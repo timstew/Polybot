@@ -15,6 +15,7 @@ CLOB_HOST = "https://clob.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 DATA_API_HOST = "https://data-api.polymarket.com"
+LB_API_HOST = "https://lb-api.polymarket.com"
 
 # Chain
 CHAIN_ID = 137  # Polygon
@@ -42,6 +43,9 @@ class Config:
     max_position_usd: float = 100.0  # max $ per single copy trade
     copy_delay_seconds: float = 0.5  # small delay before executing copy
 
+    # Cloudflare Worker URL (for remote copy listener)
+    cloudflare_worker_url: str = ""
+
     @classmethod
     def from_env(cls) -> Config:
         return cls(
@@ -51,4 +55,5 @@ class Config:
             db_path=os.getenv("POLYBOT_DB_PATH", "data/polybot.db"),
             copy_trade_percentage=float(os.getenv("COPY_TRADE_PERCENTAGE", "10")),
             copy_trade_mode=os.getenv("COPY_TRADE_MODE", "paper"),
+            cloudflare_worker_url=os.getenv("CLOUDFLARE_WORKER_URL", ""),
         )

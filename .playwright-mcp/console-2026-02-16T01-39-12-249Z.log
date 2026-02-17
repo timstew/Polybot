@@ -1,0 +1,22 @@
+[     345ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:16
+[     345ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:16
+[     365ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:16
+[     373ms] [WARNING] Datadog Browser SDK: SDK is loaded more than once. This is unsupported and might have unexpected behavior. @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[     394ms] [WARNING] RelaySDK automatically generated a source based on the url, we recommend providing a source when initializing the sdk. Refer to our docs for steps on how to do this: https://docs.relay.link/references/sdk/getting-started#configuration @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[     433ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:16
+[     472ms] [ERROR] Failed to load resource: the server responded with a status of 422 () @ https://gamma-api.polymarket.com/is-logged-in:0
+[     487ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[     500ms] [ERROR] Datadog Browser SDK: DD_LOGS is already initialized. @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[     500ms] [ERROR] Datadog Browser SDK: DD_RUM is already initialized. @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[     604ms] [WARNING] Datadog Browser SDK: Customer data exceeds the recommended 3KiB threshold. More details: https://docs.datadoghq.com/real_user_monitoring/browser/troubleshooting/#customer-data-exceeds-the-recommended-threshold-warning @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[     682ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://analytics.tiktok.com/i18n/pixel/events.js?sdkid=D2EB49JC77U067DPLNBG&lib=ttq:0
+[     785ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[     876ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/profile/0x49cf8d56dffac0e6e0e8abe70c605bf11a7e0f9b:0
+[     913ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/p:0
+[     998ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[    1211ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[    2476ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[    3506ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@0x49CF8d56dFfaC0e6e0E8ABe70c605bf11a7E0f9b-1771079519353:0
+[    5912ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/p:0
+[   12630ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/bae331aba0288cfe.js?dpl=dpl_6aVsRk7UKJmyDjHYT7eJnNDCpQXK:5
+[   13700ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@0x49CF8d56dFfaC0e6e0E8ABe70c605bf11a7E0f9b-1771079519353?tab=activity:0

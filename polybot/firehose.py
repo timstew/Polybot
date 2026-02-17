@@ -24,6 +24,7 @@ TradeCallback = Callable[[Trade], None]
 
 # ── REST polling (Data API) ─────────────────────────────────────────
 
+
 def fetch_recent_trades(
     market: Optional[str] = None,
     limit: int = 100,
@@ -50,9 +51,108 @@ def fetch_recent_trades(
     return trades
 
 
+_RELEVANT_ACTIVITY_TYPES = {"TRADE", "CONVERSION", "REDEEM"}
+
+
+def fetch_wallet_trades(
+    wallet: str,
+    limit: int = 50,
+) -> list[Trade]:
+    """Fetch recent activity for a specific wallet from the Data API.
+
+    Uses the ``/activity`` endpoint with ``user=`` which correctly
+    returns only items where *wallet* was a participant.  Returns
+    TRADE, CONVERSION, and REDEEM events.
+
+    CONVERSION and REDEEM events are converted to synthetic SELL trades:
+    - CONVERSION: exit price = usdcSize / size (typically 1.0 for winners)
+    - REDEEM with size=0: exit price = 0 (losing outcome, expired worthless)
+    """
+    params: dict = {"limit": limit, "user": wallet, "_t": int(time.time() * 1000)}
+    resp = requests.get(f"{DATA_API_HOST}/activity", params=params, timeout=15)
+    resp.raise_for_status()
+    raw = resp.json()
+    trades: list[Trade] = []
+    for item in raw:
+        try:
+            activity_type = item.get("type", "")
+            if activity_type not in _RELEVANT_ACTIVITY_TYPES:
+                continue
+
+            if activity_type == "TRADE":
+                trade = _parse_data_api_trade(item)
+                trade.maker = wallet
+                trade.activity_type = "TRADE"
+                trades.append(trade)
+            else:
+                # CONVERSION or REDEEM — synthetic SELL
+                trade = _parse_exit_event(item, activity_type)
+                trade.maker = wallet
+                trades.append(trade)
+        except Exception:
+            logger.debug("Skipping unparseable activity item: %s", item)
+    return trades
+
+
+def _parse_exit_event(item: dict, activity_type: str) -> Trade:
+    """Parse a CONVERSION or REDEEM activity item as a synthetic SELL trade."""
+    ts_raw = item.get("timestamp") or item.get("createdAt", "")
+    if isinstance(ts_raw, (int, float)):
+        ts = datetime.fromtimestamp(
+            ts_raw / 1000 if ts_raw > 1e12 else ts_raw, tz=timezone.utc
+        )
+    else:
+        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+
+    trade_id = item.get("transactionHash") or item.get("id") or str(uuid.uuid4())
+    size = float(item.get("size", 0))
+    usdc_size = float(item.get("usdcSize", 0))
+
+    # Exit price: for CONVERSION = usdcSize/size, for REDEEM with size=0 = 0
+    price = usdc_size / size if size > 0 else 0.0
+
+    trade = Trade(
+        id=trade_id,
+        market=item.get("conditionId", item.get("market", "")),
+        asset_id="",  # CONVERSIONs/REDEEMs lack asset field
+        side=TradeSide.SELL,
+        price=price,
+        size=size,
+        timestamp=ts,
+        title=item.get("title", ""),
+        outcome=item.get("outcome", ""),
+    )
+    trade.activity_type = activity_type
+    trade.usdc_size = usdc_size
+    return trade
+
+
+def fetch_asset_trades(
+    asset_id: str,
+    limit: int = 50,
+) -> list[Trade]:
+    """Fetch recent trades for a specific asset (for slippage measurement)."""
+    params: dict = {"limit": limit, "asset": asset_id, "_t": int(time.time() * 1000)}
+    resp = requests.get(f"{DATA_API_HOST}/trades", params=params, timeout=15)
+    resp.raise_for_status()
+    raw = resp.json()
+    trades: list[Trade] = []
+    for item in raw:
+        try:
+            trades.append(_parse_data_api_trade(item))
+        except Exception:
+            logger.debug("Skipping unparseable trade: %s", item)
+    return trades
+
+
 def fetch_active_markets(limit: int = 100) -> list[dict]:
     """Fetch active markets from the Gamma API."""
-    params = {"active": "true", "limit": limit, "order": "volume24hr", "ascending": "false"}
+    params = {
+        "active": "true",
+        "limit": limit,
+        "order": "volume24hr",
+        "ascending": "false",
+    }
     resp = requests.get(f"{GAMMA_HOST}/markets", params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -61,12 +161,17 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
 def _parse_data_api_trade(item: dict) -> Trade:
     ts_raw = item.get("timestamp") or item.get("createdAt", "")
     if isinstance(ts_raw, (int, float)):
-        ts = datetime.fromtimestamp(ts_raw / 1000 if ts_raw > 1e12 else ts_raw, tz=timezone.utc)
+        ts = datetime.fromtimestamp(
+            ts_raw / 1000 if ts_raw > 1e12 else ts_raw, tz=timezone.utc
+        )
     else:
         ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
 
+    # Prefer transactionHash as stable ID; fall back to id field or uuid
+    trade_id = item.get("transactionHash") or item.get("id") or str(uuid.uuid4())
+
     return Trade(
-        id=item.get("id", str(uuid.uuid4())),
+        id=trade_id,
         market=item.get("conditionId", item.get("market", "")),
         asset_id=item.get("asset", item.get("asset_id", "")),
         side=TradeSide(item.get("side", "BUY").upper()),
@@ -80,6 +185,7 @@ def _parse_data_api_trade(item: dict) -> Trade:
 
 
 # ── WebSocket firehose ──────────────────────────────────────────────
+
 
 class Firehose:
     """Connects to the Polymarket CLOB WebSocket market channel to receive
@@ -116,7 +222,9 @@ class Firehose:
                     clob_ids = json.loads(clob_ids)
                 token_ids.extend(clob_ids)
         self._subscribed_tokens = token_ids
-        logger.info("Subscribed to %d tokens from %d markets", len(token_ids), len(markets))
+        logger.info(
+            "Subscribed to %d tokens from %d markets", len(token_ids), len(markets)
+        )
         return token_ids
 
     def start(self) -> None:
@@ -158,10 +266,12 @@ class Firehose:
     def _on_open(self, ws: websocket.WebSocket) -> None:
         logger.info("WebSocket connected")
         if self._subscribed_tokens:
-            msg = json.dumps({
-                "assets_ids": self._subscribed_tokens,
-                "type": "market",
-            })
+            msg = json.dumps(
+                {
+                    "assets_ids": self._subscribed_tokens,
+                    "type": "market",
+                }
+            )
             ws.send(msg)
             logger.info("Subscribed to %d tokens", len(self._subscribed_tokens))
 
@@ -217,6 +327,7 @@ class Firehose:
 
 # ── Backfill helper ─────────────────────────────────────────────────
 
+
 def backfill_trades(
     on_trade: TradeCallback,
     pages: int = 10,
@@ -234,3 +345,46 @@ def backfill_trades(
             break
         time.sleep(0.2)  # be polite to the API
     return total
+
+
+# ── Continuous listener ─────────────────────────────────────────────
+
+
+def listen_trades(
+    on_batch: Callable[[list[Trade]], int],
+    poll_interval: float = 2.0,
+    batch_size: int = 500,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
+    """Continuously poll the Data API for the latest trades.
+
+    on_batch receives a list of trades and should return the number of
+    *new* trades inserted (for stats).  Deduplication is handled by the
+    caller via INSERT OR IGNORE.
+
+    Polls most-recent trades (offset=0) each cycle, so we always get
+    the newest data.  The DB's unique constraint on trade.id prevents
+    duplicates.
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    logger.info(
+        "Listener started — polling every %.1fs, batch size %d",
+        poll_interval,
+        batch_size,
+    )
+
+    while not stop_event.is_set():
+        try:
+            trades = fetch_recent_trades(limit=batch_size, offset=0)
+            if trades:
+                new_count = on_batch(trades)
+                if new_count > 0:
+                    logger.debug(
+                        "Ingested %d new trades (fetched %d)", new_count, len(trades)
+                    )
+        except Exception:
+            logger.exception("Listener poll error")
+
+        stop_event.wait(poll_interval)

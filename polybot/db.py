@@ -85,6 +85,25 @@ class Database:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns that may not exist in older databases."""
+        migrations = [
+            ("copy_targets", "slippage_bps", "REAL NOT NULL DEFAULT 50.0"),
+            ("copy_targets", "latency_ms", "REAL NOT NULL DEFAULT 2000.0"),
+            ("copy_targets", "fee_rate", "REAL NOT NULL DEFAULT 0.0"),
+            ("copy_trades", "source_price", "REAL NOT NULL DEFAULT 0.0"),
+            ("copy_trades", "exec_price", "REAL NOT NULL DEFAULT 0.0"),
+            ("copy_trades", "fee_amount", "REAL NOT NULL DEFAULT 0.0"),
+            ("copy_targets", "measured_slippage_bps", "REAL NOT NULL DEFAULT -1"),
+        ]
+        for table, col, col_type in migrations:
+            try:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
@@ -115,8 +134,17 @@ class Database:
     def insert_trades_batch(self, trades: list[Trade]) -> int:
         rows = [
             (
-                t.id, t.market, t.asset_id, t.side.value, t.price, t.size,
-                t.timestamp.isoformat(), t.maker, t.taker, t.title, t.outcome,
+                t.id,
+                t.market,
+                t.asset_id,
+                t.side.value,
+                t.price,
+                t.size,
+                t.timestamp.isoformat(),
+                t.maker,
+                t.taker,
+                t.title,
+                t.outcome,
             )
             for t in trades
         ]
@@ -129,9 +157,7 @@ class Database:
         self.conn.commit()
         return len(rows)
 
-    def get_trades_for_wallet(
-        self, wallet: str, limit: int = 1000
-    ) -> list[Trade]:
+    def get_trades_for_wallet(self, wallet: str, limit: int = 1000) -> list[Trade]:
         cursor = self.conn.execute(
             """SELECT * FROM trades
                WHERE maker = ? OR taker = ?
@@ -140,9 +166,7 @@ class Database:
         )
         return [self._row_to_trade(r) for r in cursor.fetchall()]
 
-    def get_trades_for_market(
-        self, market: str, limit: int = 1000
-    ) -> list[Trade]:
+    def get_trades_for_market(self, market: str, limit: int = 1000) -> list[Trade]:
         cursor = self.conn.execute(
             """SELECT * FROM trades WHERE market = ?
                ORDER BY timestamp DESC LIMIT ?""",
@@ -219,9 +243,7 @@ class Database:
         )
         self.conn.commit()
 
-    def get_suspect_bots(
-        self, min_confidence: float = 0.0
-    ) -> list[SuspectBot]:
+    def get_suspect_bots(self, min_confidence: float = 0.0) -> list[SuspectBot]:
         cursor = self.conn.execute(
             """SELECT * FROM suspect_bots WHERE confidence >= ?
                ORDER BY confidence DESC""",
@@ -253,8 +275,9 @@ class Database:
         self.conn.execute(
             """INSERT OR REPLACE INTO copy_targets
                (wallet, mode, trade_pct, max_position_usd, active,
-                total_paper_pnl, total_real_pnl)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                total_paper_pnl, total_real_pnl,
+                slippage_bps, latency_ms, fee_rate, measured_slippage_bps)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 target.wallet,
                 target.mode.value,
@@ -263,27 +286,35 @@ class Database:
                 int(target.active),
                 target.total_paper_pnl,
                 target.total_real_pnl,
+                target.slippage_bps,
+                target.latency_ms,
+                target.fee_rate,
+                target.measured_slippage_bps,
             ),
         )
         self.conn.commit()
+
+    def _row_to_copy_target(self, r: sqlite3.Row) -> CopyTarget:
+        return CopyTarget(
+            wallet=r["wallet"],
+            mode=CopyMode(r["mode"]),
+            trade_pct=r["trade_pct"],
+            max_position_usd=r["max_position_usd"],
+            active=bool(r["active"]),
+            total_paper_pnl=r["total_paper_pnl"],
+            total_real_pnl=r["total_real_pnl"],
+            slippage_bps=r["slippage_bps"],
+            latency_ms=r["latency_ms"],
+            fee_rate=r["fee_rate"],
+            measured_slippage_bps=r["measured_slippage_bps"],
+        )
 
     def get_copy_targets(self, active_only: bool = True) -> list[CopyTarget]:
         sql = "SELECT * FROM copy_targets"
         if active_only:
             sql += " WHERE active = 1"
         cursor = self.conn.execute(sql)
-        return [
-            CopyTarget(
-                wallet=r["wallet"],
-                mode=CopyMode(r["mode"]),
-                trade_pct=r["trade_pct"],
-                max_position_usd=r["max_position_usd"],
-                active=bool(r["active"]),
-                total_paper_pnl=r["total_paper_pnl"],
-                total_real_pnl=r["total_real_pnl"],
-            )
-            for r in cursor.fetchall()
-        ]
+        return [self._row_to_copy_target(r) for r in cursor.fetchall()]
 
     def get_copy_target(self, wallet: str) -> Optional[CopyTarget]:
         cursor = self.conn.execute(
@@ -292,15 +323,17 @@ class Database:
         row = cursor.fetchone()
         if not row:
             return None
-        return CopyTarget(
-            wallet=row["wallet"],
-            mode=CopyMode(row["mode"]),
-            trade_pct=row["trade_pct"],
-            max_position_usd=row["max_position_usd"],
-            active=bool(row["active"]),
-            total_paper_pnl=row["total_paper_pnl"],
-            total_real_pnl=row["total_real_pnl"],
+        return self._row_to_copy_target(row)
+
+    def update_copy_target_measured_slippage(
+        self, wallet: str, measured_slippage_bps: float
+    ) -> None:
+        """Persist the measured slippage average to the copy_targets table."""
+        self.conn.execute(
+            "UPDATE copy_targets SET measured_slippage_bps = ? WHERE wallet = ?",
+            (measured_slippage_bps, wallet),
         )
+        self.conn.commit()
 
     # ── Copy trades ─────────────────────────────────────────────────
 
@@ -308,8 +341,9 @@ class Database:
         self.conn.execute(
             """INSERT OR IGNORE INTO copy_trades
                (id, source_trade_id, source_wallet, market, asset_id,
-                side, price, size, mode, timestamp, status, pnl)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                side, price, size, mode, timestamp, status, pnl,
+                source_price, exec_price, fee_amount)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ct.id,
                 ct.source_trade_id,
@@ -323,7 +357,20 @@ class Database:
                 ct.timestamp.isoformat(),
                 ct.status,
                 ct.pnl,
+                ct.source_price,
+                ct.exec_price,
+                ct.fee_amount,
             ),
+        )
+        self.conn.commit()
+
+    def update_copy_trade_exec_price(
+        self, copy_trade_id: str, exec_price: float
+    ) -> None:
+        """Update a copy trade's exec_price after slippage observation resolves."""
+        self.conn.execute(
+            "UPDATE copy_trades SET exec_price = ?, price = ? WHERE id = ?",
+            (exec_price, exec_price, copy_trade_id),
         )
         self.conn.commit()
 
@@ -355,6 +402,72 @@ class Database:
                 timestamp=datetime.fromisoformat(r["timestamp"]),
                 status=r["status"],
                 pnl=r["pnl"],
+                source_price=r["source_price"],
+                exec_price=r["exec_price"],
+                fee_amount=r["fee_amount"],
             )
             for r in cursor.fetchall()
         ]
+
+    def compute_copy_pnl(self, source_wallet: str) -> dict:
+        """Compute paper P&L for a copy target using FIFO position matching.
+
+        Returns {"realized_pnl": float, "total_fees": float, "avg_hold_time_hours": float}.
+        """
+        cursor = self.conn.execute(
+            """SELECT asset_id, side, exec_price, price, size, fee_amount, timestamp
+               FROM copy_trades
+               WHERE source_wallet = ? AND status = 'filled'
+               ORDER BY timestamp ASC""",
+            (source_wallet,),
+        )
+        rows = cursor.fetchall()
+
+        # FIFO matching per asset_id
+        # positions[asset_id] = list of [remaining_size, entry_price, entry_timestamp]
+        positions: dict[str, list[list]] = {}
+        realized_pnl = 0.0
+        total_fees = 0.0
+        hold_times_s: list[float] = []
+
+        for r in rows:
+            asset_id = r["asset_id"]
+            side = r["side"]
+            price = r["exec_price"] if r["exec_price"] > 0 else r["price"]
+            size = r["size"]
+            fee = r["fee_amount"]
+            ts = r["timestamp"]
+            total_fees += fee
+
+            if asset_id not in positions:
+                positions[asset_id] = []
+
+            if side == "BUY":
+                positions[asset_id].append([size, price, ts])
+            else:  # SELL
+                remaining = size
+                while remaining > 0 and positions[asset_id]:
+                    lot = positions[asset_id][0]
+                    match_qty = min(remaining, lot[0])
+                    realized_pnl += (price - lot[1]) * match_qty
+                    # Compute hold time for this matched lot
+                    try:
+                        buy_dt = datetime.fromisoformat(lot[2])
+                        sell_dt = datetime.fromisoformat(ts)
+                        hold_times_s.append((sell_dt - buy_dt).total_seconds())
+                    except (ValueError, TypeError):
+                        pass
+                    lot[0] -= match_qty
+                    remaining -= match_qty
+                    if lot[0] <= 1e-9:
+                        positions[asset_id].pop(0)
+
+        avg_hold_hours = 0.0
+        if hold_times_s:
+            avg_hold_hours = (sum(hold_times_s) / len(hold_times_s)) / 3600
+
+        return {
+            "realized_pnl": realized_pnl,
+            "total_fees": total_fees,
+            "avg_hold_time_hours": avg_hold_hours,
+        }

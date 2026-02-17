@@ -1,0 +1,26 @@
+[     331ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:16
+[     331ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:16
+[     367ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:16
+[     375ms] [WARNING] Datadog Browser SDK: SDK is loaded more than once. This is unsupported and might have unexpected behavior. @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[     398ms] [WARNING] RelaySDK automatically generated a source based on the url, we recommend providing a source when initializing the sdk. Refer to our docs for steps on how to do this: https://docs.relay.link/references/sdk/getting-started#configuration @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[     435ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:16
+[     515ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[     567ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[     594ms] [ERROR] Failed to load resource: the server responded with a status of 422 () @ https://gamma-api.polymarket.com/is-logged-in:0
+[     631ms] [ERROR] Datadog Browser SDK: DD_LOGS is already initialized. @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[     631ms] [ERROR] Datadog Browser SDK: DD_RUM is already initialized. @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[     634ms] [WARNING] Datadog Browser SDK: Customer data exceeds the recommended 3KiB threshold. More details: https://docs.datadoghq.com/real_user_monitoring/browser/troubleshooting/#customer-data-exceeds-the-recommended-threshold-warning @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[     861ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[     862ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://analytics.tiktok.com/i18n/pixel/events.js?sdkid=D2EB49JC77U067DPLNBG&lib=ttq:0
+[     901ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@gabagool22:0
+[    1000ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/p:0
+[    1076ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[    1291ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[    5998ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/p:0
+[  466926ms] [ERROR] WebSocket connection to 'wss://nexus-websocket-a.intercom.io/pubsub/5-q68dho6UhXQjBUmZhqpOHi4DPldGbAmB7aERBO35CTQewiPVJygWEZiBaODn67wDrcocdgZ6cp1AgsH2ts0K0oorni1UpalOYh5o?X-Nexus-New-Client=true&X-Nexus-Version=0.18.5&user_role=visitor' failed:  @ https://js.intercomcdn.com/vendor-modern.3fc458cc.js:1
+[  494262ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[  495410ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@gabagool22?tab=activity:0
+[  509200ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/43850efaacf5e4cc.js?dpl=dpl_FXwfxHFfZ7imvGP4W9pFL7z9rC6x:5
+[  510246ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@gabagool22?tab=positions:0
+[  534474ms] [ERROR] Access to fetch at 'https://jobs.ashbyhq.com/polymarket?category=careers' (redirected from 'https://polymarket.com/_next/data/I7olyYQPIcnGA_ly9ZSnT/en/careers.json?category=careers') from origin 'https://polymarket.com' has been blocked by CORS policy: Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource. @ https://polymarket.com/@gabagool22?tab=positions:0
+[  534474ms] [ERROR] Failed to load resource: net::ERR_FAILED @ https://jobs.ashbyhq.com/polymarket?category=careers:0

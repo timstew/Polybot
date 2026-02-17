@@ -93,7 +93,7 @@ class TestTargetManagement:
 
 class TestCopyExecution:
     def test_paper_trade_on_target_activity(self, copier):
-        copier.add_target("0xbot1", mode=CopyMode.PAPER, trade_pct=10.0)
+        copier.add_target("0xbot1", mode=CopyMode.PAPER, trade_pct=10.0, slippage_bps=0)
         trade = _make_trade(taker="0xbot1", price=0.50, size=200)
         # Source trade notional = 0.50 * 200 = $100, copy = 10% = $10
         result = copier.on_trade(trade)
@@ -112,9 +112,11 @@ class TestCopyExecution:
 
     def test_respects_max_position(self, copier):
         copier.add_target(
-            "0xbot1", mode=CopyMode.PAPER,
+            "0xbot1",
+            mode=CopyMode.PAPER,
             trade_pct=100.0,  # 100% copy
             max_position_usd=50.0,  # but cap at $50
+            slippage_bps=0,
         )
         # Source trade: $100 notional. 100% copy = $100, but max = $50.
         trade = _make_trade(taker="0xbot1", price=0.50, size=200)
@@ -134,10 +136,15 @@ class TestCopyExecution:
         """Should also copy when the target is the maker, not just taker."""
         copier.add_target("0xmaker_bot")
         trade = Trade(
-            id="t1", market="m1", asset_id="a1", side=TradeSide.BUY,
-            price=0.50, size=100,
+            id="t1",
+            market="m1",
+            asset_id="a1",
+            side=TradeSide.BUY,
+            price=0.50,
+            size=100,
             timestamp=datetime(2025, 6, 1, tzinfo=timezone.utc),
-            maker="0xmaker_bot", taker="0xsomeone",
+            maker="0xmaker_bot",
+            taker="0xsomeone",
         )
         result = copier.on_trade(trade)
         assert result is not None
@@ -165,8 +172,12 @@ class TestCopySummary:
         copier.add_target("0xbot1", mode=CopyMode.PAPER)
         for i in range(5):
             trade = Trade(
-                id=f"t{i}", market="m1", asset_id="a1", side=TradeSide.BUY,
-                price=0.50, size=100,
+                id=f"t{i}",
+                market=f"m{i}",
+                asset_id=f"a{i}",
+                side=TradeSide.BUY,
+                price=0.50,
+                size=100,
                 timestamp=datetime(2025, 6, 1, tzinfo=timezone.utc),
                 taker="0xbot1",
             )

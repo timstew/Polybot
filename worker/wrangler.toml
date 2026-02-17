@@ -1,0 +1,21 @@
+name = "polybot-copy-listener"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "polybot"
+database_id = "1a14301f-5bbd-4be9-a530-56322028ee13"
+
+[durable_objects]
+bindings = [
+  { name = "LISTENER", class_name = "CopyListenerDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["CopyListenerDO"]
+
+# Auto-start: runs every minute to ensure the listener is alive
+[triggers]
+crons = ["* * * * *"]

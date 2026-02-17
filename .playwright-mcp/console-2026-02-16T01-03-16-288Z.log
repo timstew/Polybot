@@ -1,0 +1,23 @@
+[     326ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:16
+[     327ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:16
+[     353ms] [ERROR] Error: <rect> attribute height: A negative value is not valid. ("-10") @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:16
+[     374ms] [WARNING] Datadog Browser SDK: SDK is loaded more than once. This is unsupported and might have unexpected behavior. @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[     394ms] [WARNING] RelaySDK automatically generated a source based on the url, we recommend providing a source when initializing the sdk. Refer to our docs for steps on how to do this: https://docs.relay.link/references/sdk/getting-started#configuration @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[     480ms] [ERROR] Failed to load resource: the server responded with a status of 422 () @ https://gamma-api.polymarket.com/is-logged-in:0
+[     523ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[     551ms] [ERROR] Datadog Browser SDK: DD_LOGS is already initialized. @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[     551ms] [ERROR] Datadog Browser SDK: DD_RUM is already initialized. @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[     654ms] [WARNING] Datadog Browser SDK: Customer data exceeds the recommended 3KiB threshold. More details: https://docs.datadoghq.com/real_user_monitoring/browser/troubleshooting/#customer-data-exceeds-the-recommended-threshold-warning @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[     746ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[     854ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://analytics.tiktok.com/i18n/pixel/events.js?sdkid=D2EB49JC77U067DPLNBG&lib=ttq:0
+[     909ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[     923ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/p:0
+[     948ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@0x1979ae6B7E6534dE9c4539D0c205E582cA637C9D-1769439463256:0
+[    1152ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[    1368ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/config/com/e8fb67d5-9099-4de2-9750-2c66ef553d13.json?v=3.54.0-2512101929:0
+[    1767ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@0x1979ae6B7E6534dE9c4539D0c205E582cA637C9D-1769439463256:0
+[    5917ms] [ERROR] Failed to load resource: net::ERR_CERT_AUTHORITY_INVALID @ https://tr.snapchat.com/p:0
+[   11800ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[   12855ms] [ERROR] Attestation check for Attribution Reporting on https://www.google-analytics.com failed. @ https://polymarket.com/@0x1979ae6B7E6534dE9c4539D0c205E582cA637C9D-1769439463256?tab=activity:0
+[   27631ms] [WARNING] @next/third-parties: GA has not been initialized @ https://polymarket.com/_next/static/chunks/7b7aaa881b15a9a9.js?dpl=dpl_nw7SFUixptLHfwtAArCajVoaFZF2:5
+[ 1118752ms] [ERROR] WebSocket connection to 'wss://nexus-websocket-a.intercom.io/pubsub/5-lisDMnp2bqkHXdpkh_cD05lLW6K8pnliURjun5iatDBj8mMA-csvQ0kcxRn8OqDqQsbmhGVF6c8XzXQGZkZm_FHWCtQ1f-tPJglA?X-Nexus-New-Client=true&X-Nexus-Version=0.18.5&user_role=visitor' failed:  @ https://js.intercomcdn.com/vendor-modern.3fc458cc.js:1

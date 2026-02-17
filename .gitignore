@@ -13,3 +13,8 @@ data/*.db-journal
 venv/
 .pytest_cache/
 .mypy_cache/
+*.png
+polybot.db
+node_modules/
+.wrangler/
+web/.next/

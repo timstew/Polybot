@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from polybot.categories import DEFAULT_FEE_RATE, market_has_fees
 from polybot.config import Config
 from polybot.db import Database
 from polybot.models import (
@@ -30,11 +31,21 @@ class CopyTrader:
         firehose = Firehose(on_trade=copier.on_trade)
     """
 
-    def __init__(self, db: Database, config: Optional[Config] = None):
+    # Minimum seconds between copy trades on the same (wallet, market) pair.
+    # Prevents micro-trading bots from flooding us with hundreds of copies
+    # on the same market within minutes.
+    MARKET_COOLDOWN_SECONDS = 600  # 10 minutes
+
+    def __init__(
+        self, db: Database, config: Optional[Config] = None, slippage_tracker=None
+    ):
         self.db = db
         self.config = config or Config()
+        self.slippage_tracker = slippage_tracker
         self._targets: dict[str, CopyTarget] = {}
         self._real_client = None  # lazy-loaded ClobClient for real trades
+        # Track last copy time per (wallet, market) for cooldown
+        self._last_copy: dict[tuple[str, str], datetime] = {}
         self._load_targets()
 
     # ── Target management ───────────────────────────────────────────
@@ -45,6 +56,9 @@ class CopyTrader:
         mode: CopyMode = CopyMode.PAPER,
         trade_pct: Optional[float] = None,
         max_position_usd: Optional[float] = None,
+        slippage_bps: float = 50.0,
+        latency_ms: float = 2000.0,
+        fee_rate: float = 0.0,
     ) -> CopyTarget:
         """Start copy-trading a wallet."""
         target = CopyTarget(
@@ -53,6 +67,9 @@ class CopyTrader:
             trade_pct=trade_pct or self.config.copy_trade_percentage,
             max_position_usd=max_position_usd or self.config.max_position_usd,
             active=True,
+            slippage_bps=slippage_bps,
+            latency_ms=latency_ms,
+            fee_rate=fee_rate,
         )
         self.db.upsert_copy_target(target)
         self._targets[wallet] = target
@@ -72,6 +89,18 @@ class CopyTrader:
             target.active = False
             self.db.upsert_copy_target(target)
             logger.info("Stopped copying %s", wallet[:10] + "...")
+
+    def reactivate_target(self, wallet: str) -> Optional[CopyTarget]:
+        """Re-enable a previously stopped copy target."""
+        targets = self.db.get_copy_targets(active_only=False)
+        target = next((t for t in targets if t.wallet == wallet), None)
+        if not target:
+            return None
+        target.active = True
+        self.db.upsert_copy_target(target)
+        self._targets[wallet] = target
+        logger.info("Reactivated copying %s", wallet[:10] + "...")
+        return target
 
     def set_mode(self, wallet: str, mode: CopyMode) -> Optional[CopyTarget]:
         """Switch a target between paper and real mode."""
@@ -100,7 +129,42 @@ class CopyTrader:
         if not target or not target.active:
             return None
 
-        # Calculate our copy size
+        # Intra-market cooldown: skip if we recently copied a trade on this market
+        cooldown_key = (target.wallet, trade.market)
+        last_ts = self._last_copy.get(cooldown_key)
+        if last_ts is not None:
+            elapsed = (datetime.now(timezone.utc) - last_ts).total_seconds()
+            if elapsed < self.MARKET_COOLDOWN_SECONDS:
+                logger.debug(
+                    "Cooldown: skipping %s on %s (%.0fs since last copy)",
+                    trade.side.value,
+                    trade.market[:10],
+                    elapsed,
+                )
+                return None
+
+        # Determine slippage: prefer measured data, fall back to static config
+        effective_slippage_bps = target.slippage_bps
+        if self.slippage_tracker:
+            stats = self.slippage_tracker.get_stats(target.wallet)
+            if stats and stats.observation_count >= 1:
+                effective_slippage_bps = max(stats.avg_slippage_bps, 0)
+
+        slip_mult = effective_slippage_bps / 10_000
+        if trade.side == TradeSide.BUY:
+            exec_price = min(trade.price * (1 + slip_mult), 0.99)
+        else:
+            exec_price = max(trade.price * (1 - slip_mult), 0.01)
+
+        # Determine fee rate: use target override, or auto-detect from market
+        fee_rate = target.fee_rate
+        if fee_rate == 0.0 and market_has_fees(trade.title):
+            fee_rate = DEFAULT_FEE_RATE
+
+        # Fee formula: fee_per_share = exec_price * (1 - exec_price) * fee_rate
+        fee_per_share = exec_price * (1 - exec_price) * fee_rate
+
+        # Calculate our copy size based on exec_price (what we'd actually pay)
         source_notional = trade.price * trade.size
         copy_notional = source_notional * (target.trade_pct / 100.0)
         copy_notional = min(copy_notional, target.max_position_usd)
@@ -108,9 +172,13 @@ class CopyTrader:
         if copy_notional < 0.01:
             return None
 
-        copy_size = copy_notional / trade.price if trade.price > 0 else 0
+        # Effective cost per share includes fee
+        cost_per_share = exec_price + fee_per_share
+        copy_size = copy_notional / cost_per_share if cost_per_share > 0 else 0
         if copy_size <= 0:
             return None
+
+        fee_amount = fee_per_share * copy_size
 
         copy = CopyTrade(
             id=str(uuid.uuid4()),
@@ -119,11 +187,14 @@ class CopyTrader:
             market=trade.market,
             asset_id=trade.asset_id,
             side=trade.side,
-            price=trade.price,
+            price=exec_price,
             size=copy_size,
             mode=target.mode,
             timestamp=datetime.now(timezone.utc),
             status="pending",
+            source_price=trade.price,
+            exec_price=exec_price,
+            fee_amount=fee_amount,
         )
 
         if target.mode == CopyMode.PAPER:
@@ -132,6 +203,24 @@ class CopyTrader:
             copy = self._execute_real(copy, target)
 
         self.db.insert_copy_trade(copy)
+
+        # Record copy time for intra-market cooldown
+        self._last_copy[cooldown_key] = datetime.now(timezone.utc)
+
+        # Register for real slippage observation (will update exec_price later)
+        if self.slippage_tracker:
+            # Measure real detection latency: how long between the trade and now
+            detection_delay = (
+                datetime.now(timezone.utc) - trade.timestamp
+            ).total_seconds() * 1000
+            detected_latency_ms = max(detection_delay, 0)
+            self.slippage_tracker.register_observation(
+                trade,
+                target,
+                copy.id,
+                detected_latency_ms=detected_latency_ms,
+            )
+
         return copy
 
     # ── Paper trading ───────────────────────────────────────────────
@@ -140,13 +229,14 @@ class CopyTrader:
         """Record a paper trade — no real money moves."""
         copy.status = "filled"
         logger.info(
-            "[PAPER] %s %s %.2f shares @ $%.4f (from %s) | market=%s",
+            "[PAPER] %s %.2f shares | src=$%.4f exec=$%.4f slip=%dbps fee=$%.4f (from %s)",
             copy.side.value,
-            "YES" if copy.side == TradeSide.BUY else "NO",
             copy.size,
-            copy.price,
+            copy.source_price,
+            copy.exec_price,
+            target.slippage_bps,
+            copy.fee_amount,
             copy.source_wallet[:10] + "...",
-            copy.market[:10] + "...",
         )
         return copy
 
