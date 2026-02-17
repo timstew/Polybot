@@ -5,16 +5,18 @@ from __future__ import annotations
 
 import json
 import logging
+import ssl
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+import certifi
 import requests
 import websocket
 
-from polybot.config import CLOB_WS, DATA_API_HOST, GAMMA_HOST
+from polybot.config import CLOB_WS, DATA_API_HOST, GAMMA_HOST, RTDS_WS
 from polybot.models import Trade, TradeSide
 
 logger = logging.getLogger(__name__)
@@ -336,6 +338,131 @@ class Firehose:
         logger.info("WebSocket closed: %s %s", close_status, close_msg)
 
 
+# ── RTDS real-time trade stream ─────────────────────────────────────
+
+
+class RTDSFirehose:
+    """Connects to Polymarket's Real-Time Data Streaming (RTDS) WebSocket
+    to receive every trade globally with wallet addresses.
+
+    Unlike the CLOB WebSocket (which only gives price/size/side), RTDS
+    ``activity/trades`` messages include ``proxyWallet``, making them
+    suitable for bot detection and wallet discovery.
+
+    Usage:
+        rtds = RTDSFirehose(on_trade=my_callback)
+        rtds.start_background()
+    """
+
+    def __init__(self, on_trade: Optional[TradeCallback] = None):
+        self._on_trade = on_trade
+        self._ws: Optional[websocket.WebSocketApp] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+    def start(self) -> None:
+        """Start the RTDS WebSocket (blocking)."""
+        self._running = True
+        self._connect()
+
+    def start_background(self) -> threading.Thread:
+        """Start the RTDS WebSocket in a daemon thread."""
+        self._running = True
+        self._thread = threading.Thread(target=self._connect, daemon=True)
+        self._thread.start()
+        return self._thread
+
+    def stop(self) -> None:
+        self._running = False
+        if self._ws:
+            self._ws.close()
+
+    def _connect(self) -> None:
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        while self._running:
+            try:
+                self._ws = websocket.WebSocketApp(
+                    RTDS_WS,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self._ws.run_forever(
+                    ping_interval=5,
+                    ping_timeout=3,
+                    sslopt={"context": ssl_context},
+                )
+            except Exception:
+                logger.exception("RTDS connection error")
+            if self._running:
+                logger.info("RTDS reconnecting in 5s...")
+                time.sleep(5)
+
+    def _on_open(self, ws: websocket.WebSocket) -> None:
+        logger.info("RTDS connected")
+        sub = json.dumps(
+            {
+                "action": "subscribe",
+                "subscriptions": [{"topic": "activity", "type": "trades"}],
+            }
+        )
+        ws.send(sub)
+        logger.info("RTDS subscribed to activity/trades")
+
+    def _on_message(self, ws: websocket.WebSocket, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return
+
+        # RTDS wraps payload in {topic, type, timestamp, payload} sometimes,
+        # but activity/trades messages come as flat trade objects
+        if "proxyWallet" in data or "transactionHash" in data:
+            self._handle_trade(data)
+
+    def _handle_trade(self, data: dict) -> None:
+        try:
+            ts_raw = data.get("timestamp")
+            if isinstance(ts_raw, (int, float)):
+                ts = datetime.fromtimestamp(
+                    ts_raw / 1000 if ts_raw > 1e12 else ts_raw,
+                    tz=timezone.utc,
+                )
+            else:
+                ts = datetime.now(tz=timezone.utc)
+
+            trade_id = (
+                data.get("transactionHash") or data.get("id") or str(uuid.uuid4())
+            )
+
+            trade = Trade(
+                id=trade_id,
+                market=data.get("conditionId", data.get("market", "")),
+                asset_id=data.get("asset", data.get("asset_id", "")),
+                side=TradeSide(data.get("side", "BUY").upper()),
+                price=float(data.get("price", 0)),
+                size=float(data.get("size", 0)),
+                timestamp=ts,
+                taker=data.get("proxyWallet", ""),
+                title=data.get("title", ""),
+                outcome=data.get("outcome", ""),
+            )
+
+            if self._on_trade:
+                self._on_trade(trade)
+        except Exception:
+            logger.debug("RTDS: failed to parse trade: %s", data)
+
+    def _on_error(self, ws: websocket.WebSocket, error: Exception) -> None:
+        logger.warning("RTDS error: %s", error)
+
+    def _on_close(
+        self, ws: websocket.WebSocket, close_status: int, close_msg: str
+    ) -> None:
+        logger.info("RTDS closed: %s %s", close_status, close_msg)
+
+
 # ── Backfill helper ─────────────────────────────────────────────────
 
 
@@ -367,16 +494,16 @@ def listen_trades(
     batch_size: int = 500,
     stop_event: Optional[threading.Event] = None,
 ) -> None:
-    """Hybrid WebSocket + REST trade ingestion.
+    """RTDS-primary trade ingestion with REST fallback.
 
-    1. Starts the CLOB WebSocket in the background to receive real-time
-       ``last_trade_price`` events (no wallet addresses, but instant).
-    2. Collects active market (conditionId) from WS events into a hot set.
-    3. Every *poll_interval* seconds, makes targeted REST calls to
-       ``/trades?market=<conditionId>`` for each hot market — these have
-       wallet addresses and each market param is a separate cache key.
-    4. Also does a broad sweep of ``/trades`` (no market filter) every
-       5 minutes to catch markets we're not subscribed to via WS.
+    1. Connects to the RTDS WebSocket (``wss://ws-live-data.polymarket.com``)
+       which streams every trade globally with wallet addresses in real-time.
+    2. Buffers incoming RTDS trades and flushes them to ``on_batch`` every
+       *poll_interval* seconds.
+    3. Also polls ``/trades`` REST endpoint every cycle as a fallback to
+       catch anything RTDS might miss (e.g. during reconnects).
+    4. Does a broad REST sweep across offsets every 5 minutes for
+       historical backfill.
 
     on_batch receives a list of trades and should return the number of
     *new* trades inserted.  Deduplication is handled by the caller.
@@ -384,85 +511,54 @@ def listen_trades(
     if stop_event is None:
         stop_event = threading.Event()
 
-    # ── Hot-market queue from WebSocket ──
-    hot_markets: set[str] = set()
-    hot_lock = threading.Lock()
+    # ── RTDS trade buffer ──
+    rtds_buffer: list[Trade] = []
+    rtds_lock = threading.Lock()
 
-    def _on_ws_trade(trade: Trade) -> None:
-        if trade.market:
-            with hot_lock:
-                hot_markets.add(trade.market)
+    def _on_rtds_trade(trade: Trade) -> None:
+        with rtds_lock:
+            rtds_buffer.append(trade)
 
-    # Start WebSocket firehose in background
-    firehose = Firehose(on_trade=_on_ws_trade)
-    try:
-        token_ids = firehose.subscribe_all_active(limit=100)
-        logger.info(
-            "Hybrid listener: subscribed to %d tokens via WebSocket", len(token_ids)
-        )
-    except Exception:
-        logger.warning("Failed to subscribe to WebSocket tokens, will use REST only")
-        token_ids = []
-
-    if token_ids:
-        firehose.start_background()
+    # Start RTDS firehose in background
+    rtds = RTDSFirehose(on_trade=_on_rtds_trade)
+    rtds.start_background()
 
     # Track when we last did a full broad sweep
     last_broad_sweep = 0.0
     BROAD_SWEEP_INTERVAL = 300.0  # 5 minutes
-    # Refresh WS subscriptions periodically to pick up new hot markets
-    last_ws_refresh = time.time()
-    WS_REFRESH_INTERVAL = 600.0  # 10 minutes
 
     logger.info(
-        "Hybrid listener started — poll every %.1fs, WS %s",
-        poll_interval,
-        "active" if token_ids else "inactive (REST only)",
+        "Listener started — RTDS primary, REST fallback every %.1fs", poll_interval
     )
 
     try:
         while not stop_event.is_set():
             try:
-                # ── 1. Fast poll of latest trades (cached, ~0.1s) ──
-                trades = fetch_recent_trades(limit=batch_size, offset=0)
-                if trades:
-                    new_count = on_batch(trades)
+                # ── 1. Flush RTDS buffer ──
+                with rtds_lock:
+                    rtds_trades = list(rtds_buffer)
+                    rtds_buffer.clear()
+
+                if rtds_trades:
+                    new_count = on_batch(rtds_trades)
                     if new_count > 0:
-                        logger.debug("Ingested %d new trades", new_count)
+                        logger.debug(
+                            "RTDS: +%d new trades (batch %d)",
+                            new_count,
+                            len(rtds_trades),
+                        )
 
-                # ── 2. Drain hot markets from WebSocket ──
-                with hot_lock:
-                    markets_to_fetch = list(hot_markets)
-                    hot_markets.clear()
+                # ── 2. REST fallback poll (cached, ~0.1s) ──
+                rest_trades = fetch_recent_trades(limit=batch_size, offset=0)
+                if rest_trades:
+                    new_count = on_batch(rest_trades)
+                    if new_count > 0:
+                        logger.debug("REST: +%d new trades", new_count)
 
-                # ── 3. Targeted REST calls per hot market ──
-                if markets_to_fetch:
-                    logger.debug(
-                        "Fetching trades for %d hot markets", len(markets_to_fetch)
-                    )
-                    for market_id in markets_to_fetch:
-                        if stop_event.is_set():
-                            break
-                        try:
-                            trades = fetch_recent_trades(
-                                market=market_id, limit=batch_size
-                            )
-                            if trades:
-                                new_count = on_batch(trades)
-                                if new_count > 0:
-                                    logger.debug(
-                                        "Hot market %s…: +%d new trades",
-                                        market_id[:10],
-                                        new_count,
-                                    )
-                        except Exception:
-                            logger.debug("Failed to fetch market %s", market_id[:10])
-
-                # ── 4. Broad sweep every 5 minutes ──
+                # ── 3. Broad sweep every 5 minutes ──
                 now = time.time()
                 if now - last_broad_sweep >= BROAD_SWEEP_INTERVAL:
                     last_broad_sweep = now
-                    logger.debug("Running broad sweep (no market filter)")
                     for offset in range(0, 3000, batch_size):
                         if stop_event.is_set():
                             break
@@ -475,21 +571,9 @@ def listen_trades(
                         except Exception:
                             logger.debug("Broad sweep error at offset %d", offset)
 
-                # ── 5. Periodically refresh WS subscriptions ──
-                if token_ids and now - last_ws_refresh >= WS_REFRESH_INTERVAL:
-                    last_ws_refresh = now
-                    try:
-                        new_ids = firehose.subscribe_all_active(limit=100)
-                        if new_ids:
-                            logger.info(
-                                "Refreshed WS subscriptions: %d tokens", len(new_ids)
-                            )
-                    except Exception:
-                        logger.debug("Failed to refresh WS subscriptions")
-
             except Exception:
                 logger.exception("Listener poll error")
 
             stop_event.wait(poll_interval)
     finally:
-        firehose.stop()
+        rtds.stop()

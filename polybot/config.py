@@ -13,6 +13,7 @@ load_dotenv()
 # Polymarket endpoints
 CLOB_HOST = "https://clob.polymarket.com"
 CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+RTDS_WS = "wss://ws-live-data.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 DATA_API_HOST = "https://data-api.polymarket.com"
 LB_API_HOST = "https://lb-api.polymarket.com"
