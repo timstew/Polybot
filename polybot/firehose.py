@@ -132,7 +132,7 @@ def fetch_asset_trades(
     limit: int = 50,
 ) -> list[Trade]:
     """Fetch recent trades for a specific asset (for slippage measurement)."""
-    params: dict = {"limit": limit, "asset": asset_id, "_t": int(time.time() * 1000)}
+    params: dict = {"limit": limit, "asset": asset_id}
     resp = requests.get(f"{DATA_API_HOST}/trades", params=params, timeout=15)
     resp.raise_for_status()
     raw = resp.json()
@@ -212,7 +212,11 @@ class Firehose:
 
     def subscribe_all_active(self, limit: int = 50) -> list[str]:
         """Fetch top active markets from Gamma and subscribe to all their
-        token IDs.  Returns the list of token IDs subscribed to."""
+        token IDs.  Returns the list of token IDs subscribed to.
+
+        If the WebSocket is already connected, sends the subscription
+        message immediately to pick up new markets.
+        """
         markets = fetch_active_markets(limit=limit)
         token_ids: list[str] = []
         for m in markets:
@@ -225,6 +229,13 @@ class Firehose:
         logger.info(
             "Subscribed to %d tokens from %d markets", len(token_ids), len(markets)
         )
+        # If already connected, send subscription immediately
+        if self._ws and token_ids:
+            try:
+                msg = json.dumps({"assets_ids": token_ids, "type": "market"})
+                self._ws.send(msg)
+            except Exception:
+                pass  # will re-subscribe on next reconnect
         return token_ids
 
     def start(self) -> None:
@@ -356,35 +367,129 @@ def listen_trades(
     batch_size: int = 500,
     stop_event: Optional[threading.Event] = None,
 ) -> None:
-    """Continuously poll the Data API for the latest trades.
+    """Hybrid WebSocket + REST trade ingestion.
+
+    1. Starts the CLOB WebSocket in the background to receive real-time
+       ``last_trade_price`` events (no wallet addresses, but instant).
+    2. Collects active market (conditionId) from WS events into a hot set.
+    3. Every *poll_interval* seconds, makes targeted REST calls to
+       ``/trades?market=<conditionId>`` for each hot market — these have
+       wallet addresses and each market param is a separate cache key.
+    4. Also does a broad sweep of ``/trades`` (no market filter) every
+       5 minutes to catch markets we're not subscribed to via WS.
 
     on_batch receives a list of trades and should return the number of
-    *new* trades inserted (for stats).  Deduplication is handled by the
-    caller via INSERT OR IGNORE.
-
-    Polls most-recent trades (offset=0) each cycle, so we always get
-    the newest data.  The DB's unique constraint on trade.id prevents
-    duplicates.
+    *new* trades inserted.  Deduplication is handled by the caller.
     """
     if stop_event is None:
         stop_event = threading.Event()
 
+    # ── Hot-market queue from WebSocket ──
+    hot_markets: set[str] = set()
+    hot_lock = threading.Lock()
+
+    def _on_ws_trade(trade: Trade) -> None:
+        if trade.market:
+            with hot_lock:
+                hot_markets.add(trade.market)
+
+    # Start WebSocket firehose in background
+    firehose = Firehose(on_trade=_on_ws_trade)
+    try:
+        token_ids = firehose.subscribe_all_active(limit=100)
+        logger.info(
+            "Hybrid listener: subscribed to %d tokens via WebSocket", len(token_ids)
+        )
+    except Exception:
+        logger.warning("Failed to subscribe to WebSocket tokens, will use REST only")
+        token_ids = []
+
+    if token_ids:
+        firehose.start_background()
+
+    # Track when we last did a full broad sweep
+    last_broad_sweep = 0.0
+    BROAD_SWEEP_INTERVAL = 300.0  # 5 minutes
+    # Refresh WS subscriptions periodically to pick up new hot markets
+    last_ws_refresh = time.time()
+    WS_REFRESH_INTERVAL = 600.0  # 10 minutes
+
     logger.info(
-        "Listener started — polling every %.1fs, batch size %d",
+        "Hybrid listener started — poll every %.1fs, WS %s",
         poll_interval,
-        batch_size,
+        "active" if token_ids else "inactive (REST only)",
     )
 
-    while not stop_event.is_set():
-        try:
-            trades = fetch_recent_trades(limit=batch_size, offset=0)
-            if trades:
-                new_count = on_batch(trades)
-                if new_count > 0:
-                    logger.debug(
-                        "Ingested %d new trades (fetched %d)", new_count, len(trades)
-                    )
-        except Exception:
-            logger.exception("Listener poll error")
+    try:
+        while not stop_event.is_set():
+            try:
+                # ── 1. Fast poll of latest trades (cached, ~0.1s) ──
+                trades = fetch_recent_trades(limit=batch_size, offset=0)
+                if trades:
+                    new_count = on_batch(trades)
+                    if new_count > 0:
+                        logger.debug("Ingested %d new trades", new_count)
 
-        stop_event.wait(poll_interval)
+                # ── 2. Drain hot markets from WebSocket ──
+                with hot_lock:
+                    markets_to_fetch = list(hot_markets)
+                    hot_markets.clear()
+
+                # ── 3. Targeted REST calls per hot market ──
+                if markets_to_fetch:
+                    logger.debug(
+                        "Fetching trades for %d hot markets", len(markets_to_fetch)
+                    )
+                    for market_id in markets_to_fetch:
+                        if stop_event.is_set():
+                            break
+                        try:
+                            trades = fetch_recent_trades(
+                                market=market_id, limit=batch_size
+                            )
+                            if trades:
+                                new_count = on_batch(trades)
+                                if new_count > 0:
+                                    logger.debug(
+                                        "Hot market %s…: +%d new trades",
+                                        market_id[:10],
+                                        new_count,
+                                    )
+                        except Exception:
+                            logger.debug("Failed to fetch market %s", market_id[:10])
+
+                # ── 4. Broad sweep every 5 minutes ──
+                now = time.time()
+                if now - last_broad_sweep >= BROAD_SWEEP_INTERVAL:
+                    last_broad_sweep = now
+                    logger.debug("Running broad sweep (no market filter)")
+                    for offset in range(0, 3000, batch_size):
+                        if stop_event.is_set():
+                            break
+                        try:
+                            trades = fetch_recent_trades(
+                                limit=batch_size, offset=offset
+                            )
+                            if trades:
+                                on_batch(trades)
+                        except Exception:
+                            logger.debug("Broad sweep error at offset %d", offset)
+
+                # ── 5. Periodically refresh WS subscriptions ──
+                if token_ids and now - last_ws_refresh >= WS_REFRESH_INTERVAL:
+                    last_ws_refresh = now
+                    try:
+                        new_ids = firehose.subscribe_all_active(limit=100)
+                        if new_ids:
+                            logger.info(
+                                "Refreshed WS subscriptions: %d tokens", len(new_ids)
+                            )
+                    except Exception:
+                        logger.debug("Failed to refresh WS subscriptions")
+
+            except Exception:
+                logger.exception("Listener poll error")
+
+            stop_event.wait(poll_interval)
+    finally:
+        firehose.stop()
