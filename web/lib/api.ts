@@ -238,10 +238,12 @@ export const api = {
     fetchJSON<RankRow[]>(
       `/api/rank?top=${top}&min_confidence=${minConfidence}&sort_by=${sortBy}`,
     ),
-  unified: (top = 30, minConfidence = 0, sortBy = "pnl_pct") =>
-    fetchJSON<UnifiedBotRow[]>(
+  unified: async (top = 30, minConfidence = 0, sortBy = "pnl_pct") => {
+    const data = await fetchJSON<UnifiedBotRow[] | unknown>(
       `/api/unified?top=${top}&min_confidence=${minConfidence}&sort_by=${sortBy}`,
-    ),
+    );
+    return Array.isArray(data) ? data : [];
+  },
   detect: (minTrades = 20) =>
     postJSON<{ status: string; bots_found: number; wallets_scanned: number }>(
       `/api/detect?min_trades=${minTrades}`,
