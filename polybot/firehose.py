@@ -160,6 +160,107 @@ def fetch_active_markets(limit: int = 100) -> list[dict]:
     return resp.json()
 
 
+# ── Wallet harvesting (leaderboard + market positions) ──────────────
+
+_LEADERBOARD_CATEGORIES = ["POLITICS", "ECONOMICS", "TECH", "FINANCE", "SPORTS"]
+_LEADERBOARD_PERIODS = ["DAY", "WEEK", "MONTH", "ALL"]
+
+
+def fetch_leaderboard_wallets() -> set[str]:
+    """Harvest wallet addresses from the Polymarket leaderboard.
+
+    Sweeps all category × time-period combinations via the
+    ``/v1/leaderboard`` endpoint (50 per page, 20-min cache).
+    Returns a deduplicated set of proxy wallet addresses.
+    """
+    wallets: set[str] = set()
+    for category in _LEADERBOARD_CATEGORIES:
+        for period in _LEADERBOARD_PERIODS:
+            try:
+                resp = requests.get(
+                    f"{DATA_API_HOST}/v1/leaderboard",
+                    params={
+                        "category": category,
+                        "timePeriod": period,
+                        "orderBy": "PNL",
+                        "limit": 50,
+                        "offset": 0,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                for entry in resp.json():
+                    w = entry.get("proxyWallet", "")
+                    if w:
+                        wallets.add(w)
+            except Exception:
+                logger.debug("Leaderboard fetch failed: %s/%s", category, period)
+    logger.info("Leaderboard: harvested %d unique wallets", len(wallets))
+    return wallets
+
+
+def fetch_market_position_wallets(
+    condition_ids: list[str],
+    limit_per_market: int = 500,
+) -> set[str]:
+    """Harvest wallet addresses from market position holders.
+
+    Uses the ``/v1/market-positions`` endpoint (uncached, DYNAMIC) to
+    get all traders with open or closed positions in the given markets.
+    """
+    wallets: set[str] = set()
+    for cid in condition_ids:
+        try:
+            resp = requests.get(
+                f"{DATA_API_HOST}/v1/market-positions",
+                params={
+                    "market": cid,
+                    "limit": limit_per_market,
+                    "status": "ALL",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for pos in resp.json():
+                w = pos.get("proxyWallet", "")
+                if w:
+                    wallets.add(w)
+        except Exception:
+            logger.debug("Market positions fetch failed: %s", cid[:10])
+    logger.info(
+        "Market positions: harvested %d unique wallets from %d markets",
+        len(wallets),
+        len(condition_ids),
+    )
+    return wallets
+
+
+def harvest_wallets(top_markets: int = 20) -> set[str]:
+    """Harvest wallets from leaderboard + top market positions.
+
+    Combines wallets from the leaderboard (all categories/periods)
+    with position holders from the top *top_markets* active markets
+    by 24h volume.  Returns a deduplicated set.
+    """
+    wallets: set[str] = set()
+
+    # 1. Leaderboard
+    wallets |= fetch_leaderboard_wallets()
+
+    # 2. Top market positions
+    try:
+        markets = fetch_active_markets(limit=top_markets)
+        condition_ids = [
+            m.get("conditionId", "") for m in markets if m.get("conditionId")
+        ]
+        wallets |= fetch_market_position_wallets(condition_ids)
+    except Exception:
+        logger.debug("Failed to fetch active markets for position harvesting")
+
+    logger.info("Total harvested wallets: %d", len(wallets))
+    return wallets
+
+
 def _parse_data_api_trade(item: dict) -> Trade:
     ts_raw = item.get("timestamp") or item.get("createdAt", "")
     if isinstance(ts_raw, (int, float)):
@@ -526,6 +627,9 @@ def listen_trades(
     # Track when we last did a full broad sweep
     last_broad_sweep = 0.0
     BROAD_SWEEP_INTERVAL = 300.0  # 5 minutes
+    # Wallet harvesting from leaderboard + market positions
+    last_harvest = 0.0
+    HARVEST_INTERVAL = 1800.0  # 30 minutes
 
     logger.info(
         "Listener started — RTDS primary, REST fallback every %.1fs", poll_interval
@@ -570,6 +674,30 @@ def listen_trades(
                                 on_batch(trades)
                         except Exception:
                             logger.debug("Broad sweep error at offset %d", offset)
+
+                # ── 4. Wallet harvesting every 30 minutes ──
+                if now - last_harvest >= HARVEST_INTERVAL:
+                    last_harvest = now
+                    try:
+                        wallets = harvest_wallets(top_markets=20)
+                        harvest_new = 0
+                        for wallet in wallets:
+                            if stop_event.is_set():
+                                break
+                            try:
+                                trades = fetch_wallet_trades(wallet, limit=50)
+                                if trades:
+                                    harvest_new += on_batch(trades)
+                            except Exception:
+                                pass
+                        if harvest_new > 0:
+                            logger.info(
+                                "Harvest: +%d new trades from %d wallets",
+                                harvest_new,
+                                len(wallets),
+                            )
+                    except Exception:
+                        logger.debug("Wallet harvest failed")
 
             except Exception:
                 logger.exception("Listener poll error")
