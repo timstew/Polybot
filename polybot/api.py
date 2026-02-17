@@ -536,17 +536,21 @@ def trades_clear():
 
 @app.post("/api/detect")
 def detect(min_trades: int = Query(20)):
-    """Run bot detection in-memory by fetching trades from the Data API."""
+    """Run bot detection on locally ingested trades.
+
+    Uses trades already in the database (from the firehose listener)
+    rather than re-fetching from the API, which is fast and avoids
+    rate-limiting issues with large wallet counts.
+    """
     db = _db()
-    wallets = db.get_all_wallets_trade_counts()
-    wallet_list = list(wallets.keys())
     detector = BotDetector(db, config)
-    suspects = detector.scan_wallets_remote(wallet_list, min_trades=min_trades)
+    suspects = detector.scan_all_wallets(min_trades=min_trades)
+    wallets_scanned = len(db.get_all_wallets_trade_counts())
     db.close()
     return {
         "status": "completed",
         "bots_found": len(suspects),
-        "wallets_scanned": len(wallet_list),
+        "wallets_scanned": wallets_scanned,
     }
 
 
