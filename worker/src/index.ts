@@ -1,6 +1,42 @@
 import { pollCycle } from "./listener";
 import type { CopyTarget, CopyTrade, Env } from "./types";
 
+export { FirehoseDO } from "./firehose-do";
+
+// ── CORS ───────────────────────────────────────────────────────────
+
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "https://polybot.pages.dev",
+  "https://polybot-b5l.pages.dev",
+  "https://polybot-copy-listener.timstew.workers.dev",
+];
+
+function corsHeaders(origin: string): Record<string, string> {
+  const allowed = ALLOWED_ORIGINS.some(
+    (o) =>
+      origin === o ||
+      origin.endsWith(".polybot.pages.dev") ||
+      origin.endsWith(".polybot-b5l.pages.dev"),
+  );
+  return {
+    "Access-Control-Allow-Origin": allowed ? origin : ALLOWED_ORIGINS[0],
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
+
+function jsonCors(data: unknown, request: Request, status = 200): Response {
+  const origin = request.headers.get("Origin") || "";
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(origin),
+    },
+  });
+}
+
 // ── Durable Object: self-scheduling copy listener ──────────────────
 
 export class CopyListenerDO implements DurableObject {
@@ -62,15 +98,111 @@ export class CopyListenerDO implements DurableObject {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const origin = request.headers.get("Origin") || "";
 
-    // Durable Object control routes
+    // Handle CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(origin),
+      });
+    }
+
+    // ── Firehose routes → FirehoseDO ───────────────────────────────
+
+    if (url.pathname.startsWith("/firehose/")) {
+      const id = env.FIREHOSE.idFromName("singleton");
+      const obj = env.FIREHOSE.get(id);
+      const doResp = await obj.fetch(request);
+      const data = await doResp.json();
+      return jsonCors(data, request, doResp.status);
+    }
+
+    // ── API routes (dashboard compatibility) ───────────────────────
+
+    if (url.pathname === "/api/listener/start") {
+      const id = env.FIREHOSE.idFromName("singleton");
+      const obj = env.FIREHOSE.get(id);
+      const doResp = await obj.fetch(
+        new Request("https://dummy/firehose/start", { method: "POST" }),
+      );
+      return jsonCors(await doResp.json(), request);
+    }
+
+    if (url.pathname === "/api/listener/stop") {
+      const id = env.FIREHOSE.idFromName("singleton");
+      const obj = env.FIREHOSE.get(id);
+      const doResp = await obj.fetch(
+        new Request("https://dummy/firehose/stop", { method: "POST" }),
+      );
+      return jsonCors(await doResp.json(), request);
+    }
+
+    if (url.pathname === "/api/trades/clear") {
+      const id = env.FIREHOSE.idFromName("singleton");
+      const obj = env.FIREHOSE.get(id);
+      const doResp = await obj.fetch(
+        new Request("https://dummy/firehose/clear", { method: "POST" }),
+      );
+      return jsonCors(await doResp.json(), request);
+    }
+
+    if (url.pathname === "/api/stats") {
+      // Merge firehose + copy listener stats
+      const firehoseId = env.FIREHOSE.idFromName("singleton");
+      const firehoseObj = env.FIREHOSE.get(firehoseId);
+      const firehoseResp = await firehoseObj.fetch(
+        new Request("https://dummy/firehose/status"),
+      );
+      const firehose = (await firehoseResp.json()) as Record<string, unknown>;
+
+      const listenerId = env.LISTENER.idFromName("singleton");
+      const listenerObj = env.LISTENER.get(listenerId);
+      const listenerResp = await listenerObj.fetch(
+        new Request("https://dummy/status"),
+      );
+      const listener = (await listenerResp.json()) as Record<string, unknown>;
+
+      // Count copy trades and targets
+      const [copyTradeRow, targetRow, botRow] = await Promise.all([
+        env.DB.prepare("SELECT COUNT(*) as cnt FROM copy_trades").first<{
+          cnt: number;
+        }>(),
+        env.DB.prepare(
+          "SELECT COUNT(*) as cnt FROM copy_targets WHERE active = 1",
+        ).first<{ cnt: number }>(),
+        env.DB.prepare(
+          "SELECT COUNT(DISTINCT taker) as cnt FROM firehose_trades",
+        ).first<{ cnt: number }>(),
+      ]);
+
+      return jsonCors(
+        {
+          trade_count: firehose.trade_count ?? 0,
+          wallet_count: firehose.wallet_count ?? 0,
+          bot_count: 0, // detection runs locally
+          copy_targets: targetRow?.cnt ?? 0,
+          listening: firehose.running ?? false,
+          listener_new_trades: firehose.trade_count ?? 0,
+          listener_polls: firehose.polls ?? 0,
+          listener_cumulative_seconds: 0,
+          copy_listening: listener.running ?? false,
+          copy_trade_count: copyTradeRow?.cnt ?? 0,
+          unique_wallets: botRow?.cnt ?? 0,
+        },
+        request,
+      );
+    }
+
+    // ── Copy listener routes (existing) ────────────────────────────
+
     if (["/start", "/stop"].includes(url.pathname)) {
       const id = env.LISTENER.idFromName("singleton");
       const obj = env.LISTENER.get(id);
-      return obj.fetch(request);
+      const doResp = await obj.fetch(request);
+      return jsonCors(await doResp.json(), request);
     }
 
-    // Status: merge DO status with trade count from D1
     if (url.pathname === "/status") {
       const id = env.LISTENER.idFromName("singleton");
       const obj = env.LISTENER.get(id);
@@ -80,18 +212,16 @@ export default {
         "SELECT COUNT(*) as cnt FROM copy_trades",
       ).all<{ cnt: number }>();
       const tradeCount = results?.[0]?.cnt ?? 0;
-      return json({ ...doStatus, trade_count: tradeCount });
+      return jsonCors({ ...doStatus, trade_count: tradeCount }, request);
     }
 
-    // GET /targets — read copy_targets from D1
     if (url.pathname === "/targets" && request.method === "GET") {
       const { results } = await env.DB.prepare(
         "SELECT * FROM copy_targets",
       ).all<CopyTarget>();
-      return json(results ?? []);
+      return jsonCors(results ?? [], request);
     }
 
-    // GET /trades — read recent copy_trades from D1
     if (url.pathname === "/trades" && request.method === "GET") {
       const limit = Number(url.searchParams.get("limit") ?? "20");
       const { results } = await env.DB.prepare(
@@ -99,10 +229,9 @@ export default {
       )
         .bind(limit)
         .all<CopyTrade>();
-      return json(results ?? []);
+      return jsonCors(results ?? [], request);
     }
 
-    // POST /sync — receive copy_targets from local app, upsert into D1
     if (url.pathname === "/sync" && request.method === "POST") {
       const targets: CopyTarget[] = await request.json();
       const stmt = env.DB.prepare(
@@ -128,23 +257,44 @@ export default {
         ),
       );
       if (batch.length > 0) await env.DB.batch(batch);
-      return json({ status: "synced", count: targets.length });
+      return jsonCors({ status: "synced", count: targets.length }, request);
     }
 
-    return json({ service: "polybot-copy-listener" });
+    return jsonCors({ service: "polybot-copy-listener" }, request);
   },
 
-  // Cron trigger: auto-start unless the user explicitly stopped it
+  // Cron trigger: auto-start DOs unless the user explicitly stopped them
   async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    const id = env.LISTENER.idFromName("singleton");
-    const obj = env.LISTENER.get(id);
-    const resp = await obj.fetch(new Request("https://dummy/status"));
-    const status = (await resp.json()) as {
+    // Auto-start copy listener
+    const listenerId = env.LISTENER.idFromName("singleton");
+    const listenerObj = env.LISTENER.get(listenerId);
+    const listenerResp = await listenerObj.fetch(
+      new Request("https://dummy/status"),
+    );
+    const listenerStatus = (await listenerResp.json()) as {
       running: boolean;
       userStopped?: boolean;
     };
-    if (!status.running && !status.userStopped) {
-      await obj.fetch(new Request("https://dummy/start", { method: "POST" }));
+    if (!listenerStatus.running && !listenerStatus.userStopped) {
+      await listenerObj.fetch(
+        new Request("https://dummy/start", { method: "POST" }),
+      );
+    }
+
+    // Auto-start firehose
+    const firehoseId = env.FIREHOSE.idFromName("singleton");
+    const firehoseObj = env.FIREHOSE.get(firehoseId);
+    const firehoseResp = await firehoseObj.fetch(
+      new Request("https://dummy/firehose/status"),
+    );
+    const firehoseStatus = (await firehoseResp.json()) as {
+      running: boolean;
+      userStopped?: boolean;
+    };
+    if (!firehoseStatus.running && !firehoseStatus.userStopped) {
+      await firehoseObj.fetch(
+        new Request("https://dummy/firehose/start", { method: "POST" }),
+      );
     }
   },
 };

@@ -9,12 +9,17 @@ database_id = "1a14301f-5bbd-4be9-a530-56322028ee13"
 
 [durable_objects]
 bindings = [
-  { name = "LISTENER", class_name = "CopyListenerDO" }
+  { name = "LISTENER", class_name = "CopyListenerDO" },
+  { name = "FIREHOSE", class_name = "FirehoseDO" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_classes = ["CopyListenerDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["FirehoseDO"]
 
 # Auto-start: runs every minute to ensure the listener is alive
 [triggers]

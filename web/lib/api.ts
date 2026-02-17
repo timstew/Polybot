@@ -1,11 +1,13 @@
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+
 async function fetchJSON<T>(path: string): Promise<T> {
-  const res = await fetch(path, { cache: "no-store" });
+  const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
 }
 
 async function postJSON<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     cache: "no-store",
     headers: body ? { "Content-Type": "application/json" } : {},
@@ -17,6 +19,7 @@ async function postJSON<T>(path: string, body?: unknown): Promise<T> {
 
 export interface Stats {
   trade_count: number;
+  wallet_count: number;
   bot_count: number;
   copy_targets: number;
   listening: boolean;

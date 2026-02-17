@@ -42,6 +42,7 @@ import {
   Copy,
   Database,
   Trash2,
+  Users,
 } from "lucide-react";
 
 function fmt(n: number) {
@@ -466,7 +467,7 @@ export default function DashboardPage() {
             <Separator />
 
             {/* Stats row */}
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
               <Stat
                 icon={Database}
                 label="Trades Ingested"
@@ -478,6 +479,18 @@ export default function DashboardPage() {
                   )
                 }
                 tip="Total trades captured from the Polymarket firehose"
+              />
+              <Stat
+                icon={Users}
+                label="Wallets Found"
+                value={
+                  stats ? (
+                    (stats.wallet_count ?? 0).toLocaleString()
+                  ) : (
+                    <Skeleton className="h-4 w-12" />
+                  )
+                }
+                tip="Unique wallet addresses discovered from trades + leaderboard harvesting"
               />
               <Stat
                 icon={Bot}
@@ -504,14 +517,9 @@ export default function DashboardPage() {
                 label="Listener"
                 value={
                   stats ? (
-                    cloudStatus?.running ? (
+                    listening ? (
                       <span className="text-green-600">
-                        Cloud ({(cloudStatus.trade_count ?? 0).toLocaleString()}{" "}
-                        trades)
-                      </span>
-                    ) : listening ? (
-                      <span className="text-green-600">
-                        Local (+{stats.listener_new_trades.toLocaleString()})
+                        Live (+{stats.listener_new_trades.toLocaleString()})
                       </span>
                     ) : (
                       <span className="text-muted-foreground">Idle</span>
@@ -520,7 +528,7 @@ export default function DashboardPage() {
                     <Skeleton className="h-4 w-12" />
                   )
                 }
-                tip="Copy listener status — cloud (Cloudflare Worker) or local firehose"
+                tip="Firehose listener status — ingesting trades from Polymarket"
               />
             </div>
           </CardContent>
