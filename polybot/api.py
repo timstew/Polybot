@@ -536,16 +536,34 @@ def trades_clear():
 
 @app.post("/api/detect")
 def detect(min_trades: int = Query(20)):
-    """Run bot detection on locally ingested trades.
+    """Run bot detection: local scan then remote-enrich top candidates.
 
-    Uses trades already in the database (from the firehose listener)
-    rather than re-fetching from the API, which is fast and avoids
-    rate-limiting issues with large wallet counts.
+    1. Scans all wallets with ≥min_trades local trades (fast, no HTTP).
+    2. For the top wallets by local trade count that didn't score as bots,
+       fetches full trade history from the API for a richer analysis.
     """
     db = _db()
     detector = BotDetector(db, config)
+
+    # Phase 1: fast local scan
     suspects = detector.scan_all_wallets(min_trades=min_trades)
-    wallets_scanned = len(db.get_all_wallets_trade_counts())
+    found_wallets = {s.wallet for s in suspects}
+
+    # Phase 2: remote-enrich top wallets that didn't make the cut locally
+    wallets = db.get_all_wallets_trade_counts()
+    candidates = [
+        w
+        for w, count in sorted(wallets.items(), key=lambda x: x[1], reverse=True)
+        if count >= min_trades and w not in found_wallets
+    ][:200]  # cap at 200 to avoid rate limiting
+
+    if candidates:
+        remote_suspects = detector.scan_wallets_remote(
+            candidates, min_trades=min_trades
+        )
+        suspects.extend(remote_suspects)
+
+    wallets_scanned = len(wallets)
     db.close()
     return {
         "status": "completed",
@@ -569,14 +587,24 @@ def unified(
     bot_map = {s.wallet: s for s in suspects}
     wallets = [s.wallet for s in suspects[:top]]
 
-    # Profitability from Polymarket Data API
-    results = tracker.rank_wallets_remote(wallets, sort_by=sort_by)
+    # Profitability from Polymarket Data API (fail gracefully)
+    try:
+        results = tracker.rank_wallets_remote(wallets, sort_by=sort_by)
+    except Exception:
+        logger.warning("rank_wallets_remote failed, using detection data only")
+        results = []
 
-    # Time-windowed profits from Polymarket Leaderboard API
-    profits = tracker.fetch_wallets_profit([r.wallet for r in results])
+    # Time-windowed profits from Polymarket Leaderboard API (fail gracefully)
+    try:
+        profits = tracker.fetch_wallets_profit([r.wallet for r in results])
+    except Exception:
+        logger.warning("fetch_wallets_profit failed")
+        profits = {}
 
     db.close()
 
+    # Build rows from profitability results
+    result_wallets = {r.wallet for r in results}
     rows = []
     for r in results:
         bot = bot_map.get(r.wallet)
@@ -619,6 +647,37 @@ def unified(
             **{k: v for k, v in p.items() if k not in ("lb_pnl_pct", "volume_all")},
         }
         rows.append(row)
+
+    # If remote profitability failed, still return bots with detection data only
+    for s in suspects[:top]:
+        if s.wallet in result_wallets:
+            continue
+        signals = s.signals
+        copy_score = BotDetector.compute_copy_score(signals)
+        rows.append(
+            {
+                "wallet": s.wallet,
+                "confidence": s.confidence,
+                "category": (
+                    s.category.value if hasattr(s.category, "value") else s.category
+                ),
+                "tags": s.tags,
+                "avg_hold_time_hours": signals.avg_hold_time_hours,
+                "pnl_pct": 0,
+                "realized_pnl": 0,
+                "unrealized_pnl": 0,
+                "win_rate": 0,
+                "total_volume_usd": 0,
+                "active_positions": 0,
+                "portfolio_value": 0,
+                "market_categories": [],
+                "copy_score": round(copy_score, 1),
+                "trades_per_market": round(signals.trades_per_market, 1),
+                "avg_market_burst": round(signals.avg_market_burst, 1),
+                "max_market_burst": signals.max_market_burst,
+                "market_concentration": round(signals.market_concentration, 2),
+            }
+        )
 
     return rows
 

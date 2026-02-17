@@ -338,10 +338,9 @@ export default function DashboardPage() {
               Control Panel
             </CardTitle>
             <CardDescription>
-              Start the listener to discover wallets from the Polymarket
-              firehose, then scan to classify bots. Detection fetches live data
-              from Polymarket &mdash; the listener only needs to run long enough
-              to collect wallet addresses.
+              Start the listener to stream trades from Polymarket via real-time
+              WebSocket + REST APIs, then scan to classify bots. Longer
+              listening = more trade data per wallet = better detection.
             </CardDescription>
           </CardHeader>
 
@@ -433,9 +432,8 @@ export default function DashboardPage() {
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Analyze discovered wallets for bot-like patterns using live
-                  Polymarket trade data. This runs in-memory &mdash; no trades
-                  are stored.
+                  Analyze discovered wallets for bot-like patterns using
+                  ingested trades + Polymarket activity data.
                 </p>
                 <div className="flex items-center gap-3">
                   <Button
