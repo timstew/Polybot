@@ -18,3 +18,4 @@ polybot.db
 node_modules/
 .wrangler/
 web/.next/
+.playwright-mcp/

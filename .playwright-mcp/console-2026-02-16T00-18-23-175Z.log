@@ -1,1 +1,0 @@
-[   30138ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:3000/api/rank?top=30&min_confidence=0.01&sort_by=pnl_pct:0
