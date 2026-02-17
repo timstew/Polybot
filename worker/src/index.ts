@@ -260,7 +260,11 @@ export default {
       return jsonCors({ status: "synced", count: targets.length }, request);
     }
 
-    return jsonCors({ service: "polybot-copy-listener" }, request);
+    return jsonCors(
+      { error: "not_found", message: "Unknown route" },
+      request,
+      404,
+    );
   },
 
   // Cron trigger: auto-start DOs unless the user explicitly stopped them

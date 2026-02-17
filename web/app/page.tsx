@@ -172,11 +172,7 @@ export default function DashboardPage() {
   const [listenerLoading, setListenerLoading] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [detectResult, setDetectResult] = useState<string | null>(null);
-  const [cloudStatus, setCloudStatus] = useState<{
-    running: boolean;
-    polls?: number;
-    trade_count?: number;
-  } | null>(null);
+
   const [timerSeconds, setTimerSeconds] = useState(0);
   const timerSnapshotRef = useRef<{ seconds: number; fetchedAt: number }>({
     seconds: 0,
@@ -203,27 +199,13 @@ export default function DashboardPage() {
     api
       .unified(50, 0.01, "pnl_pct")
       .then(setRows)
-      .catch((e) => setError(e.message));
-  }, []);
-
-  const refreshCloudStatus = useCallback(() => {
-    api
-      .cloudListenerStatus()
-      .then(setCloudStatus)
-      .catch(() => setCloudStatus(null));
+      .catch(() => setRows([]));
   }, []);
 
   useEffect(() => {
     refreshStats();
     refreshTable();
-    refreshCloudStatus();
-  }, [refreshStats, refreshTable, refreshCloudStatus]);
-
-  // Poll cloud status periodically
-  useEffect(() => {
-    const id = setInterval(refreshCloudStatus, 15000);
-    return () => clearInterval(id);
-  }, [refreshCloudStatus]);
+  }, [refreshStats, refreshTable]);
 
   useEffect(() => {
     if (!listening) return;
@@ -264,13 +246,17 @@ export default function DashboardPage() {
     setDetectResult(null);
     try {
       const result = await api.detect();
-      setDetectResult(
-        `Found ${result.bots_found} bots from ${result.wallets_scanned} wallets`,
-      );
+      if (result.bots_found !== undefined) {
+        setDetectResult(
+          `Found ${result.bots_found} bots from ${result.wallets_scanned} wallets`,
+        );
+      } else {
+        setDetectResult("Detection requires local Python backend");
+      }
       refreshStats();
       refreshTable();
     } catch {
-      setDetectResult("Detection failed");
+      setDetectResult("Detection requires local Python backend");
     }
     setDetecting(false);
   }
