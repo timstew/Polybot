@@ -498,6 +498,16 @@ def bots_clear():
     return {"status": "cleared"}
 
 
+@app.post("/api/trades/clear")
+def trades_clear():
+    """Clear all ingested firehose trades from the database."""
+    db = _db()
+    db.conn.execute("DELETE FROM trades")
+    db.conn.commit()
+    db.close()
+    return {"status": "cleared"}
+
+
 @app.post("/api/detect")
 def detect(min_trades: int = Query(20)):
     """Run bot detection in-memory by fetching trades from the Data API."""

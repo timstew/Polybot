@@ -160,6 +160,11 @@ export default function DashboardPage() {
   const [listenerLoading, setListenerLoading] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [detectResult, setDetectResult] = useState<string | null>(null);
+  const [cloudStatus, setCloudStatus] = useState<{
+    running: boolean;
+    polls?: number;
+    trade_count?: number;
+  } | null>(null);
 
   const refreshStats = useCallback(() => {
     api
@@ -178,10 +183,24 @@ export default function DashboardPage() {
       .catch((e) => setError(e.message));
   }, []);
 
+  const refreshCloudStatus = useCallback(() => {
+    api
+      .cloudListenerStatus()
+      .then(setCloudStatus)
+      .catch(() => setCloudStatus(null));
+  }, []);
+
   useEffect(() => {
     refreshStats();
     refreshTable();
-  }, [refreshStats, refreshTable]);
+    refreshCloudStatus();
+  }, [refreshStats, refreshTable, refreshCloudStatus]);
+
+  // Poll cloud status periodically
+  useEffect(() => {
+    const id = setInterval(refreshCloudStatus, 15000);
+    return () => clearInterval(id);
+  }, [refreshCloudStatus]);
 
   useEffect(() => {
     if (!listening) return;
@@ -228,6 +247,15 @@ export default function DashboardPage() {
       setDetectResult(null);
       refreshStats();
       refreshTable();
+    } catch {
+      // ignore
+    }
+  }
+
+  async function clearTrades() {
+    try {
+      await api.tradesClear();
+      refreshStats();
     } catch {
       // ignore
     }
@@ -327,6 +355,15 @@ export default function DashboardPage() {
                   >
                     <Radio className="mr-1.5 h-3.5 w-3.5" />
                     {listenerLoading ? "..." : listening ? "Stop" : "Start"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={clearTrades}
+                    disabled={listening}
+                  >
+                    <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                    Clear
                   </Button>
                   {listening && stats && (
                     <span className="text-xs text-muted-foreground tabular-nums">
@@ -430,9 +467,14 @@ export default function DashboardPage() {
                 label="Listener"
                 value={
                   stats ? (
-                    listening ? (
+                    cloudStatus?.running ? (
                       <span className="text-green-600">
-                        Active (+{stats.listener_new_trades.toLocaleString()})
+                        Cloud ({(cloudStatus.trade_count ?? 0).toLocaleString()}{" "}
+                        trades)
+                      </span>
+                    ) : listening ? (
+                      <span className="text-green-600">
+                        Local (+{stats.listener_new_trades.toLocaleString()})
                       </span>
                     ) : (
                       <span className="text-muted-foreground">Idle</span>
@@ -441,7 +483,7 @@ export default function DashboardPage() {
                     <Skeleton className="h-4 w-12" />
                   )
                 }
-                tip="Real-time trade stream status"
+                tip="Copy listener status — cloud (Cloudflare Worker) or local firehose"
               />
             </div>
           </CardContent>

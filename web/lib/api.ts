@@ -243,6 +243,7 @@ export const api = {
       `/api/detect?min_trades=${minTrades}`,
     ),
   botsClear: () => postJSON<{ status: string }>("/api/bots/clear"),
+  tradesClear: () => postJSON<{ status: string }>("/api/trades/clear"),
   copyDetail: (wallet: string, source: "local" | "cloud" = "local") =>
     fetchJSON<CopyDetailData>(`/api/copy/detail/${wallet}?source=${source}`),
   wallet: (address: string) =>
