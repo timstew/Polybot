@@ -22,6 +22,7 @@ export interface Stats {
   listening: boolean;
   listener_new_trades: number;
   listener_polls: number;
+  listener_cumulative_seconds: number;
   copy_listening: boolean;
 }
 

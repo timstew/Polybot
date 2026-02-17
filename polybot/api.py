@@ -38,6 +38,8 @@ _listener_stop: threading.Event | None = None
 _listener_thread: threading.Thread | None = None
 _listener_new_trades: int = 0
 _listener_polls: int = 0
+_listener_cumulative_seconds: float = 0.0
+_listener_started_at: float | None = None  # time.time() when current session started
 _slippage_tracker = SlippageTracker()
 
 # ── Copy-only listener state ────────────────────────────────────────
@@ -63,6 +65,10 @@ def stats():
         _copy_listener_thread is not None and _copy_listener_thread.is_alive()
     )
     db.close()
+    cumulative = _listener_cumulative_seconds
+    if _listener_started_at is not None:
+        cumulative += time.time() - _listener_started_at
+
     return {
         "trade_count": trade_count,
         "bot_count": len(bots),
@@ -70,6 +76,7 @@ def stats():
         "listening": listening,
         "listener_new_trades": _listener_new_trades,
         "listener_polls": _listener_polls,
+        "listener_cumulative_seconds": cumulative,
         "copy_listening": copy_listening,
     }
 
@@ -81,6 +88,7 @@ def listener_start():
         _listener_thread, \
         _listener_new_trades, \
         _listener_polls, \
+        _listener_started_at, \
         _slippage_tracker
 
     if _listener_thread is not None and _listener_thread.is_alive():
@@ -92,6 +100,7 @@ def listener_start():
 
     _listener_new_trades = 0
     _listener_polls = 0
+    _listener_started_at = time.time()
     _listener_stop = threading.Event()
     _slippage_tracker = SlippageTracker()
 
@@ -143,7 +152,11 @@ def listener_start():
 
 @app.post("/api/listener/stop")
 def listener_stop():
-    global _listener_stop, _listener_thread
+    global \
+        _listener_stop, \
+        _listener_thread, \
+        _listener_cumulative_seconds, \
+        _listener_started_at
 
     if (
         _listener_stop is None
@@ -151,6 +164,10 @@ def listener_stop():
         or not _listener_thread.is_alive()
     ):
         return {"status": "not_running"}
+
+    if _listener_started_at is not None:
+        _listener_cumulative_seconds += time.time() - _listener_started_at
+        _listener_started_at = None
 
     _listener_stop.set()
     _listener_thread.join(timeout=5)
@@ -500,11 +517,20 @@ def bots_clear():
 
 @app.post("/api/trades/clear")
 def trades_clear():
-    """Clear all ingested firehose trades from the database."""
+    """Clear all ingested firehose trades and reset the listening timer."""
+    global \
+        _listener_cumulative_seconds, \
+        _listener_started_at, \
+        _listener_new_trades, \
+        _listener_polls
     db = _db()
     db.conn.execute("DELETE FROM trades")
     db.conn.commit()
     db.close()
+    _listener_cumulative_seconds = 0.0
+    _listener_started_at = None
+    _listener_new_trades = 0
+    _listener_polls = 0
     return {"status": "cleared"}
 
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Card,
   CardAction,
@@ -38,6 +38,7 @@ import {
   Search,
   Activity,
   Bot,
+  Clock,
   Copy,
   Database,
   Trash2,
@@ -54,6 +55,16 @@ function fmtHold(hours: number): string {
   const mins = hours * 60;
   if (mins >= 1) return `${mins.toFixed(0)}m`;
   return `${(mins * 60).toFixed(0)}s`;
+}
+
+function fmtTimer(totalSeconds: number): string {
+  if (totalSeconds <= 0) return "0s";
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 const categoryColor: Record<string, string> = {
@@ -165,6 +176,11 @@ export default function DashboardPage() {
     polls?: number;
     trade_count?: number;
   } | null>(null);
+  const [timerSeconds, setTimerSeconds] = useState(0);
+  const timerSnapshotRef = useRef<{ seconds: number; fetchedAt: number }>({
+    seconds: 0,
+    fetchedAt: Date.now() / 1000,
+  });
 
   const refreshStats = useCallback(() => {
     api
@@ -172,6 +188,12 @@ export default function DashboardPage() {
       .then((s) => {
         setStats(s);
         setListening(s.listening);
+        const secs = s.listener_cumulative_seconds ?? 0;
+        timerSnapshotRef.current = {
+          seconds: secs,
+          fetchedAt: Date.now() / 1000,
+        };
+        setTimerSeconds(Math.floor(secs));
       })
       .catch(() => {});
   }, []);
@@ -207,6 +229,17 @@ export default function DashboardPage() {
     const id = setInterval(refreshStats, 5000);
     return () => clearInterval(id);
   }, [listening, refreshStats]);
+
+  // Tick the timer every second while listening
+  useEffect(() => {
+    if (!listening) return;
+    const id = setInterval(() => {
+      const snap = timerSnapshotRef.current;
+      const elapsed = Date.now() / 1000 - snap.fetchedAt;
+      setTimerSeconds(Math.floor(snap.seconds + elapsed));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [listening]);
 
   async function toggleListener() {
     setListenerLoading(true);
@@ -365,6 +398,12 @@ export default function DashboardPage() {
                     <Trash2 className="mr-1.5 h-3.5 w-3.5" />
                     Clear
                   </Button>
+                  {timerSeconds > 0 && (
+                    <span className="flex items-center gap-1 text-xs text-muted-foreground tabular-nums">
+                      <Clock className="h-3 w-3" />
+                      {fmtTimer(timerSeconds)}
+                    </span>
+                  )}
                   {listening && stats && (
                     <span className="text-xs text-muted-foreground tabular-nums">
                       +{stats.listener_new_trades.toLocaleString()} trades
