@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS copy_trades (
     pnl REAL NOT NULL DEFAULT 0.0,
     source_price REAL NOT NULL DEFAULT 0.0,
     exec_price REAL NOT NULL DEFAULT 0.0,
-    fee_amount REAL NOT NULL DEFAULT 0.0
+    fee_amount REAL NOT NULL DEFAULT 0.0,
+    title TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_copy_trades_wallet ON copy_trades(source_wallet);

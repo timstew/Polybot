@@ -451,6 +451,179 @@ export default {
       );
     }
 
+    // ── Wallet detail (D1 bot data + copy trade FIFO + Polymarket positions)
+    const walletMatch = url.pathname.match(/^\/api\/wallet\/(0x[a-fA-F0-9]+)$/);
+    if (walletMatch) {
+      const w = walletMatch[1].toLowerCase();
+
+      // 1. Bot info from D1
+      const botRow = await env.DB.prepare(
+        "SELECT * FROM suspect_bots WHERE wallet = ?",
+      )
+        .bind(w)
+        .first<{
+          wallet: string;
+          confidence: number;
+          category: string;
+          trade_count: number;
+          tags: string;
+          win_rate: number;
+          total_volume_usd: number;
+          pnl_pct: number;
+          realized_pnl: number;
+          profit_1d: number;
+          profit_7d: number;
+          profit_30d: number;
+          profit_all: number;
+          username: string;
+          copy_score: number;
+        }>();
+
+      // 2. Copy trade data (if we're copy-trading this wallet)
+      const { results: copyTrades } = await env.DB.prepare(
+        `SELECT market, asset_id, side, price, size, timestamp, fee_amount, title
+         FROM copy_trades
+         WHERE source_wallet = ? AND status = 'filled'
+         ORDER BY timestamp`,
+      )
+        .bind(w)
+        .all<TradeRowWithMarket & { title: string }>();
+
+      const copyPnl =
+        copyTrades && copyTrades.length > 0 ? computeFifoPnl(copyTrades) : null;
+
+      // 3. Username from activity API
+      let username = botRow?.username || "";
+      if (!username) {
+        try {
+          const actResp = await fetch(
+            `https://data-api.polymarket.com/activity?user=${w}&limit=1`,
+          );
+          if (actResp.ok) {
+            const entries = (await actResp.json()) as Array<{
+              name?: string;
+            }>;
+            const n = entries?.[0]?.name;
+            if (n && !n.startsWith("0x")) username = n;
+          }
+        } catch {
+          // optional
+        }
+      }
+
+      // 4. Polymarket positions
+      let positions: Array<Record<string, unknown>> = [];
+      try {
+        const posResp = await fetch(
+          `https://data-api.polymarket.com/positions?user=${w}&sizeThreshold=-1&limit=100`,
+        );
+        if (posResp.ok) {
+          positions = (await posResp.json()) as Array<Record<string, unknown>>;
+        }
+      } catch {
+        // optional
+      }
+
+      const vol = botRow?.total_volume_usd || 0;
+      const winRate = botRow?.win_rate || 0;
+      const copyWinRate =
+        copyPnl && copyPnl.wins + copyPnl.losses > 0
+          ? Math.round(
+              (copyPnl.wins / (copyPnl.wins + copyPnl.losses)) * 1000,
+            ) / 10
+          : 0;
+
+      return jsonCors(
+        {
+          username,
+          bot: botRow
+            ? {
+                wallet: botRow.wallet,
+                confidence: botRow.confidence,
+                category: botRow.category,
+                tags: JSON.parse(botRow.tags || "[]"),
+                avg_hold_time_hours: 0,
+              }
+            : null,
+          profitability: {
+            total_trades: botRow?.trade_count || copyTrades?.length || 0,
+            total_volume_usd: vol,
+            realized_pnl: copyPnl?.realized_pnl ?? botRow?.realized_pnl ?? 0,
+            unrealized_pnl: 0,
+            pnl_pct: botRow?.pnl_pct || 0,
+            win_rate: copyPnl ? copyWinRate / 100 : winRate,
+            markets_traded: 0,
+            active_positions: positions.length,
+            market_categories: [],
+          },
+          copy_trading: copyPnl
+            ? {
+                trade_count: copyTrades?.length ?? 0,
+                realized_pnl: copyPnl.realized_pnl,
+                total_fees: copyPnl.total_fees,
+                peak_capital: copyPnl.peak_capital,
+                avg_hold_time_hours: copyPnl.avg_hold_time_hours,
+                wins: copyPnl.wins,
+                losses: copyPnl.losses,
+                win_rate: copyWinRate,
+                best_trade_pnl: copyPnl.best_trade_pnl,
+                worst_trade_pnl: copyPnl.worst_trade_pnl,
+                pnl_series: copyPnl.pnl_series,
+              }
+            : null,
+          positions: positions.map((p) => ({
+            title: String(p.title ?? ""),
+            outcome: String(p.outcome ?? ""),
+            size: Number(p.size ?? 0),
+            avg_price: Number(p.avgPrice ?? 0),
+            current_price: Number(p.curPrice ?? 0),
+            initial_value: Number(p.initialValue ?? 0),
+            current_value: Number(p.currentValue ?? 0),
+            cash_pnl: Number(p.cashPnl ?? 0),
+            percent_pnl: Number(p.percentPnl ?? 0),
+            realized_pnl: Number(p.realizedPnl ?? 0),
+            slug: String(p.slug ?? ""),
+          })),
+          profit_1d: botRow?.profit_1d || 0,
+          profit_7d: botRow?.profit_7d || 0,
+          profit_30d: botRow?.profit_30d || 0,
+          profit_all: botRow?.profit_all || 0,
+        },
+        request,
+      );
+    }
+
+    // Wallet trades — return copy trades if available, else fall through to Python
+    const walletTradesMatch = url.pathname.match(
+      /^\/api\/wallet\/(0x[a-fA-F0-9]+)\/trades$/,
+    );
+    if (walletTradesMatch) {
+      const w = walletTradesMatch[1].toLowerCase();
+      const limit = Number(url.searchParams.get("limit") ?? "100");
+      const { results: trades } = await env.DB.prepare(
+        `SELECT id, market, title, side, price, size, timestamp
+         FROM copy_trades
+         WHERE source_wallet = ? AND status = 'filled'
+         ORDER BY timestamp DESC
+         LIMIT ?`,
+      )
+        .bind(w, limit)
+        .all<{
+          id: string;
+          market: string;
+          title: string;
+          side: string;
+          price: number;
+          size: number;
+          timestamp: string;
+        }>();
+
+      if (trades && trades.length > 0) {
+        return jsonCors(trades, request);
+      }
+      // Fall through to Python API if no copy trades
+    }
+
     if (url.pathname === "/api/trades/clear") {
       const id = env.FIREHOSE.idFromName("singleton");
       const obj = env.FIREHOSE.get(id);

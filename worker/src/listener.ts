@@ -139,6 +139,7 @@ export function calculateCopyTrade(
     source_price: trade.price,
     exec_price: execPrice,
     fee_amount: feeAmount,
+    title: trade.title || "",
   };
 }
 
@@ -153,8 +154,8 @@ async function insertCopyTrade(db: D1Database, copy: CopyTrade): Promise<void> {
       `INSERT OR IGNORE INTO copy_trades
        (id, source_trade_id, source_wallet, market, asset_id,
         side, price, size, mode, timestamp, status, pnl,
-        source_price, exec_price, fee_amount)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        source_price, exec_price, fee_amount, title)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       copy.id,
@@ -172,6 +173,7 @@ async function insertCopyTrade(db: D1Database, copy: CopyTrade): Promise<void> {
       copy.source_price,
       copy.exec_price,
       copy.fee_amount,
+      copy.title,
     )
     .run();
 }
@@ -230,6 +232,7 @@ async function handlePositionExit(
         source_price: 0,
         exec_price: 0,
         fee_amount: 0,
+        title: event.title || "",
       };
       await insertCopyTrade(db, copy);
       count++;
@@ -278,6 +281,7 @@ async function handlePositionExit(
       source_price: exitPrice,
       exec_price: exitPrice,
       fee_amount: 0,
+      title: event.title || "",
     };
     await insertCopyTrade(db, copy);
     count++;

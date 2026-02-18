@@ -28,6 +28,7 @@ export interface CopyTrade {
   source_price: number;
   exec_price: number;
   fee_amount: number;
+  title: string;
 }
 
 export interface DataApiTrade {
