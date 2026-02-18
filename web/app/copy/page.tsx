@@ -30,6 +30,43 @@ function fmt(n: number) {
   return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+const CATEGORY_ICONS: Record<string, { icon: string; label: string }> = {
+  crypto: { icon: "₿", label: "Crypto" },
+  sports: { icon: "⚽", label: "Sports" },
+  politics: { icon: "🏛", label: "Politics" },
+  other: { icon: "📊", label: "Other" },
+};
+
+function CategoryIcons({ categories }: { categories: string[] }) {
+  if (!categories?.length)
+    return <span className="text-muted-foreground">—</span>;
+  return (
+    <span className="flex gap-0.5">
+      {categories.map((cat) => {
+        const info = CATEGORY_ICONS[cat] || { icon: "?", label: cat };
+        return (
+          <TooltipProvider key={cat}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className="cursor-default text-sm"
+                  role="img"
+                  aria-label={info.label}
+                >
+                  {info.icon}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top">
+                <p className="text-xs">{info.label}</p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        );
+      })}
+    </span>
+  );
+}
+
 function fmtHold(hours: number): string {
   if (!hours || hours <= 0) return "—";
   if (hours >= 24) return `${(hours / 24).toFixed(1)}d`;
@@ -408,6 +445,7 @@ export default function CopyTradingPage() {
                   <TableRow>
                     <TableHead className="w-8"></TableHead>
                     <TableHead>Wallet</TableHead>
+                    <TableHead>Cat</TableHead>
                     <TableHead>Mode</TableHead>
                     <TableHead className="text-right">Copy %</TableHead>
                     <TableHead className="text-right">Trades</TableHead>
@@ -439,6 +477,9 @@ export default function CopyTradingPage() {
                             address={t.wallet}
                             username={t.username}
                           />
+                        </TableCell>
+                        <TableCell>
+                          <CategoryIcons categories={t.categories ?? []} />
                         </TableCell>
                         <TableCell>
                           <Badge
@@ -510,7 +551,7 @@ export default function CopyTradingPage() {
                       </TableRow>
                       {expandedWallet === t.wallet && (
                         <TableRow key={`${t.wallet}-detail`}>
-                          <TableCell colSpan={10} className="p-0 px-4 pb-4">
+                          <TableCell colSpan={11} className="p-0 px-4 pb-4">
                             <CopyTargetDetail
                               wallet={t.wallet}
                               source="cloud"

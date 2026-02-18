@@ -133,6 +133,7 @@ export interface CopyTarget {
   trade_count: number;
   listening_hours: number;
   peak_capital: number;
+  categories: string[];
 }
 
 export interface CopyTradeRow {

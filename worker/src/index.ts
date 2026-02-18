@@ -37,6 +37,68 @@ function jsonCors(data: unknown, request: Request, status = 200): Response {
   });
 }
 
+// ── Market category detection ──────────────────────────────────────
+
+type MarketCategory = "crypto" | "sports" | "politics" | "other";
+
+function classifyTitle(title: string): MarketCategory | null {
+  if (!title) return null;
+  const t = title.toLowerCase();
+  if (
+    t.includes("bitcoin") ||
+    t.includes("ethereum") ||
+    t.includes("sol") ||
+    t.includes("up or down") ||
+    t.includes("updown") ||
+    t.includes("above")
+  )
+    return "crypto";
+  if (
+    t.includes("win the") ||
+    t.includes("division") ||
+    t.includes("championship") ||
+    t.includes("nfl") ||
+    t.includes("nba") ||
+    t.includes("nhl") ||
+    t.includes("mlb") ||
+    t.includes("score") ||
+    t.includes("super bowl") ||
+    t.includes("playoffs")
+  )
+    return "sports";
+  if (
+    t.includes("trump") ||
+    t.includes("biden") ||
+    t.includes("election") ||
+    t.includes("president") ||
+    t.includes("strike") ||
+    t.includes("congress") ||
+    t.includes("senate") ||
+    t.includes("iran") ||
+    t.includes("tariff")
+  )
+    return "politics";
+  return "other";
+}
+
+function walletCategories(trades: { title: string }[]): MarketCategory[] {
+  const counts: Record<MarketCategory, number> = {
+    crypto: 0,
+    sports: 0,
+    politics: 0,
+    other: 0,
+  };
+  for (const t of trades) {
+    const cat = classifyTitle(t.title);
+    if (cat) counts[cat]++;
+  }
+  // Return categories sorted by frequency, only those with > 0
+  return (Object.entries(counts) as [MarketCategory, number][])
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([cat]) => cat);
+}
+
 // ── FIFO P&L computation ───────────────────────────────────────────
 
 interface TradeRow {
@@ -760,15 +822,15 @@ export default {
 
       // Fetch all filled trades for FIFO P&L computation
       const { results: allTrades } = await env.DB.prepare(
-        `SELECT source_wallet, market, asset_id, side, price, size, timestamp, fee_amount
+        `SELECT source_wallet, market, asset_id, side, price, size, timestamp, fee_amount, title
          FROM copy_trades WHERE status = 'filled'
          ORDER BY timestamp`,
-      ).all<TradeRowWithMarket & { source_wallet: string }>();
+      ).all<TradeRowWithMarket & { source_wallet: string; title: string }>();
 
       // Group trades by wallet
       const tradesByWallet = new Map<
         string,
-        (TradeRowWithMarket & { source_wallet: string })[]
+        (TradeRowWithMarket & { source_wallet: string; title: string })[]
       >();
       for (const t of allTrades ?? []) {
         const arr = tradesByWallet.get(t.source_wallet);
@@ -793,6 +855,8 @@ export default {
           }
         }
 
+        const categories = walletCategories(walletTrades);
+
         return {
           wallet: r.wallet,
           username: r.display_username || r.username || "",
@@ -812,6 +876,7 @@ export default {
           listening_hours,
           avg_hold_time_hours: pnl?.avg_hold_time_hours ?? 0,
           peak_capital: pnl?.peak_capital ?? 0,
+          categories,
         };
       });
       return jsonCors(enriched, request);
