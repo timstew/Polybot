@@ -37,6 +37,187 @@ function jsonCors(data: unknown, request: Request, status = 200): Response {
   });
 }
 
+// ── FIFO P&L computation ───────────────────────────────────────────
+
+interface TradeRow {
+  asset_id: string;
+  side: string;
+  price: number;
+  size: number;
+  timestamp: string;
+  fee_amount: number;
+}
+
+interface ClosedPosition {
+  market: string;
+  asset_id: string;
+  size: number;
+  entry_price: number;
+  exit_price: number;
+  realized_pnl: number;
+  hold_time_hours: number;
+  closed_at: string;
+}
+
+interface OpenPosition {
+  market: string;
+  asset_id: string;
+  size: number;
+  entry_price: number;
+  entry_time: string;
+}
+
+interface PnlResult {
+  realized_pnl: number;
+  total_fees: number;
+  avg_hold_time_hours: number;
+  wins: number;
+  losses: number;
+  best_trade_pnl: number;
+  worst_trade_pnl: number;
+  closed_positions: ClosedPosition[];
+  open_positions: OpenPosition[];
+  pnl_series: { t: string; pnl: number }[];
+}
+
+interface TradeRowWithMarket extends TradeRow {
+  market?: string;
+}
+
+function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
+  const byAsset = new Map<string, TradeRowWithMarket[]>();
+  for (const t of trades) {
+    const arr = byAsset.get(t.asset_id);
+    if (arr) arr.push(t);
+    else byAsset.set(t.asset_id, [t]);
+  }
+
+  let realizedPnl = 0;
+  let totalFees = 0;
+  let holdTimeSum = 0;
+  let holdTimeCount = 0;
+  let wins = 0;
+  let losses = 0;
+  let bestTradePnl = 0;
+  let worstTradePnl = 0;
+  const closedPositions: ClosedPosition[] = [];
+  const openPositions: OpenPosition[] = [];
+  const pnlEvents: { t: string; pnl: number }[] = [];
+
+  for (const [assetId, assetTrades] of byAsset) {
+    assetTrades.sort(
+      (a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+    );
+    const queue: {
+      price: number;
+      remaining: number;
+      ts: number;
+      market: string;
+    }[] = [];
+
+    for (const t of assetTrades) {
+      totalFees += t.fee_amount || 0;
+      if (t.side === "BUY") {
+        queue.push({
+          price: t.price,
+          remaining: t.size,
+          ts: new Date(t.timestamp).getTime(),
+          market: t.market || "",
+        });
+      } else {
+        let sellRemaining = t.size;
+        const sellTs = new Date(t.timestamp).getTime();
+        let positionPnl = 0;
+        let positionSize = 0;
+        let entryPriceSum = 0;
+        let entryTs = 0;
+        let market = t.market || "";
+
+        while (sellRemaining > 0 && queue.length > 0) {
+          const buy = queue[0];
+          const matched = Math.min(sellRemaining, buy.remaining);
+          const matchPnl = matched * (t.price - buy.price);
+          realizedPnl += matchPnl;
+          positionPnl += matchPnl;
+          positionSize += matched;
+          entryPriceSum += buy.price * matched;
+          if (!entryTs) entryTs = buy.ts;
+          if (!market) market = buy.market;
+          holdTimeSum += ((sellTs - buy.ts) / 3_600_000) * matched;
+          holdTimeCount += matched;
+          buy.remaining -= matched;
+          sellRemaining -= matched;
+          if (buy.remaining <= 0) queue.shift();
+        }
+
+        if (positionSize > 0) {
+          const netPnl = Math.round(positionPnl * 100) / 100;
+          if (netPnl >= 0) wins++;
+          else losses++;
+          if (netPnl > bestTradePnl) bestTradePnl = netPnl;
+          if (netPnl < worstTradePnl) worstTradePnl = netPnl;
+
+          closedPositions.push({
+            market,
+            asset_id: assetId,
+            size: Math.round(positionSize * 1000) / 1000,
+            entry_price:
+              Math.round((entryPriceSum / positionSize) * 10000) / 10000,
+            exit_price: t.price,
+            realized_pnl: netPnl,
+            hold_time_hours:
+              Math.round(((sellTs - entryTs) / 3_600_000) * 10) / 10,
+            closed_at: t.timestamp,
+          });
+
+          pnlEvents.push({ t: t.timestamp, pnl: netPnl });
+        }
+      }
+    }
+
+    // Remaining in queue = open positions
+    for (const buy of queue) {
+      if (buy.remaining > 0.001) {
+        openPositions.push({
+          market: buy.market,
+          asset_id: assetId,
+          size: Math.round(buy.remaining * 1000) / 1000,
+          entry_price: buy.price,
+          entry_time: new Date(buy.ts).toISOString(),
+        });
+      }
+    }
+  }
+
+  // Build cumulative P&L series
+  pnlEvents.sort((a, b) => a.t.localeCompare(b.t));
+  let cumPnl = 0;
+  const pnl_series = pnlEvents.map((e) => {
+    cumPnl += e.pnl;
+    return { t: e.t, pnl: Math.round(cumPnl * 100) / 100 };
+  });
+
+  // Sort closed positions by time desc
+  closedPositions.sort((a, b) => b.closed_at.localeCompare(a.closed_at));
+
+  return {
+    realized_pnl: Math.round((realizedPnl - totalFees) * 100) / 100,
+    total_fees: Math.round(totalFees * 100) / 100,
+    avg_hold_time_hours:
+      holdTimeCount > 0
+        ? Math.round((holdTimeSum / holdTimeCount) * 10) / 10
+        : 0,
+    wins,
+    losses,
+    best_trade_pnl: bestTradePnl,
+    worst_trade_pnl: worstTradePnl,
+    closed_positions: closedPositions,
+    open_positions: openPositions,
+    pnl_series,
+  };
+}
+
 // ── Durable Object: self-scheduling copy listener ──────────────────
 
 export class CopyListenerDO implements DurableObject {
@@ -370,49 +551,66 @@ export default {
       url.pathname === "/api/copy/targets" ||
       url.pathname === "/api/copy/targets/cloud"
     ) {
-      const { results } = await env.DB.prepare(
-        `SELECT ct.*,
-                COALESCE(sb.username, '') as username,
-                COALESCE(ts.trade_count, 0) as trade_count,
-                COALESCE(ts.total_pnl, 0) as computed_pnl,
-                ts.first_trade,
-                ts.last_trade
+      // Fetch targets with usernames
+      const { results: targets } = await env.DB.prepare(
+        `SELECT ct.*, COALESCE(sb.username, '') as username
          FROM copy_targets ct
-         LEFT JOIN suspect_bots sb ON ct.wallet = sb.wallet
-         LEFT JOIN (
-           SELECT source_wallet,
-                  COUNT(*) as trade_count,
-                  SUM(pnl) - SUM(fee_amount) as total_pnl,
-                  MIN(timestamp) as first_trade,
-                  MAX(timestamp) as last_trade
-           FROM copy_trades
-           WHERE status = 'filled'
-           GROUP BY source_wallet
-         ) ts ON ct.wallet = ts.source_wallet`,
-      ).all<
-        CopyTarget & {
-          username: string;
-          trade_count: number;
-          computed_pnl: number;
-          first_trade: string | null;
-          last_trade: string | null;
-        }
+         LEFT JOIN suspect_bots sb ON ct.wallet = sb.wallet`,
+      ).all<CopyTarget & { username: string }>();
+
+      // Fetch all filled trades for FIFO P&L computation
+      const { results: allTrades } = await env.DB.prepare(
+        `SELECT source_wallet, market, asset_id, side, price, size, timestamp, fee_amount
+         FROM copy_trades WHERE status = 'filled'
+         ORDER BY timestamp`,
+      ).all<TradeRowWithMarket & { source_wallet: string }>();
+
+      // Group trades by wallet
+      const tradesByWallet = new Map<
+        string,
+        (TradeRowWithMarket & { source_wallet: string })[]
       >();
-      // Compute listening_hours and override total_paper_pnl with computed value
-      const enriched = (results ?? []).map((r) => {
+      for (const t of allTrades ?? []) {
+        const arr = tradesByWallet.get(t.source_wallet);
+        if (arr) arr.push(t);
+        else tradesByWallet.set(t.source_wallet, [t]);
+      }
+
+      const enriched = (targets ?? []).map((r) => {
+        const walletTrades = tradesByWallet.get(r.wallet) ?? [];
+        const tradeCount = walletTrades.length;
+        const pnl = tradeCount > 0 ? computeFifoPnl(walletTrades) : null;
+
         let listening_hours = 0;
-        if (r.first_trade && r.last_trade) {
-          const first = new Date(r.first_trade).getTime();
-          const last = new Date(r.last_trade).getTime();
+        if (tradeCount > 0) {
+          const first = new Date(walletTrades[0].timestamp).getTime();
+          const last = new Date(
+            walletTrades[tradeCount - 1].timestamp,
+          ).getTime();
           if (first && last) {
             listening_hours =
               Math.round(((last - first) / 3_600_000) * 10) / 10;
           }
         }
+
         return {
-          ...r,
-          total_paper_pnl: r.computed_pnl ?? r.total_paper_pnl,
+          wallet: r.wallet,
+          username: r.username || "",
+          mode: r.mode,
+          trade_pct: r.trade_pct,
+          max_position_usd: r.max_position_usd,
+          active: !!r.active,
+          total_paper_pnl: pnl?.realized_pnl ?? 0,
+          total_real_pnl: r.total_real_pnl,
+          slippage_bps: r.slippage_bps,
+          latency_ms: r.latency_ms,
+          fee_rate: r.fee_rate,
+          measured_slippage_bps: r.measured_slippage_bps,
+          measured_latency_ms: -1,
+          observations: 0,
+          trade_count: tradeCount,
           listening_hours,
+          avg_hold_time_hours: pnl?.avg_hold_time_hours ?? 0,
         };
       });
       return jsonCors(enriched, request);
@@ -434,6 +632,59 @@ export default {
           ).bind(limit);
       const { results } = await stmt.all<CopyTrade>();
       return jsonCors(results ?? [], request);
+    }
+
+    // Copy target detail — FIFO P&L breakdown
+    const detailMatch = url.pathname.match(
+      /^\/api\/copy\/detail\/(0x[a-fA-F0-9]+)$/,
+    );
+    if (detailMatch) {
+      const wallet = detailMatch[1].toLowerCase();
+      const { results: trades } = await env.DB.prepare(
+        `SELECT market, asset_id, side, price, size, timestamp, fee_amount
+         FROM copy_trades
+         WHERE source_wallet = ? AND status = 'filled'
+         ORDER BY timestamp`,
+      )
+        .bind(wallet)
+        .all<TradeRowWithMarket>();
+
+      const pnl = computeFifoPnl(trades ?? []);
+      const totalTrades = trades?.length ?? 0;
+      const winRate =
+        pnl.wins + pnl.losses > 0
+          ? Math.round((pnl.wins / (pnl.wins + pnl.losses)) * 1000) / 10
+          : 0;
+
+      return jsonCors(
+        {
+          summary: {
+            total_trades: totalTrades,
+            wins: pnl.wins,
+            losses: pnl.losses,
+            win_rate: winRate,
+            total_realized_pnl: pnl.realized_pnl,
+            total_unrealized_pnl: 0,
+            total_fees: pnl.total_fees,
+            total_slippage_cost: 0,
+            best_trade_pnl: pnl.best_trade_pnl,
+            worst_trade_pnl: pnl.worst_trade_pnl,
+          },
+          pnl_series: pnl.pnl_series,
+          open_positions: pnl.open_positions.map((p) => ({
+            ...p,
+            title: "",
+            current_price: 0,
+            unrealized_pnl: 0,
+          })),
+          closed_positions: pnl.closed_positions.slice(0, 100).map((p) => ({
+            ...p,
+            title: "",
+          })),
+          missed_positions: [],
+        },
+        request,
+      );
     }
 
     if (url.pathname === "/sync" && request.method === "POST") {
