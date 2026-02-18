@@ -140,15 +140,15 @@ export default {
 
     if (url.pathname === "/api/detect" && env.PYTHON_API_URL) {
       // Fetch top wallets from D1 and send to Cloud Run for detection
-      const minTrades = Number(url.searchParams.get("min_trades") ?? "5");
+      const minTrades = Number(url.searchParams.get("min_trades") ?? "1");
       const { results } = await env.DB.prepare(
-        "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT 200",
+        "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT 500",
       )
         .bind(minTrades)
         .all<{ wallet: string }>();
 
       const wallets = (results ?? []).map((r) => r.wallet);
-      const pyUrl = `${env.PYTHON_API_URL}/api/detect/cloud?min_trades=${minTrades}`;
+      const pyUrl = `${env.PYTHON_API_URL}/api/detect/cloud?min_trades=${minTrades}&min_confidence=0.3`;
       try {
         const pyResp = await fetch(pyUrl, {
           method: "POST",

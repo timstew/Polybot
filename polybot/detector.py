@@ -58,7 +58,10 @@ class BotDetector:
         return suspects
 
     def scan_wallets_remote(
-        self, wallets: list[str], min_trades: int = 0
+        self,
+        wallets: list[str],
+        min_trades: int = 0,
+        min_confidence: float = 0.3,
     ) -> list[SuspectBot]:
         """Analyze wallets by fetching trades from the Data API (in-memory).
 
@@ -74,32 +77,44 @@ class BotDetector:
                 trades = fetch_wallet_trades(wallet, limit=200)
                 if len(trades) < min_t:
                     return None
-                return self.analyze_wallet(wallet, trades=trades)
+                return self.analyze_wallet(
+                    wallet, trades=trades, min_trades_override=min_t
+                )
             except Exception:
-                logger.debug("Failed to fetch trades for %s", wallet[:10])
+                logger.warning(
+                    "Failed to fetch/analyze trades for %s: %s",
+                    wallet[:10],
+                    Exception,
+                    exc_info=True,
+                )
                 return None
 
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(_fetch_and_analyze, w): w for w in wallets}
             for future in as_completed(futures):
                 bot = future.result()
-                if bot and bot.confidence > 0.3:
+                if bot and bot.confidence > min_confidence:
                     suspects.append(bot)
 
         suspects.sort(key=lambda b: b.confidence, reverse=True)
         return suspects
 
     def analyze_wallet(
-        self, wallet: str, trades: list[Trade] | None = None
+        self,
+        wallet: str,
+        trades: list[Trade] | None = None,
+        min_trades_override: int | None = None,
     ) -> Optional[SuspectBot]:
         """Compute bot signals for a single wallet and return a SuspectBot
         if the confidence exceeds the minimum threshold.
 
         If *trades* is provided, uses them directly instead of reading from DB.
+        If *min_trades_override* is given, it replaces the config threshold.
         """
         if trades is None:
             trades = self.db.get_trades_for_wallet(wallet, limit=5000)
-        if len(trades) < self.config.min_trades_for_detection:
+        min_required = min_trades_override or self.config.min_trades_for_detection
+        if len(trades) < min_required:
             return None
 
         signals = self._compute_signals(trades)
@@ -118,7 +133,12 @@ class BotDetector:
             last_seen=max(timestamps),
             tags=tags,
         )
-        self.db.upsert_suspect_bot(bot)
+        try:
+            self.db.upsert_suspect_bot(bot)
+        except Exception:
+            # DB write may fail in thread pool (SQLite thread-safety).
+            # The SuspectBot result is still valid.
+            pass
         return bot
 
     # ── Signal computation ──────────────────────────────────────────

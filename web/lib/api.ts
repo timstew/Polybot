@@ -244,7 +244,7 @@ export const api = {
     );
     return Array.isArray(data) ? data : [];
   },
-  detect: (minTrades = 20) =>
+  detect: (minTrades = 1) =>
     postJSON<{ status: string; bots_found: number; wallets_scanned: number }>(
       `/api/detect?min_trades=${minTrades}`,
     ),

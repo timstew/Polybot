@@ -580,11 +580,14 @@ def detect(min_trades: int = Query(20)):
 def detect_cloud(
     wallets: list[str],
     min_trades: int = Query(5),
+    min_confidence: float = Query(0.1),
 ):
     """Run bot detection on a provided list of wallets (for cloud use).
 
     Skips Phase 1 (local DB scan) and runs Phase 2 only — fetching each
     wallet's activity from the Polymarket API and scoring remotely.
+    Uses a lower confidence threshold than local detection since we have
+    fewer trades per wallet from the remote API.
     """
     if not wallets:
         return {"status": "completed", "bots_found": 0, "wallets_scanned": 0}
@@ -592,9 +595,13 @@ def detect_cloud(
     db = _db()
     detector = BotDetector(db, config)
 
-    # Cap at 200 to avoid rate limiting
-    candidates = wallets[:200]
-    suspects = detector.scan_wallets_remote(candidates, min_trades=min_trades)
+    # Cap at 500 to avoid rate limiting
+    candidates = wallets[:500]
+    suspects = detector.scan_wallets_remote(
+        candidates,
+        min_trades=min_trades,
+        min_confidence=min_confidence,
+    )
 
     db.close()
     return {
@@ -602,6 +609,46 @@ def detect_cloud(
         "bots_found": len(suspects),
         "wallets_scanned": len(candidates),
     }
+
+
+@app.get("/api/detect/debug/{wallet}")
+def detect_debug(wallet: str):
+    """Debug endpoint: test detection on a single wallet with full diagnostics."""
+    result: dict = {"wallet": wallet}
+
+    # Step 1: Fetch trades
+    try:
+        trades = fetch_wallet_trades(wallet, limit=200)
+        result["trades_fetched"] = len(trades)
+        if trades:
+            result["first_trade"] = trades[0].timestamp.isoformat()
+            result["last_trade"] = trades[-1].timestamp.isoformat()
+    except Exception as e:
+        result["fetch_error"] = str(e)
+        return result
+
+    if not trades:
+        result["analysis"] = "no_trades"
+        return result
+
+    # Step 2: Analyze
+    db = _db()
+    detector = BotDetector(db, config)
+    try:
+        bot = detector.analyze_wallet(wallet, trades=trades, min_trades_override=1)
+        if bot:
+            result["confidence"] = bot.confidence
+            result["category"] = (
+                bot.category.value if hasattr(bot.category, "value") else bot.category
+            )
+            result["trade_count"] = bot.signals.trade_count
+            result["tags"] = bot.tags
+        else:
+            result["analysis"] = "returned_none"
+    except Exception as e:
+        result["analyze_error"] = str(e)
+    db.close()
+    return result
 
 
 @app.get("/api/unified")
