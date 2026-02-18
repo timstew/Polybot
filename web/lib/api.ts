@@ -83,6 +83,7 @@ export interface Position {
 
 export interface WalletDetail {
   username: string;
+  alt_username: string;
   bot: {
     wallet: string;
     confidence: number;

@@ -169,6 +169,11 @@ export default function WalletPageClient() {
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-2xl font-bold tracking-tight">
             {data?.username || "Wallet"}
+            {data?.alt_username && (
+              <span className="ml-2 text-sm font-normal text-muted-foreground">
+                aka {data.alt_username}
+              </span>
+            )}
           </h1>
           <code className="rounded bg-muted px-2 py-1 font-mono text-sm">
             {address}

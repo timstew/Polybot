@@ -909,11 +909,21 @@ def wallet_detail(address: str):
 
     # Fetch username from Polymarket leaderboard API
     profit_data = tracker.fetch_wallet_profit(address)
-    username = profit_data.get("username", "")
+    lb_username = profit_data.get("username", "")
+
+    # Also check copy_targets for the username we use on the copy page
+    copy_target = db.get_copy_target(address)
+    copy_username = (
+        copy_target.username if copy_target and hasattr(copy_target, "username") else ""
+    ) or ""
+
+    # Prefer copy_targets username (matches copy page), fall back to leaderboard
+    username = copy_username or lb_username
 
     db.close()
     return {
         "username": username,
+        "alt_username": lb_username if lb_username and lb_username != username else "",
         "bot": bot_info,
         "profitability": {
             "total_trades": profitability.total_trades,
