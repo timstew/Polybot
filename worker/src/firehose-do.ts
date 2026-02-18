@@ -218,9 +218,36 @@ export class FirehoseDO implements DurableObject {
       const data = (await pyResp.json()) as {
         bots_found?: number;
         wallets_scanned?: number;
+        bots?: Array<{
+          wallet: string;
+          confidence: number;
+          category: string;
+          trade_count: number;
+          tags: string[];
+        }>;
       };
       this.detectBotsFound += data.bots_found ?? 0;
       this.detectWalletsScanned += data.wallets_scanned ?? 0;
+
+      // Store detected bots in D1
+      if (data.bots && data.bots.length > 0) {
+        const stmt = this.env.DB.prepare(
+          `INSERT OR REPLACE INTO suspect_bots (wallet, confidence, category, trade_count, tags, detected_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+        );
+        const batch = data.bots.map((b) =>
+          stmt.bind(
+            b.wallet,
+            b.confidence,
+            b.category,
+            b.trade_count,
+            JSON.stringify(b.tags),
+          ),
+        );
+        for (let i = 0; i < batch.length; i += 100) {
+          await this.env.DB.batch(batch.slice(i, i + 100));
+        }
+      }
     } catch (e) {
       console.error("Detection batch failed:", e);
     }

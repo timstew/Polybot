@@ -608,6 +608,18 @@ def detect_cloud(
         "status": "completed",
         "bots_found": len(suspects),
         "wallets_scanned": len(candidates),
+        "bots": [
+            {
+                "wallet": s.wallet,
+                "confidence": s.confidence,
+                "category": s.category.value
+                if hasattr(s.category, "value")
+                else s.category,
+                "trade_count": s.signals.trade_count,
+                "tags": s.tags,
+            }
+            for s in suspects
+        ],
     }
 
 

@@ -160,6 +160,78 @@ export default {
       return jsonCors(await doResp.json(), request);
     }
 
+    if (url.pathname === "/api/bots") {
+      const minConfidence = Number(
+        url.searchParams.get("min_confidence") ?? "0",
+      );
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM suspect_bots WHERE confidence >= ? ORDER BY confidence DESC",
+      )
+        .bind(minConfidence)
+        .all<{
+          wallet: string;
+          confidence: number;
+          category: string;
+          trade_count: number;
+          tags: string;
+          detected_at: string;
+        }>();
+      return jsonCors(
+        (results ?? []).map((r) => ({
+          ...r,
+          tags: JSON.parse(r.tags || "[]"),
+        })),
+        request,
+      );
+    }
+
+    if (url.pathname === "/api/bots/clear") {
+      await env.DB.prepare("DELETE FROM suspect_bots").run();
+      return jsonCors({ status: "cleared" }, request);
+    }
+
+    if (url.pathname === "/api/unified") {
+      // Return detected bots from D1 — the cloud equivalent of the local unified endpoint
+      const top = Math.min(Number(url.searchParams.get("top") ?? "200"), 500);
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM suspect_bots ORDER BY confidence DESC LIMIT ?",
+      )
+        .bind(top)
+        .all<{
+          wallet: string;
+          confidence: number;
+          category: string;
+          trade_count: number;
+          tags: string;
+          detected_at: string;
+        }>();
+      return jsonCors(
+        (results ?? []).map((r) => ({
+          wallet: r.wallet,
+          confidence: r.confidence,
+          category: r.category,
+          trade_count: r.trade_count,
+          tags: JSON.parse(r.tags || "[]"),
+          // Provide defaults for fields the dashboard expects
+          pnl_pct: 0,
+          realized_pnl: 0,
+          unrealized_pnl: 0,
+          win_rate: 0,
+          total_volume_usd: 0,
+          active_positions: 0,
+          portfolio_value: 0,
+          market_categories: [],
+          copy_score: 0,
+          avg_hold_time_hours: 0,
+          trades_per_market: 0,
+          avg_market_burst: 0,
+          max_market_burst: 0,
+          market_concentration: 0,
+        })),
+        request,
+      );
+    }
+
     if (url.pathname === "/api/trades/clear") {
       const id = env.FIREHOSE.idFromName("singleton");
       const obj = env.FIREHOSE.get(id);
@@ -186,7 +258,7 @@ export default {
       const listener = (await listenerResp.json()) as Record<string, unknown>;
 
       // Count copy trades and targets
-      const [copyTradeRow, targetRow, botRow] = await Promise.all([
+      const [copyTradeRow, targetRow, botRow, suspectRow] = await Promise.all([
         env.DB.prepare("SELECT COUNT(*) as cnt FROM copy_trades").first<{
           cnt: number;
         }>(),
@@ -196,13 +268,16 @@ export default {
         env.DB.prepare(
           "SELECT COUNT(DISTINCT taker) as cnt FROM firehose_trades",
         ).first<{ cnt: number }>(),
+        env.DB.prepare("SELECT COUNT(*) as cnt FROM suspect_bots").first<{
+          cnt: number;
+        }>(),
       ]);
 
       return jsonCors(
         {
           trade_count: firehose.trade_count ?? 0,
           wallet_count: firehose.wallet_count ?? 0,
-          bot_count: 0, // detection runs locally
+          bot_count: suspectRow?.cnt ?? 0,
           copy_targets: targetRow?.cnt ?? 0,
           listening: firehose.running ?? false,
           listener_new_trades: firehose.trade_count ?? 0,
