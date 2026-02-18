@@ -410,10 +410,6 @@ export default function CopyTradingPage() {
                     <TableHead>Wallet</TableHead>
                     <TableHead>Mode</TableHead>
                     <TableHead className="text-right">Copy %</TableHead>
-                    <TableHead className="text-right">Max Position</TableHead>
-                    <TableHead className="text-right">Slippage</TableHead>
-                    <TableHead className="text-right">Latency</TableHead>
-                    <TableHead className="text-right">Fee Rate</TableHead>
                     <TableHead className="text-right">Trades</TableHead>
                     <TableHead className="text-right">Listening</TableHead>
                     <TableHead className="text-right">Avg Hold</TableHead>
@@ -475,50 +471,6 @@ export default function CopyTradingPage() {
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
                           {t.trade_pct}%
-                        </TableCell>
-                        <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {fmt(t.max_position_usd)}
-                        </TableCell>
-                        <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {t.observations > 0 ? (
-                            <span>
-                              <span className="text-green-600 font-semibold">
-                                {t.measured_slippage_bps.toFixed(1)}bps
-                              </span>
-                              <span className="text-muted-foreground text-xs ml-1">
-                                ({t.observations})
-                              </span>
-                            </span>
-                          ) : (
-                            <span>
-                              {t.slippage_bps}bps
-                              <span className="text-muted-foreground text-xs ml-1">
-                                fallback
-                              </span>
-                            </span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {t.measured_latency_ms >= 0 ? (
-                            <span>
-                              <span className="text-green-600 font-semibold">
-                                {(t.measured_latency_ms / 1000).toFixed(1)}s
-                              </span>
-                              <span className="text-muted-foreground text-xs ml-1">
-                                measured
-                              </span>
-                            </span>
-                          ) : (
-                            <span>
-                              {(t.latency_ms / 1000).toFixed(1)}s
-                              <span className="text-muted-foreground text-xs ml-1">
-                                fallback
-                              </span>
-                            </span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {t.fee_rate === 0 ? "auto" : t.fee_rate}
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
                           {t.trade_count ?? 0}
