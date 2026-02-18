@@ -371,11 +371,51 @@ export default {
       url.pathname === "/api/copy/targets/cloud"
     ) {
       const { results } = await env.DB.prepare(
-        `SELECT ct.*, COALESCE(sb.username, '') as username
+        `SELECT ct.*,
+                COALESCE(sb.username, '') as username,
+                COALESCE(ts.trade_count, 0) as trade_count,
+                COALESCE(ts.total_pnl, 0) as computed_pnl,
+                ts.first_trade,
+                ts.last_trade
          FROM copy_targets ct
-         LEFT JOIN suspect_bots sb ON ct.wallet = sb.wallet`,
-      ).all<CopyTarget & { username: string }>();
-      return jsonCors(results ?? [], request);
+         LEFT JOIN suspect_bots sb ON ct.wallet = sb.wallet
+         LEFT JOIN (
+           SELECT source_wallet,
+                  COUNT(*) as trade_count,
+                  SUM(pnl) - SUM(fee_amount) as total_pnl,
+                  MIN(timestamp) as first_trade,
+                  MAX(timestamp) as last_trade
+           FROM copy_trades
+           WHERE status = 'filled'
+           GROUP BY source_wallet
+         ) ts ON ct.wallet = ts.source_wallet`,
+      ).all<
+        CopyTarget & {
+          username: string;
+          trade_count: number;
+          computed_pnl: number;
+          first_trade: string | null;
+          last_trade: string | null;
+        }
+      >();
+      // Compute listening_hours and override total_paper_pnl with computed value
+      const enriched = (results ?? []).map((r) => {
+        let listening_hours = 0;
+        if (r.first_trade && r.last_trade) {
+          const first = new Date(r.first_trade).getTime();
+          const last = new Date(r.last_trade).getTime();
+          if (first && last) {
+            listening_hours =
+              Math.round(((last - first) / 3_600_000) * 10) / 10;
+          }
+        }
+        return {
+          ...r,
+          total_paper_pnl: r.computed_pnl ?? r.total_paper_pnl,
+          listening_hours,
+        };
+      });
+      return jsonCors(enriched, request);
     }
 
     if (
