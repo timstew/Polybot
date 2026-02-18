@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "build:pages": "NEXT_BUILD_EXPORT=1 next build && rm -f out/404.html out/_not-found.html",
+    "build:pages": "NEXT_BUILD_EXPORT=1 next build && rm -f out/404.html out/_not-found.html && cp out/wallet/_.html out/wallet/404.html",
     "start": "next start",
     "lint": "eslint"
   },
