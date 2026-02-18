@@ -245,9 +245,19 @@ export const api = {
     return Array.isArray(data) ? data : [];
   },
   detect: (minTrades = 1) =>
-    postJSON<{ status: string; bots_found: number; wallets_scanned: number }>(
-      `/api/detect?min_trades=${minTrades}`,
-    ),
+    postJSON<{
+      status: string;
+      total_wallets?: number;
+      bots_found?: number;
+      wallets_scanned?: number;
+    }>(`/api/detect?min_trades=${minTrades}`),
+  detectStatus: () =>
+    fetchJSON<{
+      running: boolean;
+      bots_found: number;
+      wallets_scanned: number;
+      total_wallets: number;
+    }>("/api/detect/status"),
   botsClear: () => postJSON<{ status: string }>("/api/bots/clear"),
   tradesClear: () => postJSON<{ status: string }>("/api/trades/clear"),
   copyDetail: (wallet: string, source: "local" | "cloud" = "local") =>

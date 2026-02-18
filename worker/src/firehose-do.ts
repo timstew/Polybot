@@ -40,6 +40,14 @@ export class FirehoseDO implements DurableObject {
   private seenIds = new Set<string>();
   private pollCount = 0;
 
+  // Detection state (in-memory, survives across alarm cycles while DO is alive)
+  private detectRunning = false;
+  private detectOffset = 0;
+  private detectBotsFound = 0;
+  private detectWalletsScanned = 0;
+  private detectTotalWallets = 0;
+  private detectMinTrades = 1;
+
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
@@ -85,6 +93,49 @@ export class FirehoseDO implements DurableObject {
       });
     }
 
+    if (url.pathname === "/firehose/detect/start") {
+      if (this.detectRunning) {
+        return json({
+          status: "already_running",
+          progress: this.detectProgress(),
+        });
+      }
+      const params = new URL(request.url).searchParams;
+      this.detectMinTrades = Number(params.get("min_trades") ?? "1");
+      // Count total wallets to scan
+      const countRow = await this.env.DB.prepare(
+        "SELECT COUNT(*) as cnt FROM firehose_wallets WHERE trade_count >= ?",
+      )
+        .bind(this.detectMinTrades)
+        .first<{ cnt: number }>();
+      this.detectTotalWallets = countRow?.cnt ?? 0;
+      this.detectOffset = 0;
+      this.detectBotsFound = 0;
+      this.detectWalletsScanned = 0;
+      this.detectRunning = true;
+      // Ensure alarm is running to process batches
+      const alarm = await this.state.storage.getAlarm();
+      if (!alarm) {
+        await this.state.storage.setAlarm(Date.now() + 500);
+      }
+      return json({
+        status: "started",
+        total_wallets: this.detectTotalWallets,
+      });
+    }
+
+    if (url.pathname === "/firehose/detect/status") {
+      return json({
+        running: this.detectRunning,
+        ...this.detectProgress(),
+      });
+    }
+
+    if (url.pathname === "/firehose/detect/stop") {
+      this.detectRunning = false;
+      return json({ status: "stopped", ...this.detectProgress() });
+    }
+
     if (url.pathname === "/firehose/clear") {
       await this.env.DB.batch([
         this.env.DB.prepare("DELETE FROM firehose_trades"),
@@ -110,12 +161,78 @@ export class FirehoseDO implements DurableObject {
         await this.harvestWallets();
         await this.state.storage.put("lastHarvestTime", Date.now());
       }
+
+      // Process a detection batch if running
+      if (this.detectRunning) {
+        await this.processDetectBatch();
+      }
     } catch (e) {
       console.error("FirehoseDO poll error:", e);
     }
 
-    // Re-schedule
-    await this.state.storage.setAlarm(Date.now() + POLL_INTERVAL_MS);
+    // Re-schedule (use shorter interval if detection is running)
+    const userStopped = (await this.state.storage.get("userStopped")) ?? false;
+    if (userStopped && !this.detectRunning) return;
+    const interval = this.detectRunning ? 1_000 : POLL_INTERVAL_MS;
+    await this.state.storage.setAlarm(Date.now() + interval);
+  }
+
+  private detectProgress() {
+    return {
+      bots_found: this.detectBotsFound,
+      wallets_scanned: this.detectWalletsScanned,
+      total_wallets: this.detectTotalWallets,
+    };
+  }
+
+  private async processDetectBatch(): Promise<void> {
+    if (!this.env.PYTHON_API_URL) {
+      this.detectRunning = false;
+      return;
+    }
+
+    const BATCH_SIZE = 500;
+    const { results } = await this.env.DB.prepare(
+      "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT ? OFFSET ?",
+    )
+      .bind(this.detectMinTrades, BATCH_SIZE, this.detectOffset)
+      .all<{ wallet: string }>();
+
+    const wallets = (results ?? []).map((r) => r.wallet);
+    if (wallets.length === 0) {
+      // Done — no more wallets
+      this.detectRunning = false;
+      console.log(
+        `Detection complete: ${this.detectBotsFound} bots from ${this.detectWalletsScanned} wallets`,
+      );
+      return;
+    }
+
+    try {
+      const pyUrl = `${this.env.PYTHON_API_URL}/api/detect/cloud?min_trades=${this.detectMinTrades}&min_confidence=0.3`;
+      const pyResp = await fetch(pyUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(wallets),
+      });
+      const data = (await pyResp.json()) as {
+        bots_found?: number;
+        wallets_scanned?: number;
+      };
+      this.detectBotsFound += data.bots_found ?? 0;
+      this.detectWalletsScanned += data.wallets_scanned ?? 0;
+    } catch (e) {
+      console.error("Detection batch failed:", e);
+    }
+
+    this.detectOffset += BATCH_SIZE;
+    if (wallets.length < BATCH_SIZE) {
+      // Last batch
+      this.detectRunning = false;
+      console.log(
+        `Detection complete: ${this.detectBotsFound} bots from ${this.detectWalletsScanned} wallets`,
+      );
+    }
   }
 
   // ── Trade polling ────────────────────────────────────────────────
@@ -185,7 +302,18 @@ export class FirehoseDO implements DurableObject {
       }
 
       batch.push(
-        tradeStmt.bind(id, market, assetId, side, price, size, ts, taker, title, outcome),
+        tradeStmt.bind(
+          id,
+          market,
+          assetId,
+          side,
+          price,
+          size,
+          ts,
+          taker,
+          title,
+          outcome,
+        ),
       );
 
       // Track wallet

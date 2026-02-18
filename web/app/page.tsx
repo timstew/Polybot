@@ -245,20 +245,43 @@ export default function DashboardPage() {
     setDetecting(true);
     setDetectResult(null);
     try {
-      const result = await api.detect();
-      if (result.bots_found !== undefined) {
-        setDetectResult(
-          `Found ${result.bots_found} bots from ${result.wallets_scanned} wallets`,
-        );
+      const startResult = await api.detect();
+      if (startResult.total_wallets !== undefined) {
+        setDetectResult(`Scanning ${startResult.total_wallets} wallets...`);
+        // Poll for progress
+        const poll = setInterval(async () => {
+          try {
+            const status = await api.detectStatus();
+            const pct =
+              status.total_wallets > 0
+                ? Math.round(
+                    (status.wallets_scanned / status.total_wallets) * 100,
+                  )
+                : 0;
+            setDetectResult(
+              `Scanning... ${status.wallets_scanned}/${status.total_wallets} wallets (${pct}%) — ${status.bots_found} bots found`,
+            );
+            if (!status.running) {
+              clearInterval(poll);
+              setDetectResult(
+                `Found ${status.bots_found} bots from ${status.wallets_scanned} wallets`,
+              );
+              setDetecting(false);
+              refreshStats();
+              refreshTable();
+            }
+          } catch {
+            // keep polling
+          }
+        }, 3000);
       } else {
         setDetectResult("Detection requires local Python backend");
+        setDetecting(false);
       }
-      refreshStats();
-      refreshTable();
     } catch {
       setDetectResult("Detection requires local Python backend");
+      setDetecting(false);
     }
-    setDetecting(false);
   }
 
   async function clearBots() {

@@ -138,34 +138,26 @@ export default {
       return jsonCors(await doResp.json(), request);
     }
 
-    if (url.pathname === "/api/detect" && env.PYTHON_API_URL) {
-      // Fetch top wallets from D1 and send to Cloud Run for detection
-      const minTrades = Number(url.searchParams.get("min_trades") ?? "1");
-      const { results } = await env.DB.prepare(
-        "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT 500",
-      )
-        .bind(minTrades)
-        .all<{ wallet: string }>();
-
-      const wallets = (results ?? []).map((r) => r.wallet);
-      const pyUrl = `${env.PYTHON_API_URL}/api/detect/cloud?min_trades=${minTrades}&min_confidence=0.3`;
-      try {
-        const pyResp = await fetch(pyUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(wallets),
-        });
-        return jsonCors(await pyResp.json(), request, pyResp.status);
-      } catch {
-        return jsonCors(
-          {
-            error: "python_unavailable",
-            message: "Python backend not reachable",
-          },
-          request,
-          502,
-        );
-      }
+    if (
+      (url.pathname === "/api/detect" ||
+        url.pathname === "/api/detect/status" ||
+        url.pathname === "/api/detect/stop") &&
+      env.PYTHON_API_URL
+    ) {
+      const id = env.FIREHOSE.idFromName("singleton");
+      const stub = env.FIREHOSE.get(id);
+      // Map routes: /api/detect → start, /api/detect/status → status, /api/detect/stop → stop
+      let doPath = "/firehose/detect/start";
+      if (url.pathname === "/api/detect/status")
+        doPath = "/firehose/detect/status";
+      else if (url.pathname === "/api/detect/stop")
+        doPath = "/firehose/detect/stop";
+      const doResp = await stub.fetch(
+        new Request(`https://do${doPath}?${url.searchParams}`, {
+          method: request.method,
+        }),
+      );
+      return jsonCors(await doResp.json(), request);
     }
 
     if (url.pathname === "/api/trades/clear") {
