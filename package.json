@@ -1,0 +1,9 @@
+{
+  "name": "polybot",
+  "private": true,
+  "scripts": {
+    "dev": "./scripts/dev.sh",
+    "stop": "./scripts/stop.sh",
+    "deploy": "./scripts/deploy.sh"
+  }
+}
