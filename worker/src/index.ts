@@ -842,13 +842,16 @@ export default {
     if (detailMatch) {
       const wallet = detailMatch[1].toLowerCase();
       const { results: trades } = await env.DB.prepare(
-        `SELECT market, asset_id, side, price, size, timestamp, fee_amount
+        `SELECT market, asset_id, side, price, size, timestamp, fee_amount,
+                source_price, exec_price
          FROM copy_trades
          WHERE source_wallet = ? AND status = 'filled'
          ORDER BY timestamp`,
       )
         .bind(wallet)
-        .all<TradeRowWithMarket>();
+        .all<
+          TradeRowWithMarket & { source_price: number; exec_price: number }
+        >();
 
       const pnl = computeFifoPnl(trades ?? []);
       const totalTrades = trades?.length ?? 0;
@@ -856,6 +859,12 @@ export default {
         pnl.wins + pnl.losses > 0
           ? Math.round((pnl.wins / (pnl.wins + pnl.losses)) * 1000) / 10
           : 0;
+
+      // Compute total slippage cost from source_price vs exec_price
+      let totalSlippageCost = 0;
+      for (const t of trades ?? []) {
+        totalSlippageCost += Math.abs(t.exec_price - t.source_price) * t.size;
+      }
 
       return jsonCors(
         {
@@ -867,7 +876,7 @@ export default {
             total_realized_pnl: pnl.realized_pnl,
             total_unrealized_pnl: 0,
             total_fees: pnl.total_fees,
-            total_slippage_cost: 0,
+            total_slippage_cost: Math.round(totalSlippageCost * 100) / 100,
             best_trade_pnl: pnl.best_trade_pnl,
             worst_trade_pnl: pnl.worst_trade_pnl,
             peak_capital: pnl.peak_capital,
