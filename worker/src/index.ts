@@ -213,6 +213,7 @@ export default {
           trade_count: r.trade_count,
           tags: JSON.parse(r.tags || "[]"),
           // Provide defaults for fields the dashboard expects
+          username: "",
           pnl_pct: 0,
           realized_pnl: 0,
           unrealized_pnl: 0,
@@ -227,6 +228,10 @@ export default {
           avg_market_burst: 0,
           max_market_burst: 0,
           market_concentration: 0,
+          profit_1d: 0,
+          profit_7d: 0,
+          profit_30d: 0,
+          profit_all: 0,
         })),
         request,
       );
