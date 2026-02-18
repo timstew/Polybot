@@ -76,6 +76,12 @@ CREATE TABLE IF NOT EXISTS copy_trades (
 );
 
 CREATE INDEX IF NOT EXISTS idx_copy_trades_wallet ON copy_trades(source_wallet);
+
+CREATE TABLE IF NOT EXISTS analyzed_wallets (
+    wallet TEXT PRIMARY KEY,
+    analyzed_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'detected'
+);
 """
 
 
@@ -471,3 +477,63 @@ class Database:
             "total_fees": total_fees,
             "avg_hold_time_hours": avg_hold_hours,
         }
+
+    # ── Analyzed wallets ────────────────────────────────────────────
+
+    def mark_wallet_analyzed(self, wallet: str, status: str = "detected") -> None:
+        """Record that a wallet has been analyzed. Status: detected|dismissed|copied."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO analyzed_wallets (wallet, analyzed_at, status)
+               VALUES (?, ?, ?)""",
+            (wallet, datetime.utcnow().isoformat(), status),
+        )
+        self.conn.commit()
+
+    def is_wallet_analyzed(self, wallet: str) -> bool:
+        cursor = self.conn.execute(
+            "SELECT 1 FROM analyzed_wallets WHERE wallet = ?", (wallet,)
+        )
+        return cursor.fetchone() is not None
+
+    def get_analyzed_wallets(self, status: str | None = None) -> list[str]:
+        if status:
+            cursor = self.conn.execute(
+                "SELECT wallet FROM analyzed_wallets WHERE status = ?", (status,)
+            )
+        else:
+            cursor = self.conn.execute("SELECT wallet FROM analyzed_wallets")
+        return [r["wallet"] for r in cursor.fetchall()]
+
+    def dismiss_wallet(self, wallet: str) -> None:
+        """Mark a wallet as dismissed and remove from suspect_bots."""
+        self.mark_wallet_analyzed(wallet, status="dismissed")
+        self.conn.execute("DELETE FROM suspect_bots WHERE wallet = ?", (wallet,))
+        self.conn.commit()
+
+    def undismiss_wallet(self, wallet: str) -> None:
+        """Remove a wallet's dismissed status so it can be re-detected."""
+        self.conn.execute(
+            "DELETE FROM analyzed_wallets WHERE wallet = ? AND status = 'dismissed'",
+            (wallet,),
+        )
+        self.conn.commit()
+
+    def prune_analyzed_before(self, days: int = 30) -> int:
+        """Remove analyzed_wallets entries older than N days for re-evaluation."""
+        cursor = self.conn.execute(
+            "DELETE FROM analyzed_wallets WHERE analyzed_at < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def prune_old_trades(self, days: int = 7) -> int:
+        """Delete trades older than N days for wallets NOT in copy_targets."""
+        cursor = self.conn.execute(
+            """DELETE FROM trades WHERE timestamp < datetime('now', ?)
+               AND taker NOT IN (SELECT wallet FROM copy_targets)
+               AND maker NOT IN (SELECT wallet FROM copy_targets)""",
+            (f"-{days} days",),
+        )
+        self.conn.commit()
+        return cursor.rowcount

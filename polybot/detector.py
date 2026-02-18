@@ -418,38 +418,51 @@ class BotDetector:
         pnl_pct: float = 0.0,
         win_rate: float = 0.0,
         profit_all: float = 0.0,
+        profit_1d: float = 0.0,
+        profit_7d: float = 0.0,
+        profit_30d: float = 0.0,
     ) -> float:
-        """Compute a 0-100 copy-worthiness score.
+        """Compute a 0-100 copy-worthiness score (bottom-up).
 
-        Higher = better candidate for copy trading. Combines:
-        - Profitability (P&L %, win rate)
-        - Hold time (longer = easier to copy)
-        - Trade pattern cleanliness (low burst, low concentration)
-        - Category penalty (market makers / scalpers score low)
+        Returns -1 when insufficient data to score meaningfully.
+        Higher = better candidate for copy trading.
+
+        Signals (total 100 pts):
+        - P&L % (25): is this wallet actually profitable?
+        - Win rate (15): higher = more consistent
+        - Hold time (15): longer holds = easier to copy
+        - Profit consistency (10): profitable across time periods
+        - Market liquidity (10): trades on liquid markets = less slippage
+        - Trade frequency (10): moderate = manageable to copy
+        - Drawdown (10): low drawdown = safer
+        - Burst penalty (5): clean entries vs micro-trading
         """
-        score = 50.0  # start neutral
+        # Insufficient data: need trades and some profit data
+        if signals.trade_count < 10 and profit_all == 0 and pnl_pct == 0:
+            return -1.0
 
-        # Profitability: +/- up to 20 points
-        if pnl_pct > 5:
+        score = 0.0
+
+        # 1. P&L % — the most important signal (up to 25 pts)
+        if pnl_pct > 10:
+            score += 25
+        elif pnl_pct > 5:
             score += 20
         elif pnl_pct > 1:
             score += 12
         elif pnl_pct > 0:
             score += 5
-        elif pnl_pct < -5:
-            score -= 20
-        elif pnl_pct < 0:
-            score -= 10
+        # Negative P&L is simply 0 pts (not penalized below 0)
 
-        # Win rate: +/- up to 15 points
+        # 2. Win rate (up to 15 pts)
         if win_rate >= 0.65:
             score += 15
         elif win_rate >= 0.55:
-            score += 8
-        elif win_rate < 0.4:
-            score -= 10
+            score += 10
+        elif win_rate >= 0.45:
+            score += 5
 
-        # Hold time: longer is better for us (up to 15 points)
+        # 3. Hold time — longer holds are easier to copy (up to 15 pts)
         h = signals.avg_hold_time_hours
         if 4 <= h <= 168:  # 4h to 1 week — ideal range
             score += 15
@@ -457,33 +470,50 @@ class BotDetector:
             score += 8
         elif h > 168:
             score += 5  # very long holds are fine, just slow
-        elif 0 < h < 1:
-            score -= 10  # sub-hour holds = hard to copy
+        # Sub-hour holds get 0 pts (hard to copy)
 
-        # Burst trading penalty: up to -20 points
+        # 4. Profit consistency — profitable across time periods (up to 10 pts)
+        periods_positive = sum(1 for p in (profit_1d, profit_7d, profit_30d) if p > 0)
+        if periods_positive == 3:
+            score += 10  # all recent periods profitable
+        elif periods_positive == 2:
+            score += 6
+        elif periods_positive == 1 and profit_all > 0:
+            score += 3
+
+        # 5. Market liquidity proxy — diversified, moderate-sized trades (up to 10 pts)
+        # Low concentration + moderate trade size = liquid markets
+        if signals.market_concentration < 0.3 and signals.avg_trade_size_usd < 500:
+            score += 10
+        elif signals.market_concentration < 0.5 and signals.avg_trade_size_usd < 1000:
+            score += 6
+        elif signals.market_concentration < 0.7:
+            score += 3
+
+        # 6. Trade frequency — moderate is best (up to 10 pts)
+        # Ideal: 1-20 trades per day equivalent
+        tpm = signals.trades_per_market
+        if 2 <= tpm <= 10:
+            score += 10  # moderate, deliberate trading
+        elif 1 <= tpm < 2:
+            score += 7  # very clean entries
+        elif 10 < tpm <= 20:
+            score += 5
+        elif tpm > 50:
+            score += 0  # excessive micro-trading
+
+        # 7. Drawdown — inferred from recent vs all-time (up to 10 pts)
+        if profit_all > 0:
+            if profit_30d >= 0:
+                score += 10  # no recent drawdown
+            elif profit_30d > -profit_all * 0.1:
+                score += 5  # small recent drawdown
+            # Large drawdown gets 0 pts
+
+        # 8. Burst trading penalty (up to 5 pts)
         if signals.avg_market_burst <= 2:
-            score += 10  # clean single entries
+            score += 5  # clean single entries
         elif signals.avg_market_burst <= 5:
-            score += 0  # neutral
-        elif signals.avg_market_burst <= 20:
-            score -= 10
-        else:
-            score -= 20  # heavy micro-trading
-
-        # Market concentration: diversified is better (up to 10 points)
-        if signals.market_concentration < 0.2:
-            score += 10
-        elif signals.market_concentration < 0.4:
-            score += 5
-        elif signals.market_concentration > 0.7:
-            score -= 10
-
-        # All-time profit: a bot that actually makes money (up to 10 points)
-        if profit_all > 1000:
-            score += 10
-        elif profit_all > 100:
-            score += 5
-        elif profit_all < -100:
-            score -= 5
+            score += 3
 
         return max(0, min(100, score))

@@ -35,14 +35,11 @@ class Config:
     # Bot detection thresholds
     min_trades_for_detection: int = 20
     speed_threshold_ms: int = 2000  # trades faster than this are suspicious
-    regularity_threshold: float = 0.8  # coefficient of variation threshold
-    session_gap_seconds: int = 300  # gap between trading sessions
 
     # Copy trading
     copy_trade_percentage: float = 10.0  # % of the bot's trade size to copy
     copy_trade_mode: str = "paper"  # "paper" or "real"
     max_position_usd: float = 100.0  # max $ per single copy trade
-    copy_delay_seconds: float = 0.5  # small delay before executing copy
 
     # Cloudflare Worker URL (for remote copy listener)
     cloudflare_worker_url: str = ""

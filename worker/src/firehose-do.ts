@@ -53,6 +53,11 @@ export class FirehoseDO implements DurableObject {
     this.env = env;
   }
 
+  /** Shorthand: firehose DB for trades/wallets (high-volume). */
+  private get fdb(): D1Database {
+    return this.env.FIREHOSE_DB ?? this.env.DB;
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -74,14 +79,14 @@ export class FirehoseDO implements DurableObject {
       const userStopped =
         (await this.state.storage.get("userStopped")) ?? false;
 
-      // Query D1 for counts
+      // Query firehose DB for counts
       const [tradeRow, walletRow] = await Promise.all([
-        this.env.DB.prepare(
-          "SELECT COUNT(*) as cnt FROM firehose_trades",
-        ).first<{ cnt: number }>(),
-        this.env.DB.prepare(
-          "SELECT COUNT(*) as cnt FROM firehose_wallets",
-        ).first<{ cnt: number }>(),
+        this.fdb
+          .prepare("SELECT COUNT(*) as cnt FROM firehose_trades")
+          .first<{ cnt: number }>(),
+        this.fdb
+          .prepare("SELECT COUNT(*) as cnt FROM firehose_wallets")
+          .first<{ cnt: number }>(),
       ]);
 
       return json({
@@ -103,9 +108,10 @@ export class FirehoseDO implements DurableObject {
       const params = new URL(request.url).searchParams;
       this.detectMinTrades = Number(params.get("min_trades") ?? "1");
       // Count total wallets to scan
-      const countRow = await this.env.DB.prepare(
-        "SELECT COUNT(*) as cnt FROM firehose_wallets WHERE trade_count >= ?",
-      )
+      const countRow = await this.fdb
+        .prepare(
+          "SELECT COUNT(*) as cnt FROM firehose_wallets WHERE trade_count >= ?",
+        )
         .bind(this.detectMinTrades)
         .first<{ cnt: number }>();
       this.detectTotalWallets = countRow?.cnt ?? 0;
@@ -137,9 +143,9 @@ export class FirehoseDO implements DurableObject {
     }
 
     if (url.pathname === "/firehose/clear") {
-      await this.env.DB.batch([
-        this.env.DB.prepare("DELETE FROM firehose_trades"),
-        this.env.DB.prepare("DELETE FROM firehose_wallets"),
+      await this.fdb.batch([
+        this.fdb.prepare("DELETE FROM firehose_trades"),
+        this.fdb.prepare("DELETE FROM firehose_wallets"),
       ]);
       this.seenIds.clear();
       this.pollCount = 0;
@@ -192,9 +198,10 @@ export class FirehoseDO implements DurableObject {
     }
 
     const BATCH_SIZE = 500;
-    const { results } = await this.env.DB.prepare(
-      "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT ? OFFSET ?",
-    )
+    const { results } = await this.fdb
+      .prepare(
+        "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT ? OFFSET ?",
+      )
       .bind(this.detectMinTrades, BATCH_SIZE, this.detectOffset)
       .all<{ wallet: string }>();
 
@@ -310,14 +317,14 @@ export class FirehoseDO implements DurableObject {
 
     if (!newTrades.length) return;
 
-    // Batch insert trades into D1
-    const tradeStmt = this.env.DB.prepare(
+    // Batch insert trades into firehose DB
+    const tradeStmt = this.fdb.prepare(
       `INSERT OR IGNORE INTO firehose_trades
        (id, market, asset_id, side, price, size, timestamp, taker, title, outcome)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
-    const walletStmt = this.env.DB.prepare(
+    const walletStmt = this.fdb.prepare(
       `INSERT INTO firehose_wallets (wallet, source, trade_count)
        VALUES (?, 'trade', 1)
        ON CONFLICT(wallet) DO UPDATE SET trade_count = trade_count + 1`,
@@ -375,7 +382,18 @@ export class FirehoseDO implements DurableObject {
 
     // D1 batch limit is 100 statements — chunk if needed
     for (let i = 0; i < batch.length; i += 100) {
-      await this.env.DB.batch(batch.slice(i, i + 100));
+      await this.fdb.batch(batch.slice(i, i + 100));
+    }
+
+    // Retention pruning: delete firehose_trades older than 7 days
+    try {
+      await this.fdb
+        .prepare(
+          "DELETE FROM firehose_trades WHERE timestamp < datetime('now', '-7 days')",
+        )
+        .run();
+    } catch {
+      // non-critical
     }
   }
 
@@ -433,15 +451,15 @@ export class FirehoseDO implements DurableObject {
 
     if (!wallets.size) return;
 
-    // Insert harvested wallets into D1
-    const stmt = this.env.DB.prepare(
+    // Insert harvested wallets into firehose DB
+    const stmt = this.fdb.prepare(
       `INSERT OR IGNORE INTO firehose_wallets (wallet, source)
        VALUES (?, 'harvest')`,
     );
 
     const batch = Array.from(wallets).map((w) => stmt.bind(w));
     for (let i = 0; i < batch.length; i += 100) {
-      await this.env.DB.batch(batch.slice(i, i + 100));
+      await this.fdb.batch(batch.slice(i, i + 100));
     }
 
     console.log(`Harvested ${wallets.size} wallets`);

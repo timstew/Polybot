@@ -95,14 +95,16 @@ class TestCopyExecution:
     def test_paper_trade_on_target_activity(self, copier):
         copier.add_target("0xbot1", mode=CopyMode.PAPER, trade_pct=10.0, slippage_bps=0)
         trade = _make_trade(taker="0xbot1", price=0.50, size=200)
-        # Source trade notional = 0.50 * 200 = $100, copy = 10% = $10
+        # Source trade notional = 0.50 * 200 = $100
+        # Paper mode always copies at 100% regardless of trade_pct
+        # No fee (test trade has no asset_id, so fetch_fee_rate returns 0)
+        # Copy size: $100 / $0.50 = 200 shares
         result = copier.on_trade(trade)
         assert result is not None
         assert result.mode == CopyMode.PAPER
         assert result.status == "filled"
         assert result.price == 0.50
-        # Copy size: $10 / $0.50 = 20 shares
-        assert result.size == pytest.approx(20.0)
+        assert result.size == pytest.approx(200.0)
 
     def test_ignores_non_target_trades(self, copier):
         copier.add_target("0xbot1")
@@ -110,20 +112,20 @@ class TestCopyExecution:
         result = copier.on_trade(trade)
         assert result is None
 
-    def test_respects_max_position(self, copier):
+    def test_real_trade_uses_configured_pct(self, copier):
         copier.add_target(
             "0xbot1",
-            mode=CopyMode.PAPER,
-            trade_pct=100.0,  # 100% copy
-            max_position_usd=50.0,  # but cap at $50
+            mode=CopyMode.REAL,
+            trade_pct=10.0,  # 10% copy for real trades
             slippage_bps=0,
         )
-        # Source trade: $100 notional. 100% copy = $100, but max = $50.
+        # Source trade: $100 notional. Real mode uses trade_pct = 10% → $10.
+        # No fee (test trade has no asset_id)
+        # Copy size: $10 / $0.50 = 20 shares
         trade = _make_trade(taker="0xbot1", price=0.50, size=200)
         result = copier.on_trade(trade)
         assert result is not None
-        # $50 / $0.50 = 100 shares max
-        assert result.size == pytest.approx(100.0)
+        assert result.size == pytest.approx(20.0)
 
     def test_copies_sell_side(self, copier):
         copier.add_target("0xbot1", mode=CopyMode.PAPER)

@@ -228,9 +228,9 @@ export default {
           win_rate: r.win_rate || 0,
           total_volume_usd: r.total_volume_usd || 0,
           active_positions: 0,
-          portfolio_value: 0,
+          portfolio_value: r.profit_all || 0,
           market_categories: [],
-          copy_score: r.copy_score || 0,
+          copy_score: r.copy_score ?? 0,
           avg_hold_time_hours: 0,
           trades_per_market: 0,
           avg_market_burst: 0,
@@ -271,19 +271,33 @@ export default {
       const listener = (await listenerResp.json()) as Record<string, unknown>;
 
       // Count copy trades and targets
-      const [copyTradeRow, targetRow, botRow, suspectRow] = await Promise.all([
+      const fdb = env.FIREHOSE_DB ?? env.DB;
+      const [
+        copyTradeRow,
+        targetRow,
+        botRow,
+        suspectRow,
+        firehoseTradeRow,
+        firehoseWalletRow,
+      ] = await Promise.all([
         env.DB.prepare("SELECT COUNT(*) as cnt FROM copy_trades").first<{
           cnt: number;
         }>(),
         env.DB.prepare(
           "SELECT COUNT(*) as cnt FROM copy_targets WHERE active = 1",
         ).first<{ cnt: number }>(),
-        env.DB.prepare(
-          "SELECT COUNT(DISTINCT taker) as cnt FROM firehose_trades",
-        ).first<{ cnt: number }>(),
+        fdb
+          .prepare("SELECT COUNT(DISTINCT taker) as cnt FROM firehose_trades")
+          .first<{ cnt: number }>(),
         env.DB.prepare("SELECT COUNT(*) as cnt FROM suspect_bots").first<{
           cnt: number;
         }>(),
+        fdb
+          .prepare("SELECT COUNT(*) as cnt FROM firehose_trades")
+          .first<{ cnt: number }>(),
+        fdb
+          .prepare("SELECT COUNT(*) as cnt FROM firehose_wallets")
+          .first<{ cnt: number }>(),
       ]);
 
       return jsonCors(
@@ -299,6 +313,15 @@ export default {
           copy_listening: listener.running ?? false,
           copy_trade_count: copyTradeRow?.cnt ?? 0,
           unique_wallets: botRow?.cnt ?? 0,
+          db_ops: {
+            copy_trades: copyTradeRow?.cnt ?? 0,
+            copy_targets: targetRow?.cnt ?? 0,
+            suspect_bots: suspectRow?.cnt ?? 0,
+          },
+          db_firehose: {
+            firehose_trades: firehoseTradeRow?.cnt ?? 0,
+            firehose_wallets: firehoseWalletRow?.cnt ?? 0,
+          },
         },
         request,
       );

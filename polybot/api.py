@@ -7,7 +7,7 @@ import threading
 import time
 
 import requests as http_requests
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel as PydanticBaseModel
 
@@ -140,6 +140,43 @@ def listener_start():
         db.close()
         return added
 
+    def on_new_wallets(wallets: list[str]):
+        """Continuous detection: scan newly harvested wallets, skip already-analyzed."""
+        db = _db()
+        try:
+            new_wallets = [w for w in wallets if not db.is_wallet_analyzed(w)]
+            if not new_wallets:
+                return
+            logger.info(
+                "Continuous detection: %d new wallets to scan", len(new_wallets)
+            )
+            detector = BotDetector(db, config)
+            suspects = detector.scan_wallets_remote(new_wallets)
+            for s in suspects:
+                db.upsert_suspect(s)
+            for w in new_wallets:
+                status = (
+                    "detected" if any(s.wallet == w for s in suspects) else "detected"
+                )
+                db.mark_wallet_analyzed(w, status=status)
+            logger.info(
+                "Continuous detection: found %d bots from %d new wallets",
+                len(suspects),
+                len(new_wallets),
+            )
+        finally:
+            db.close()
+
+    def on_prune():
+        """Periodic cleanup: prune old trades and stale analyzed_wallets."""
+        db = _db()
+        try:
+            db.prune_old_trades(days=7)
+            db.prune_analyzed_before(days=30)
+            logger.info("Pruned old trades (>7d) and stale analyzed wallets (>30d)")
+        finally:
+            db.close()
+
     _listener_thread = threading.Thread(
         target=listen_trades,
         kwargs={
@@ -147,6 +184,8 @@ def listener_start():
             "poll_interval": 2.0,
             "batch_size": 500,
             "stop_event": _listener_stop,
+            "on_new_wallets": on_new_wallets,
+            "on_prune": on_prune,
         },
         daemon=True,
     )
@@ -454,6 +493,8 @@ def cloud_targets():
 def bots(min_confidence: float = Query(0.0)):
     db = _db()
     suspects = db.get_suspect_bots(min_confidence=min_confidence)
+    dismissed = set(db.get_analyzed_wallets(status="dismissed"))
+    suspects = [s for s in suspects if s.wallet not in dismissed]
     db.close()
     return [
         {
@@ -478,7 +519,7 @@ def bots(min_confidence: float = Query(0.0)):
 def rank(
     top: int = Query(30, ge=1, le=100),
     min_confidence: float = Query(0.0),
-    sort_by: str = Query("pnl_pct", regex="^(realized_pnl|pnl_pct)$"),
+    sort_by: str = Query("pnl_pct", pattern="^(realized_pnl|pnl_pct)$"),
 ):
     db = _db()
     tracker = ProfitabilityTracker(db)
@@ -517,6 +558,28 @@ def bots_clear():
     db.conn.commit()
     db.close()
     return {"status": "cleared"}
+
+
+class DismissRequest(PydanticBaseModel):
+    wallet: str
+
+
+@app.post("/api/bots/dismiss")
+def bots_dismiss(req: DismissRequest):
+    """Dismiss a bot — removes from suspect_bots and prevents re-detection for 30 days."""
+    db = _db()
+    db.dismiss_wallet(req.wallet)
+    db.close()
+    return {"status": "dismissed", "wallet": req.wallet}
+
+
+@app.post("/api/bots/undismiss")
+def bots_undismiss(req: DismissRequest):
+    """Undo a dismissal so the wallet can be re-detected."""
+    db = _db()
+    db.undismiss_wallet(req.wallet)
+    db.close()
+    return {"status": "undismissed", "wallet": req.wallet}
 
 
 @app.post("/api/trades/clear")
@@ -616,6 +679,9 @@ def detect_cloud(
             pnl_pct=p.get("lb_pnl_pct", 0) or 0,
             win_rate=0,
             profit_all=p.get("profit_all", 0) or 0,
+            profit_1d=p.get("profit_1d", 0) or 0,
+            profit_7d=p.get("profit_7d", 0) or 0,
+            profit_30d=p.get("profit_30d", 0) or 0,
         )
         bots_out.append(
             {
@@ -692,12 +758,14 @@ def detect_debug(wallet: str):
 def unified(
     top: int = Query(30, ge=1, le=200),
     min_confidence: float = Query(0.0),
-    sort_by: str = Query("pnl_pct", regex="^(realized_pnl|pnl_pct)$"),
+    sort_by: str = Query("pnl_pct", pattern="^(realized_pnl|pnl_pct)$"),
 ):
     """Unified endpoint merging bot detection signals with profitability data."""
     db = _db()
     tracker = ProfitabilityTracker(db)
     suspects = db.get_suspect_bots(min_confidence=min_confidence)
+    dismissed = set(db.get_analyzed_wallets(status="dismissed"))
+    suspects = [s for s in suspects if s.wallet not in dismissed]
 
     # Build detection lookup
     bot_map = {s.wallet: s for s in suspects}
@@ -735,6 +803,9 @@ def unified(
             pnl_pct=pnl_pct,
             win_rate=win_rate,
             profit_all=profit_all,
+            profit_1d=p.get("profit_1d", 0) or 0,
+            profit_7d=p.get("profit_7d", 0) or 0,
+            profit_30d=p.get("profit_30d", 0) or 0,
         )
 
         row = {
@@ -753,7 +824,7 @@ def unified(
             "win_rate": win_rate,
             "total_volume_usd": p.get("volume_all") or r.total_volume_usd,
             "active_positions": r.active_positions,
-            "portfolio_value": r.portfolio_value,
+            "portfolio_value": p.get("profit_all", 0) or r.portfolio_value,
             "market_categories": r.market_categories,
             "copy_score": round(copy_score, 1),
             "trades_per_market": round(signals.trades_per_market, 1),

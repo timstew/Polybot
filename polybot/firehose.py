@@ -594,6 +594,8 @@ def listen_trades(
     poll_interval: float = 2.0,
     batch_size: int = 500,
     stop_event: Optional[threading.Event] = None,
+    on_new_wallets: Optional[Callable[[list[str]], None]] = None,
+    on_prune: Optional[Callable[[], None]] = None,
 ) -> None:
     """RTDS-primary trade ingestion with REST fallback.
 
@@ -630,6 +632,9 @@ def listen_trades(
     # Wallet harvesting from leaderboard + market positions
     last_harvest = 0.0
     HARVEST_INTERVAL = 1800.0  # 30 minutes
+    # Periodic pruning
+    last_prune = 0.0
+    PRUNE_INTERVAL = 3600.0  # 1 hour
 
     logger.info(
         "Listener started — RTDS primary, REST fallback every %.1fs", poll_interval
@@ -696,8 +701,25 @@ def listen_trades(
                                 harvest_new,
                                 len(wallets),
                             )
+
+                        # ── 4b. Continuous detection on new wallets ──
+                        if on_new_wallets and wallets:
+                            try:
+                                on_new_wallets(list(wallets))
+                            except Exception:
+                                logger.debug("Continuous detection callback failed")
+
                     except Exception:
                         logger.debug("Wallet harvest failed")
+
+                # ── 5. Periodic pruning every hour ──
+                if now - last_prune >= PRUNE_INTERVAL:
+                    last_prune = now
+                    if on_prune:
+                        try:
+                            on_prune()
+                        except Exception:
+                            logger.debug("Prune callback failed")
 
             except Exception:
                 logger.exception("Listener poll error")

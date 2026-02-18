@@ -17,6 +17,10 @@ async function postJSON<T>(path: string, body?: unknown): Promise<T> {
   return res.json();
 }
 
+export interface DbTableCounts {
+  [key: string]: number;
+}
+
 export interface Stats {
   trade_count: number;
   wallet_count: number;
@@ -27,6 +31,8 @@ export interface Stats {
   listener_polls: number;
   listener_cumulative_seconds: number;
   copy_listening: boolean;
+  db_ops?: DbTableCounts;
+  db_firehose?: DbTableCounts;
 }
 
 export interface BotRow {
@@ -326,4 +332,12 @@ export const api = {
   cloudTrades: (limit = 20) =>
     fetchJSON<CopyTradeRow[]>(`/api/copy/trades/cloud?limit=${limit}`),
   cloudTargets: () => fetchJSON<CopyTarget[]>("/api/copy/targets/cloud"),
+  dismissBot: (wallet: string) =>
+    postJSON<{ status: string; wallet: string }>("/api/bots/dismiss", {
+      wallet,
+    }),
+  undismissBot: (wallet: string) =>
+    postJSON<{ status: string; wallet: string }>("/api/bots/undismiss", {
+      wallet,
+    }),
 };

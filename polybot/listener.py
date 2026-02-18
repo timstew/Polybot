@@ -195,7 +195,8 @@ def run_copy_listener(
             if batches % 30 == 0:
                 tracker.update_target_measured_slippage(db)
                 if len(seen_ids) > 50000:
-                    seen_ids.clear()
+                    seen_list = list(seen_ids)
+                    seen_ids = set(seen_list[len(seen_list) // 2 :])
 
             db.close()
         except Exception:
