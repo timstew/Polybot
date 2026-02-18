@@ -371,8 +371,10 @@ export default {
       url.pathname === "/api/copy/targets/cloud"
     ) {
       const { results } = await env.DB.prepare(
-        "SELECT * FROM copy_targets",
-      ).all<CopyTarget>();
+        `SELECT ct.*, COALESCE(sb.username, '') as username
+         FROM copy_targets ct
+         LEFT JOIN suspect_bots sb ON ct.wallet = sb.wallet`,
+      ).all<CopyTarget & { username: string }>();
       return jsonCors(results ?? [], request);
     }
 
