@@ -666,19 +666,21 @@ def detect_cloud(
         min_confidence=min_confidence,
     )
 
-    # Fetch profitability for detected bots
+    # Fetch profitability and win rates for detected bots
     tracker = ProfitabilityTracker(db)
     bot_wallets = [s.wallet for s in suspects]
     profits = tracker.fetch_wallets_profit(bot_wallets) if bot_wallets else {}
+    win_rates = tracker.fetch_wallets_win_rates(bot_wallets) if bot_wallets else {}
 
     bots_out = []
     for s in suspects:
         p = profits.get(s.wallet, {})
+        wr = win_rates.get(s.wallet, 0.0)
         cat_str = s.category.value if hasattr(s.category, "value") else str(s.category)
         copy_score = BotDetector.compute_copy_score(
             s.signals,
             pnl_pct=p.get("lb_pnl_pct", 0) or 0,
-            win_rate=0,
+            win_rate=wr,
             profit_all=p.get("profit_all", 0) or 0,
             profit_1d=p.get("profit_1d", 0) or 0,
             profit_7d=p.get("profit_7d", 0) or 0,
@@ -697,7 +699,7 @@ def detect_cloud(
                 "username": p.get("username", ""),
                 "pnl_pct": p.get("lb_pnl_pct", 0) or 0,
                 "realized_pnl": p.get("profit_all", 0) or 0,
-                "win_rate": 0,
+                "win_rate": wr,
                 "total_volume_usd": p.get("volume_all", 0) or 0,
                 "profit_1d": p.get("profit_1d", 0) or 0,
                 "profit_7d": p.get("profit_7d", 0) or 0,

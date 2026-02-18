@@ -465,6 +465,45 @@ class ProfitabilityTracker:
                 r["lb_pnl_pct"] = r["profit_all"] / r["volume_all"] * 100
         return results
 
+    def _fetch_win_rate(self, wallet: str) -> tuple[str, float]:
+        """Fetch win rate from positions API. A win = any position with cashPnl > 0."""
+        try:
+            resp = requests.get(
+                f"{DATA_API_HOST}/positions",
+                params={"user": wallet, "sizeThreshold": -1, "limit": 200},
+                timeout=10,
+            )
+            if resp.ok:
+                positions = resp.json()
+                wins = sum(1 for p in positions if p.get("cashPnl", 0) > 0)
+                losses = sum(1 for p in positions if p.get("cashPnl", 0) < 0)
+                total = wins + losses
+                if total > 0:
+                    return (wallet, wins / total)
+        except Exception:
+            logger.debug("Could not fetch positions for %s", wallet)
+        return (wallet, 0.0)
+
+    def fetch_wallets_win_rates(self, wallets: list[str]) -> dict[str, float]:
+        """Fetch win rates for multiple wallets in parallel."""
+        import threading
+        import time as _time
+
+        results: dict[str, float] = {w: 0.0 for w in wallets}
+        _throttle = threading.Semaphore(6)
+
+        def _throttled(w):
+            with _throttle:
+                _time.sleep(0.1)
+                return self._fetch_win_rate(w)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(_throttled, w): w for w in wallets}
+            for future in as_completed(futures):
+                wallet, rate = future.result()
+                results[wallet] = rate
+        return results
+
     def rank_wallets_remote(
         self, wallets: list[str], sort_by: str = "realized_pnl"
     ) -> list[BotProfitability]:
