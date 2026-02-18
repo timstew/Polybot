@@ -270,8 +270,9 @@ export default {
       );
       const listener = (await listenerResp.json()) as Record<string, unknown>;
 
-      // Count copy trades and targets
+      // Count copy trades and targets + DB sizes
       const fdb = env.FIREHOSE_DB ?? env.DB;
+
       const [
         copyTradeRow,
         targetRow,
@@ -300,6 +301,18 @@ export default {
           .first<{ cnt: number }>(),
       ]);
 
+      // Get DB sizes from D1 query metadata (size_after is returned on every query)
+      const [opsMetaResult, firehoseMetaResult] = await Promise.all([
+        env.DB.prepare("SELECT 1").run(),
+        fdb.prepare("SELECT 1").run(),
+      ]);
+      const opsSizeBytes =
+        ((opsMetaResult.meta as Record<string, unknown>)
+          ?.size_after as number) ?? 0;
+      const firehoseSizeBytes =
+        ((firehoseMetaResult.meta as Record<string, unknown>)
+          ?.size_after as number) ?? 0;
+
       return jsonCors(
         {
           trade_count: firehose.trade_count ?? 0,
@@ -317,10 +330,12 @@ export default {
             copy_trades: copyTradeRow?.cnt ?? 0,
             copy_targets: targetRow?.cnt ?? 0,
             suspect_bots: suspectRow?.cnt ?? 0,
+            size_mb: Math.round((opsSizeBytes / 1048576) * 100) / 100,
           },
           db_firehose: {
             firehose_trades: firehoseTradeRow?.cnt ?? 0,
             firehose_wallets: firehoseWalletRow?.cnt ?? 0,
+            size_mb: Math.round((firehoseSizeBytes / 1048576) * 100) / 100,
           },
         },
         request,

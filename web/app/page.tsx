@@ -135,6 +135,7 @@ function Stat({
 
 export default function DashboardPage() {
   const [stats, setStats] = useState<Stats | null>(null);
+  const [statsLoaded, setStatsLoaded] = useState(false);
   const [rows, setRows] = useState<UnifiedBotRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("copy_score");
@@ -143,8 +144,14 @@ export default function DashboardPage() {
   const refreshStats = useCallback(() => {
     api
       .stats()
-      .then(setStats)
-      .catch(() => {});
+      .then((s) => {
+        setStats(s);
+        setStatsLoaded(true);
+      })
+      .catch(() => {
+        setStats(null);
+        setStatsLoaded(true);
+      });
   }, []);
 
   const refreshTable = useCallback(() => {
@@ -218,7 +225,9 @@ export default function DashboardPage() {
             <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
               {/* Live indicator */}
               <div className="flex items-center gap-2">
-                {stats?.listening ? (
+                {!statsLoaded ? (
+                  <Skeleton className="h-5 w-14 rounded-full" />
+                ) : stats?.listening ? (
                   <Badge
                     variant="default"
                     className="bg-green-600 text-white gap-1.5"
@@ -291,37 +300,47 @@ export default function DashboardPage() {
                       <div className="flex items-center gap-1.5 cursor-help text-xs text-muted-foreground">
                         <Database className="h-3 w-3" />
                         <span className="tabular-nums">
-                          {stats.db_firehose
-                            ? (
-                                stats.db_firehose.firehose_trades ?? 0
-                              ).toLocaleString()
-                            : 0}{" "}
-                          rows
+                          {(
+                            (stats.db_ops?.size_mb ?? 0) +
+                            (stats.db_firehose?.size_mb ?? 0)
+                          ).toFixed(1)}{" "}
+                          MB / 1,000 MB
                         </span>
                       </div>
                     </TooltipTrigger>
                     <TooltipContent side="bottom">
-                      <div className="space-y-1 text-xs">
+                      <div className="space-y-1.5 text-xs">
                         {stats.db_ops && (
                           <div>
-                            <span className="font-medium">Ops DB:</span>{" "}
-                            {Object.entries(stats.db_ops)
-                              .map(
-                                ([t, c]) =>
-                                  `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
-                              )
-                              .join(", ")}
+                            <div className="font-medium">
+                              Ops DB: {stats.db_ops.size_mb ?? 0} MB / 500 MB
+                            </div>
+                            <div className="text-muted-foreground">
+                              {Object.entries(stats.db_ops)
+                                .filter(([t]) => t !== "size_mb")
+                                .map(
+                                  ([t, c]) =>
+                                    `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
+                                )
+                                .join(", ")}
+                            </div>
                           </div>
                         )}
                         {stats.db_firehose && (
                           <div>
-                            <span className="font-medium">Firehose DB:</span>{" "}
-                            {Object.entries(stats.db_firehose)
-                              .map(
-                                ([t, c]) =>
-                                  `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
-                              )
-                              .join(", ")}
+                            <div className="font-medium">
+                              Firehose DB: {stats.db_firehose.size_mb ?? 0} MB /
+                              500 MB
+                            </div>
+                            <div className="text-muted-foreground">
+                              {Object.entries(stats.db_firehose)
+                                .filter(([t]) => t !== "size_mb")
+                                .map(
+                                  ([t, c]) =>
+                                    `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
+                                )
+                                .join(", ")}
+                            </div>
                           </div>
                         )}
                       </div>
