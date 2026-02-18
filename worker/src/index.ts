@@ -78,6 +78,7 @@ interface PnlResult {
   closed_positions: ClosedPosition[];
   open_positions: OpenPosition[];
   pnl_series: { t: string; pnl: number }[];
+  peak_capital: number;
 }
 
 interface TradeRowWithMarket extends TradeRow {
@@ -103,6 +104,8 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
   const closedPositions: ClosedPosition[] = [];
   const openPositions: OpenPosition[] = [];
   const pnlEvents: { t: string; pnl: number }[] = [];
+  // Track capital deployed over time to find peak
+  const capitalEvents: { ts: number; delta: number }[] = [];
 
   for (const [assetId, assetTrades] of byAsset) {
     assetTrades.sort(
@@ -119,11 +122,16 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
     for (const t of assetTrades) {
       totalFees += t.fee_amount || 0;
       if (t.side === "BUY") {
+        const cost = t.price * t.size;
         queue.push({
           price: t.price,
           remaining: t.size,
           ts: new Date(t.timestamp).getTime(),
           market: t.market || "",
+        });
+        capitalEvents.push({
+          ts: new Date(t.timestamp).getTime(),
+          delta: cost,
         });
       } else {
         let sellRemaining = t.size;
@@ -151,7 +159,9 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
           if (buy.remaining <= 0) queue.shift();
         }
 
+        // Release capital for matched sells
         if (positionSize > 0) {
+          capitalEvents.push({ ts: sellTs, delta: -entryPriceSum });
           const netPnl = Math.round(positionPnl * 100) / 100;
           if (netPnl >= 0) wins++;
           else losses++;
@@ -201,6 +211,15 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
   // Sort closed positions by time desc
   closedPositions.sort((a, b) => b.closed_at.localeCompare(a.closed_at));
 
+  // Compute peak capital (max simultaneous open cost)
+  capitalEvents.sort((a, b) => a.ts - b.ts);
+  let runningCapital = 0;
+  let peakCapital = 0;
+  for (const ev of capitalEvents) {
+    runningCapital += ev.delta;
+    if (runningCapital > peakCapital) peakCapital = runningCapital;
+  }
+
   return {
     realized_pnl: Math.round((realizedPnl - totalFees) * 100) / 100,
     total_fees: Math.round(totalFees * 100) / 100,
@@ -215,6 +234,7 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
     closed_positions: closedPositions,
     open_positions: openPositions,
     pnl_series,
+    peak_capital: Math.round(peakCapital * 100) / 100,
   };
 }
 
@@ -396,32 +416,37 @@ export default {
           copy_score: number;
         }>();
       return jsonCors(
-        (results ?? []).map((r) => ({
-          wallet: r.wallet,
-          confidence: r.confidence,
-          category: r.category,
-          trade_count: r.trade_count,
-          tags: JSON.parse(r.tags || "[]"),
-          username: r.username || "",
-          pnl_pct: r.pnl_pct || 0,
-          realized_pnl: r.realized_pnl || 0,
-          unrealized_pnl: 0,
-          win_rate: r.win_rate || 0,
-          total_volume_usd: r.total_volume_usd || 0,
-          active_positions: 0,
-          portfolio_value: r.profit_all || 0,
-          market_categories: [],
-          copy_score: r.copy_score ?? 0,
-          avg_hold_time_hours: 0,
-          trades_per_market: 0,
-          avg_market_burst: 0,
-          max_market_burst: 0,
-          market_concentration: 0,
-          profit_1d: r.profit_1d || 0,
-          profit_7d: r.profit_7d || 0,
-          profit_30d: r.profit_30d || 0,
-          profit_all: r.profit_all || 0,
-        })),
+        (results ?? []).map((r) => {
+          const vol = r.total_volume_usd || 0;
+          const pall = r.profit_all || 0;
+          return {
+            wallet: r.wallet,
+            confidence: r.confidence,
+            category: r.category,
+            trade_count: r.trade_count,
+            tags: JSON.parse(r.tags || "[]"),
+            username: r.username || "",
+            pnl_pct: r.pnl_pct || 0,
+            realized_pnl: r.realized_pnl || 0,
+            unrealized_pnl: 0,
+            win_rate: r.win_rate || 0,
+            total_volume_usd: vol,
+            active_positions: 0,
+            portfolio_value: pall,
+            market_categories: [],
+            copy_score: r.copy_score ?? 0,
+            avg_hold_time_hours: 0,
+            trades_per_market: 0,
+            avg_market_burst: 0,
+            max_market_burst: 0,
+            market_concentration: 0,
+            profit_1d: r.profit_1d || 0,
+            profit_7d: r.profit_7d || 0,
+            profit_30d: r.profit_30d || 0,
+            profit_all: pall,
+            efficiency: vol > 0 ? Math.round((pall / vol) * 10000) / 100 : 0,
+          };
+        }),
         request,
       );
     }
@@ -613,6 +638,7 @@ export default {
           trade_count: tradeCount,
           listening_hours,
           avg_hold_time_hours: pnl?.avg_hold_time_hours ?? 0,
+          peak_capital: pnl?.peak_capital ?? 0,
         };
       });
       return jsonCors(enriched, request);
@@ -671,6 +697,7 @@ export default {
             total_slippage_cost: 0,
             best_trade_pnl: pnl.best_trade_pnl,
             worst_trade_pnl: pnl.worst_trade_pnl,
+            peak_capital: pnl.peak_capital,
           },
           pnl_series: pnl.pnl_series,
           open_positions: pnl.open_positions.map((p) => ({
@@ -728,7 +755,7 @@ export default {
       )
         .bind(
           w,
-          body.trade_pct ?? 10,
+          body.trade_pct ?? 100,
           body.max_position_usd ?? 100,
           body.slippage_bps ?? 50,
           body.latency_ms ?? 2000,

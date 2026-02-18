@@ -417,6 +417,7 @@ export default function CopyTradingPage() {
                     <TableHead className="text-right">Trades</TableHead>
                     <TableHead className="text-right">Listening</TableHead>
                     <TableHead className="text-right">Avg Hold</TableHead>
+                    <TableHead className="text-right">Peak Capital</TableHead>
                     <TableHead className="text-right">Paper P&L</TableHead>
                     <TableHead className="w-24"></TableHead>
                   </TableRow>
@@ -527,6 +528,9 @@ export default function CopyTradingPage() {
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
                           {fmtHold(t.avg_hold_time_hours)}
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-sm tabular-nums text-muted-foreground">
+                          {fmt(t.peak_capital ?? 0)}
                         </TableCell>
                         <TableCell className="text-right">
                           <span

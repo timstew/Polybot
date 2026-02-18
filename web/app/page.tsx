@@ -72,7 +72,8 @@ type SortKey =
   | "profit_1d"
   | "profit_7d"
   | "profit_30d"
-  | "profit_all";
+  | "profit_all"
+  | "efficiency";
 
 type SortDir = "asc" | "desc";
 
@@ -494,6 +495,22 @@ export default function DashboardPage() {
                       className="text-right"
                     />
                     <SortableHead
+                      label="Vol"
+                      sortKey="total_volume_usd"
+                      currentKey={sortKey}
+                      currentDir={sortDir}
+                      onSort={handleSort}
+                      className="text-right"
+                    />
+                    <SortableHead
+                      label="Efficiency"
+                      sortKey="efficiency"
+                      currentKey={sortKey}
+                      currentDir={sortDir}
+                      onSort={handleSort}
+                      className="text-right"
+                    />
+                    <SortableHead
                       label="Hold"
                       sortKey="avg_hold_time_hours"
                       currentKey={sortKey}
@@ -571,6 +588,20 @@ export default function DashboardPage() {
                         </TableCell>
                         <TableCell className="text-right font-mono text-xs tabular-nums">
                           {(r.win_rate * 100).toFixed(0)}%
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">
+                          $
+                          {r.total_volume_usd >= 1000
+                            ? `${(r.total_volume_usd / 1000).toFixed(1)}k`
+                            : r.total_volume_usd.toFixed(0)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <span
+                            className={`font-mono text-xs font-semibold tabular-nums ${(r.efficiency ?? 0) > 0 ? "text-green-600" : (r.efficiency ?? 0) < 0 ? "text-red-600" : "text-muted-foreground"}`}
+                          >
+                            {(r.efficiency ?? 0) > 0 ? "+" : ""}
+                            {(r.efficiency ?? 0).toFixed(2)}%
+                          </span>
                         </TableCell>
                         <TableCell className="text-right font-mono text-xs tabular-nums">
                           {fmtHold(r.avg_hold_time_hours)}

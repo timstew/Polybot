@@ -132,6 +132,7 @@ export interface CopyTarget {
   avg_hold_time_hours: number;
   trade_count: number;
   listening_hours: number;
+  peak_capital: number;
 }
 
 export interface CopyTradeRow {
@@ -172,6 +173,7 @@ export interface UnifiedBotRow {
   profit_30d: number;
   profit_all: number;
   copy_score: number;
+  efficiency: number;
   trades_per_market: number;
   avg_market_burst: number;
   max_market_burst: number;
