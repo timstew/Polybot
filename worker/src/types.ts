@@ -50,4 +50,5 @@ export interface Env {
   DB: D1Database;
   LISTENER: DurableObjectNamespace;
   FIREHOSE: DurableObjectNamespace;
+  PYTHON_API_URL: string;
 }

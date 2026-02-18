@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Polybot API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://polybot-b5l.pages.dev",
+        "https://polybot-copy-listener.timstew.workers.dev",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )

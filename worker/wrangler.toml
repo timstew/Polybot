@@ -21,6 +21,10 @@ new_classes = ["CopyListenerDO"]
 tag = "v2"
 new_classes = ["FirehoseDO"]
 
+# Python API (Cloud Run) — set after deploying Cloud Run
+[vars]
+PYTHON_API_URL = ""
+
 # Auto-start: runs every minute to ensure the listener is alive
 [triggers]
 crons = ["* * * * *"]

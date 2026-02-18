@@ -260,6 +260,36 @@ export default {
       return jsonCors({ status: "synced", count: targets.length }, request);
     }
 
+    // ── Python API proxy (Cloud Run) ──────────────────────────────────
+
+    if (env.PYTHON_API_URL) {
+      const pyUrl = `${env.PYTHON_API_URL}${url.pathname}${url.search}`;
+      try {
+        const pyResp = await fetch(pyUrl, {
+          method: request.method,
+          headers: { "Content-Type": "application/json" },
+          body: request.method !== "GET" ? await request.text() : undefined,
+        });
+        const data = await pyResp.text();
+        return new Response(data, {
+          status: pyResp.status,
+          headers: {
+            "Content-Type": "application/json",
+            ...corsHeaders(origin),
+          },
+        });
+      } catch {
+        return jsonCors(
+          {
+            error: "python_unavailable",
+            message: "Python backend not reachable",
+          },
+          request,
+          502,
+        );
+      }
+    }
+
     return jsonCors(
       { error: "not_found", message: "Unknown route" },
       request,

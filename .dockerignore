@@ -1,0 +1,12 @@
+node_modules
+web/node_modules
+web/.next
+web/out
+worker/node_modules
+.git
+__pycache__
+*.pyc
+.env
+.pytest_cache
+tests/
+scripts/
