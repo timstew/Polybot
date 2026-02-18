@@ -72,24 +72,31 @@ class BotDetector:
         min_t = min_trades or self.config.min_trades_for_detection
         suspects: list[SuspectBot] = []
 
-        def _fetch_and_analyze(wallet: str) -> Optional[SuspectBot]:
-            try:
-                trades = fetch_wallet_trades(wallet, limit=200)
-                if len(trades) < min_t:
-                    return None
-                return self.analyze_wallet(
-                    wallet, trades=trades, min_trades_override=min_t
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to fetch/analyze trades for %s: %s",
-                    wallet[:10],
-                    Exception,
-                    exc_info=True,
-                )
-                return None
+        import threading
+        import time as _time
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        _throttle = threading.Semaphore(4)  # max 4 concurrent API calls
+
+        def _fetch_and_analyze(wallet: str) -> Optional[SuspectBot]:
+            with _throttle:
+                _time.sleep(0.15)  # 150ms between requests — leave headroom
+                try:
+                    trades = fetch_wallet_trades(wallet, limit=200)
+                    if len(trades) < min_t:
+                        return None
+                    return self.analyze_wallet(
+                        wallet, trades=trades, min_trades_override=min_t
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to fetch/analyze trades for %s: %s",
+                        wallet[:10],
+                        Exception,
+                        exc_info=True,
+                    )
+                    return None
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(_fetch_and_analyze, w): w for w in wallets}
             for future in as_completed(futures):
                 bot = future.result()

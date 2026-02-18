@@ -363,20 +363,34 @@ export default {
       return jsonCors({ ...doStatus, trade_count: tradeCount }, request);
     }
 
-    if (url.pathname === "/targets" && request.method === "GET") {
+    // ── Copy trading routes (D1-backed) ──────────────────────────────
+
+    if (
+      url.pathname === "/targets" ||
+      url.pathname === "/api/copy/targets" ||
+      url.pathname === "/api/copy/targets/cloud"
+    ) {
       const { results } = await env.DB.prepare(
         "SELECT * FROM copy_targets",
       ).all<CopyTarget>();
       return jsonCors(results ?? [], request);
     }
 
-    if (url.pathname === "/trades" && request.method === "GET") {
+    if (
+      url.pathname === "/trades" ||
+      url.pathname === "/api/copy/trades" ||
+      url.pathname === "/api/copy/trades/cloud"
+    ) {
       const limit = Number(url.searchParams.get("limit") ?? "20");
-      const { results } = await env.DB.prepare(
-        "SELECT * FROM copy_trades ORDER BY timestamp DESC LIMIT ?",
-      )
-        .bind(limit)
-        .all<CopyTrade>();
+      const wallet = url.searchParams.get("wallet") || "";
+      const stmt = wallet
+        ? env.DB.prepare(
+            "SELECT * FROM copy_trades WHERE source_wallet = ? ORDER BY timestamp DESC LIMIT ?",
+          ).bind(wallet, limit)
+        : env.DB.prepare(
+            "SELECT * FROM copy_trades ORDER BY timestamp DESC LIMIT ?",
+          ).bind(limit);
+      const { results } = await stmt.all<CopyTrade>();
       return jsonCors(results ?? [], request);
     }
 

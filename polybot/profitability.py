@@ -420,17 +420,31 @@ class ProfitabilityTracker:
             }
             for w in wallets
         }
-        with ThreadPoolExecutor(max_workers=20) as pool:
+        import threading
+        import time as _time
+
+        _throttle = threading.Semaphore(6)
+
+        def _throttled_profit(w, window):
+            with _throttle:
+                _time.sleep(0.1)
+                return self._fetch_single_profit(w, window)
+
+        def _throttled_volume(w, window):
+            with _throttle:
+                _time.sleep(0.1)
+                return self._fetch_single_volume(w, window)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
             # Submit profit tasks
             profit_futures = {
-                pool.submit(self._fetch_single_profit, w, window): ("profit", w)
+                pool.submit(_throttled_profit, w, window): ("profit", w)
                 for w in wallets
                 for window in ("1d", "7d", "30d", "all")
             }
             # Submit volume tasks (all-time only)
             volume_futures = {
-                pool.submit(self._fetch_single_volume, w, "all"): ("volume", w)
-                for w in wallets
+                pool.submit(_throttled_volume, w, "all"): ("volume", w) for w in wallets
             }
             for future in as_completed({**profit_futures, **volume_futures}):
                 kind, _ = profit_futures.get(future) or volume_futures.get(future)

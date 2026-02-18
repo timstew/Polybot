@@ -56,8 +56,6 @@ export default function CopyTradingPage() {
   const [feeRate, setFeeRate] = useState("0");
   const [adding, setAdding] = useState(false);
 
-  const [copyListenerLoading, setCopyListenerLoading] = useState(false);
-  const [listenerMode, setListenerMode] = useState<"local" | "cloud">("cloud");
   const [cloudRunning, setCloudRunning] = useState(false);
   const [cloudTradeCount, setCloudTradeCount] = useState(0);
   const [cloudLoading, setCloudLoading] = useState(false);
@@ -66,14 +64,12 @@ export default function CopyTradingPage() {
     stats?.listening || stats?.copy_listening || cloudRunning;
 
   const fetchTrades = useCallback(() => {
-    return listenerMode === "cloud"
-      ? api.cloudTrades(20)
-      : api.copyTrades("", 20);
-  }, [listenerMode]);
+    return api.cloudTrades(20);
+  }, []);
 
   const fetchTargets = useCallback(() => {
-    return listenerMode === "cloud" ? api.cloudTargets() : api.copyTargets();
-  }, [listenerMode]);
+    return api.cloudTargets();
+  }, []);
 
   const refresh = useCallback(() => {
     fetchTargets()
@@ -103,8 +99,8 @@ export default function CopyTradingPage() {
       .catch(() => {});
   }, []);
 
-  // Poll while any listener is active or viewing cloud mode
-  const shouldPoll = isAnyListenerActive || listenerMode === "cloud";
+  // Poll while any listener is active
+  const shouldPoll = isAnyListenerActive;
   useEffect(() => {
     if (!shouldPoll) return;
     const id = setInterval(() => {
@@ -162,7 +158,7 @@ export default function CopyTradingPage() {
     }
   }
 
-  // Poll cloud status when in cloud mode
+  // Poll cloud listener status
   const updateCloudStatus = useCallback(
     (s: { running: boolean; trade_count?: number }) => {
       setCloudRunning(s.running);
@@ -171,11 +167,6 @@ export default function CopyTradingPage() {
     [],
   );
   useEffect(() => {
-    if (listenerMode !== "cloud") return;
-    api
-      .cloudListenerStatus()
-      .then(updateCloudStatus)
-      .catch(() => setCloudRunning(false));
     const id = setInterval(() => {
       api
         .cloudListenerStatus()
@@ -183,27 +174,7 @@ export default function CopyTradingPage() {
         .catch(() => setCloudRunning(false));
     }, 5000);
     return () => clearInterval(id);
-  }, [listenerMode, updateCloudStatus]);
-
-  async function handleCopyListenerToggle() {
-    setCopyListenerLoading(true);
-    try {
-      if (stats?.copy_listening) {
-        await api.copyListenerStop();
-      } else {
-        const res = await api.copyListenerStart();
-        if (res.status === "error") {
-          setError(res.detail ?? "Failed to start copy listener");
-          setCopyListenerLoading(false);
-          return;
-        }
-      }
-      setTimeout(refresh, 300);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Listener toggle failed");
-    }
-    setCopyListenerLoading(false);
-  }
+  }, [updateCloudStatus]);
 
   async function handleCloudListenerToggle() {
     setCloudLoading(true);
@@ -232,88 +203,22 @@ export default function CopyTradingPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Copy Trading</h1>
         <div className="flex items-center gap-3">
-          {/* Mode toggle */}
-          <div className="flex rounded-md border overflow-hidden text-xs">
-            <button
-              className={`px-3 py-1.5 transition-colors ${
-                listenerMode === "local"
-                  ? "bg-foreground text-background"
-                  : "hover:bg-muted"
-              }`}
-              onClick={() => setListenerMode("local")}
+          <Button
+            variant={cloudRunning ? "destructive" : "default"}
+            size="sm"
+            disabled={cloudLoading}
+            onClick={handleCloudListenerToggle}
+          >
+            {cloudLoading ? "..." : cloudRunning ? "Stop" : "Start"}
+          </Button>
+          {cloudRunning && (
+            <Badge
+              variant="outline"
+              className="border-green-300 text-green-700"
             >
-              Local
-            </button>
-            <button
-              className={`px-3 py-1.5 transition-colors ${
-                listenerMode === "cloud"
-                  ? "bg-foreground text-background"
-                  : "hover:bg-muted"
-              }`}
-              onClick={() => setListenerMode("cloud")}
-            >
-              Cloud
-            </button>
-          </div>
-
-          {/* Local listener controls */}
-          {listenerMode === "local" && (
-            <>
-              {stats?.listening && (
-                <Badge
-                  variant="outline"
-                  className="border-blue-300 text-blue-700"
-                >
-                  Full listener active
-                </Badge>
-              )}
-              {!stats?.listening && (
-                <Button
-                  variant={stats?.copy_listening ? "destructive" : "default"}
-                  size="sm"
-                  disabled={copyListenerLoading}
-                  onClick={handleCopyListenerToggle}
-                >
-                  {copyListenerLoading
-                    ? "..."
-                    : stats?.copy_listening
-                      ? "Stop"
-                      : "Start"}
-                </Button>
-              )}
-              {stats?.copy_listening && (
-                <Badge
-                  variant="outline"
-                  className="border-green-300 text-green-700"
-                >
-                  Listening
-                </Badge>
-              )}
-            </>
+              Listening
+            </Badge>
           )}
-
-          {/* Cloud listener controls */}
-          {listenerMode === "cloud" && (
-            <>
-              <Button
-                variant={cloudRunning ? "destructive" : "default"}
-                size="sm"
-                disabled={cloudLoading}
-                onClick={handleCloudListenerToggle}
-              >
-                {cloudLoading ? "..." : cloudRunning ? "Stop" : "Start"}
-              </Button>
-              {cloudRunning && (
-                <Badge
-                  variant="outline"
-                  className="border-green-300 text-green-700"
-                >
-                  Cloud listening
-                </Badge>
-              )}
-            </>
-          )}
-
           {!isAnyListenerActive && (
             <span className="text-xs text-amber-600">No listener running</span>
           )}
@@ -423,10 +328,7 @@ export default function CopyTradingPage() {
             Active Targets
             {activeTargets.length > 0 ? ` (${activeTargets.length})` : ""}
             {(() => {
-              const count =
-                listenerMode === "cloud"
-                  ? cloudTradeCount
-                  : (trades?.length ?? 0);
+              const count = cloudTradeCount || (trades?.length ?? 0);
               return count > 0 ? (
                 <Badge variant="secondary" className="text-xs font-normal">
                   {count.toLocaleString()} trade{count !== 1 ? "s" : ""}
@@ -655,7 +557,7 @@ export default function CopyTradingPage() {
                           <TableCell colSpan={13} className="p-0 px-4 pb-4">
                             <CopyTargetDetail
                               wallet={t.wallet}
-                              source={listenerMode}
+                              source="cloud"
                             />
                           </TableCell>
                         </TableRow>
