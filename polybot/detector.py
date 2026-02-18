@@ -284,72 +284,43 @@ class BotDetector:
     # ── Scoring ─────────────────────────────────────────────────────
 
     def _score(self, s: BotSignals) -> float:
-        """Produce a 0-1 confidence score that the wallet is a bot."""
+        """Produce a 0-1 confidence score that the wallet is a bot.
+
+        Primary signal: trade frequency.  >1 trade/min avg is almost
+        certainly automated.  Secondary signals add confidence but
+        alone are not enough to cross the 0.5 threshold.
+        """
         score = 0.0
-        weights_total = 0.0
 
-        # 1. High trade count → more likely bot (weight: 1.0)
-        if s.trade_count >= 500:
-            score += 1.0
-        elif s.trade_count >= 100:
-            score += 0.6
-        elif s.trade_count >= 50:
-            score += 0.3
-        weights_total += 1.0
+        # ── Primary: trade frequency (0-0.6) ───────────────────────
+        # avg_interval_ms < 60_000 means >1 trade per minute on average
+        if s.avg_interval_ms > 0:
+            if s.avg_interval_ms < 10_000:  # >6 trades/min
+                score += 0.6
+            elif s.avg_interval_ms < 30_000:  # >2 trades/min
+                score += 0.5
+            elif s.avg_interval_ms < 60_000:  # >1 trade/min
+                score += 0.4
+            elif s.avg_interval_ms < 120_000:  # >1 trade/2min
+                score += 0.15
 
-        # 2. Low interval CV → very regular timing (weight: 1.5)
-        if s.interval_cv > 0:
-            if s.interval_cv < 0.3:
-                score += 1.5  # extremely regular
-            elif s.interval_cv < 0.6:
-                score += 0.9
-            elif s.interval_cv < 1.0:
-                score += 0.3
-        weights_total += 1.5
+        # ── Secondary: timing regularity (0-0.15) ──────────────────
+        if s.interval_cv > 0 and s.interval_cv < 0.3:
+            score += 0.15  # extremely regular = programmatic
+        elif s.interval_cv > 0 and s.interval_cv < 0.6:
+            score += 0.05
 
-        # 3. Fast execution (weight: 1.5)
+        # ── Secondary: sub-second reactions (0-0.15) ────────────────
         if s.fastest_reaction_ms < 500:
-            score += 1.5
-        elif s.fastest_reaction_ms < self.config.speed_threshold_ms:
-            score += 0.9
-        elif s.fastest_reaction_ms < 5000:
-            score += 0.3
-        weights_total += 1.5
+            score += 0.15
+        elif s.fastest_reaction_ms < 2000:
+            score += 0.05
 
-        # 4. Many markets (weight: 1.0)
-        if s.unique_markets >= 20:
-            score += 1.0
-        elif s.unique_markets >= 10:
-            score += 0.6
-        elif s.unique_markets >= 5:
-            score += 0.3
-        weights_total += 1.0
-
-        # 5. Extended active hours (weight: 1.0)
+        # ── Secondary: 24/7 activity (0-0.1) ───────────────────────
         if s.active_hours_per_day >= 20:
-            score += 1.0  # practically 24/7
-        elif s.active_hours_per_day >= 16:
-            score += 0.7
-        elif s.active_hours_per_day >= 12:
-            score += 0.3
-        weights_total += 1.0
+            score += 0.1
 
-        # 6. Round trade sizes (weight: 0.5)
-        if s.round_size_pct >= 0.8:
-            score += 0.5
-        elif s.round_size_pct >= 0.5:
-            score += 0.25
-        weights_total += 0.5
-
-        # 7. Balanced buy/sell near 0.5 suggests market making (weight: 0.5)
-        balance_dist = abs(s.buy_sell_ratio - 0.5)
-        if balance_dist < 0.05:
-            score += 0.5
-        elif balance_dist < 0.15:
-            score += 0.25
-        weights_total += 0.5
-
-        return min(score / weights_total, 1.0)
+        return min(score, 1.0)
 
     # ── Categorization ──────────────────────────────────────────────
 

@@ -106,7 +106,7 @@ export class FirehoseDO implements DurableObject {
         });
       }
       const params = new URL(request.url).searchParams;
-      this.detectMinTrades = Number(params.get("min_trades") ?? "1");
+      this.detectMinTrades = Number(params.get("min_trades") ?? "10");
       // Count total wallets to scan
       const countRow = await this.fdb
         .prepare(
@@ -216,7 +216,7 @@ export class FirehoseDO implements DurableObject {
     }
 
     try {
-      const pyUrl = `${this.env.PYTHON_API_URL}/api/detect/cloud?min_trades=${this.detectMinTrades}&min_confidence=0.3`;
+      const pyUrl = `${this.env.PYTHON_API_URL}/api/detect/cloud?min_trades=${this.detectMinTrades}&min_confidence=0.5`;
       const pyResp = await fetch(pyUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
