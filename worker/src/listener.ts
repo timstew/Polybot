@@ -105,10 +105,16 @@ export function calculateCopyTrade(
   }
   const feePerShare = execPrice * (1 - execPrice) * feeRate;
 
-  // Copy size
+  // Copy size — paper mode uses 100% of source, real mode uses configured %
   const sourceNotional = trade.price * trade.size;
-  let copyNotional = sourceNotional * (target.trade_pct / 100);
-  copyNotional = Math.min(copyNotional, target.max_position_usd);
+  let copyNotional =
+    target.mode === "paper"
+      ? sourceNotional
+      : sourceNotional * (target.trade_pct / 100);
+  // Only apply max position cap for real trades
+  if (target.mode !== "paper") {
+    copyNotional = Math.min(copyNotional, target.max_position_usd);
+  }
   if (copyNotional < 0.01) return null;
 
   const costPerShare = execPrice + feePerShare;

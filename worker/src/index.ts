@@ -756,7 +756,7 @@ export default {
         .bind(
           w,
           body.trade_pct ?? 100,
-          body.max_position_usd ?? 100,
+          body.max_position_usd ?? 10000,
           body.slippage_bps ?? 50,
           body.latency_ms ?? 2000,
           body.fee_rate ?? 0,
