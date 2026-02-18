@@ -551,12 +551,14 @@ export default {
       url.pathname === "/api/copy/targets" ||
       url.pathname === "/api/copy/targets/cloud"
     ) {
-      // Fetch targets with usernames
+      // Fetch targets (username now stored directly on copy_targets)
       const { results: targets } = await env.DB.prepare(
-        `SELECT ct.*, COALESCE(sb.username, '') as username
+        `SELECT ct.*,
+                CASE WHEN ct.username != '' THEN ct.username
+                     ELSE COALESCE(sb.username, '') END as display_username
          FROM copy_targets ct
          LEFT JOIN suspect_bots sb ON ct.wallet = sb.wallet`,
-      ).all<CopyTarget & { username: string }>();
+      ).all<CopyTarget & { username: string; display_username: string }>();
 
       // Fetch all filled trades for FIFO P&L computation
       const { results: allTrades } = await env.DB.prepare(
@@ -595,7 +597,7 @@ export default {
 
         return {
           wallet: r.wallet,
-          username: r.username || "",
+          username: r.display_username || r.username || "",
           mode: r.mode,
           trade_pct: r.trade_pct,
           max_position_usd: r.max_position_usd,
@@ -685,6 +687,130 @@ export default {
         },
         request,
       );
+    }
+
+    // ── Copy target mutations ──────────────────────────────────────
+    if (url.pathname === "/api/copy/add" && request.method === "POST") {
+      const body = (await request.json()) as {
+        wallet: string;
+        trade_pct?: number;
+        max_position_usd?: number;
+        slippage_bps?: number;
+        latency_ms?: number;
+        fee_rate?: number;
+      };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+
+      // Fetch username from Polymarket activity API
+      let username = "";
+      try {
+        const profResp = await fetch(
+          `https://data-api.polymarket.com/activity?user=${w}&limit=1`,
+        );
+        if (profResp.ok) {
+          const entries = (await profResp.json()) as Array<{
+            name?: string;
+          }>;
+          const n = entries?.[0]?.name;
+          if (n && !n.startsWith("0x")) username = n;
+        }
+      } catch {
+        // username is optional
+      }
+
+      await env.DB.prepare(
+        `INSERT OR REPLACE INTO copy_targets
+         (wallet, mode, trade_pct, max_position_usd, active,
+          total_paper_pnl, total_real_pnl,
+          slippage_bps, latency_ms, fee_rate, measured_slippage_bps, username)
+         VALUES (?, 'paper', ?, ?, 1, 0, 0, ?, ?, ?, -1, ?)`,
+      )
+        .bind(
+          w,
+          body.trade_pct ?? 10,
+          body.max_position_usd ?? 100,
+          body.slippage_bps ?? 50,
+          body.latency_ms ?? 2000,
+          body.fee_rate ?? 0,
+          username,
+        )
+        .run();
+      return jsonCors(
+        { status: "added", wallet: w, mode: "paper", username },
+        request,
+      );
+    }
+
+    if (url.pathname === "/api/copy/remove" && request.method === "POST") {
+      const body = (await request.json()) as { wallet: string };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+      await env.DB.prepare(
+        "UPDATE copy_targets SET active = 0 WHERE wallet = ?",
+      )
+        .bind(w)
+        .run();
+      return jsonCors({ status: "removed", wallet: w }, request);
+    }
+
+    if (url.pathname === "/api/copy/reactivate" && request.method === "POST") {
+      const body = (await request.json()) as { wallet: string };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+      await env.DB.prepare(
+        "UPDATE copy_targets SET active = 1 WHERE wallet = ?",
+      )
+        .bind(w)
+        .run();
+      return jsonCors({ status: "reactivated", wallet: w }, request);
+    }
+
+    if (url.pathname === "/api/copy/set-mode" && request.method === "POST") {
+      const body = (await request.json()) as {
+        wallet: string;
+        mode: string;
+      };
+      const w = body.wallet?.toLowerCase();
+      const mode = body.mode === "real" ? "real" : "paper";
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+      await env.DB.prepare("UPDATE copy_targets SET mode = ? WHERE wallet = ?")
+        .bind(mode, w)
+        .run();
+      return jsonCors({ status: "updated", wallet: w, mode }, request);
+    }
+
+    // Backfill usernames for all copy targets missing them
+    if (
+      url.pathname === "/api/copy/backfill-usernames" &&
+      request.method === "POST"
+    ) {
+      const targets = await env.DB.prepare(
+        "SELECT wallet FROM copy_targets WHERE username = '' OR username IS NULL",
+      ).all<{ wallet: string }>();
+      const results: Record<string, string> = {};
+      for (const t of targets.results) {
+        try {
+          const resp = await fetch(
+            `https://data-api.polymarket.com/activity?user=${t.wallet}&limit=1`,
+          );
+          if (resp.ok) {
+            const entries = (await resp.json()) as Array<{ name?: string }>;
+            const n = entries?.[0]?.name;
+            if (n && !n.startsWith("0x")) {
+              await env.DB.prepare(
+                "UPDATE copy_targets SET username = ? WHERE wallet = ?",
+              )
+                .bind(n, t.wallet)
+                .run();
+              results[t.wallet] = n;
+            }
+          }
+        } catch {
+          // skip
+        }
+      }
+      return jsonCors({ status: "backfilled", updated: results }, request);
     }
 
     if (url.pathname === "/sync" && request.method === "POST") {

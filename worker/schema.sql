@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS copy_targets (
     slippage_bps REAL NOT NULL DEFAULT 50.0,
     latency_ms REAL NOT NULL DEFAULT 2000.0,
     fee_rate REAL NOT NULL DEFAULT 0.0,
-    measured_slippage_bps REAL NOT NULL DEFAULT -1
+    measured_slippage_bps REAL NOT NULL DEFAULT -1,
+    username TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS copy_trades (
