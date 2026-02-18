@@ -34,6 +34,7 @@ export function WalletLink({
         <TooltipTrigger asChild>
           <Link
             href={`/wallet/${address}`}
+            prefetch={false}
             className="text-sm text-primary hover:underline"
           >
             {username ? (
