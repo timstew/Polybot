@@ -674,6 +674,7 @@ def detect_cloud(
     bots_out = []
     for s in suspects:
         p = profits.get(s.wallet, {})
+        cat_str = s.category.value if hasattr(s.category, "value") else str(s.category)
         copy_score = BotDetector.compute_copy_score(
             s.signals,
             pnl_pct=p.get("lb_pnl_pct", 0) or 0,
@@ -682,6 +683,7 @@ def detect_cloud(
             profit_1d=p.get("profit_1d", 0) or 0,
             profit_7d=p.get("profit_7d", 0) or 0,
             profit_30d=p.get("profit_30d", 0) or 0,
+            category=cat_str,
         )
         bots_out.append(
             {
@@ -798,6 +800,15 @@ def unified(
         win_rate = r.win_rate
         profit_all = p.get("profit_all", 0) or 0
 
+        cat_str = (
+            (
+                bot.category.value
+                if hasattr(bot.category, "value")
+                else str(bot.category)
+            )
+            if bot
+            else ""
+        )
         copy_score = BotDetector.compute_copy_score(
             signals,
             pnl_pct=pnl_pct,
@@ -806,6 +817,7 @@ def unified(
             profit_1d=p.get("profit_1d", 0) or 0,
             profit_7d=p.get("profit_7d", 0) or 0,
             profit_30d=p.get("profit_30d", 0) or 0,
+            category=cat_str,
         )
 
         row = {
@@ -840,7 +852,8 @@ def unified(
         if s.wallet in result_wallets:
             continue
         signals = s.signals
-        copy_score = BotDetector.compute_copy_score(signals)
+        cat_str = s.category.value if hasattr(s.category, "value") else str(s.category)
+        copy_score = BotDetector.compute_copy_score(signals, category=cat_str)
         rows.append(
             {
                 "wallet": s.wallet,

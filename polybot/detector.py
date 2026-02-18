@@ -421,6 +421,7 @@ class BotDetector:
         profit_1d: float = 0.0,
         profit_7d: float = 0.0,
         profit_30d: float = 0.0,
+        category: str = "",
     ) -> float:
         """Compute a 0-100 copy-worthiness score (bottom-up).
 
@@ -436,12 +437,24 @@ class BotDetector:
         - Trade frequency (10): moderate = manageable to copy
         - Drawdown (10): low drawdown = safer
         - Burst penalty (5): clean entries vs micro-trading
+
+        Category penalties:
+        - Market makers profit from the spread, not direction — copying
+          their buys means buying at their ask price without the spread.
+        - Arbitrageurs exploit momentary price differences across venues —
+          by the time we copy, the arb opportunity is gone.
         """
         # Insufficient data: need trades and some profit data
         if signals.trade_count < 10 and profit_all == 0 and pnl_pct == 0:
             return -1.0
 
         score = 0.0
+
+        # Category penalty: uncopyable strategies get a hard cap
+        uncopyable = category.lower() in ("market_maker", "arbitrageur")
+        if uncopyable:
+            # Still compute the score for informational purposes but cap at 15
+            pass
 
         # 1. P&L % — the most important signal (up to 25 pts)
         if pnl_pct > 10:
@@ -515,5 +528,9 @@ class BotDetector:
             score += 5  # clean single entries
         elif signals.avg_market_burst <= 5:
             score += 3
+
+        # Cap uncopyable categories — their profits don't transfer to copiers
+        if uncopyable:
+            score = min(score, 15)
 
         return max(0, min(100, score))

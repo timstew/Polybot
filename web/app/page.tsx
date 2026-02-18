@@ -612,7 +612,7 @@ export default function DashboardPage() {
                                     <Badge
                                       key={tag}
                                       variant="outline"
-                                      className="text-xs"
+                                      className="text-xs border-white/30 text-white"
                                     >
                                       {tag}
                                     </Badge>
