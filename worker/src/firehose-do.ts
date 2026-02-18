@@ -197,7 +197,7 @@ export class FirehoseDO implements DurableObject {
       return;
     }
 
-    const BATCH_SIZE = 500;
+    const BATCH_SIZE = 100;
     const { results } = await this.fdb
       .prepare(
         "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT ? OFFSET ?",
