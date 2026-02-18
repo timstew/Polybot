@@ -576,6 +576,34 @@ def detect(min_trades: int = Query(20)):
     }
 
 
+@app.post("/api/detect/cloud")
+def detect_cloud(
+    wallets: list[str],
+    min_trades: int = Query(5),
+):
+    """Run bot detection on a provided list of wallets (for cloud use).
+
+    Skips Phase 1 (local DB scan) and runs Phase 2 only — fetching each
+    wallet's activity from the Polymarket API and scoring remotely.
+    """
+    if not wallets:
+        return {"status": "completed", "bots_found": 0, "wallets_scanned": 0}
+
+    db = _db()
+    detector = BotDetector(db, config)
+
+    # Cap at 200 to avoid rate limiting
+    candidates = wallets[:200]
+    suspects = detector.scan_wallets_remote(candidates, min_trades=min_trades)
+
+    db.close()
+    return {
+        "status": "completed",
+        "bots_found": len(suspects),
+        "wallets_scanned": len(candidates),
+    }
+
+
 @app.get("/api/unified")
 def unified(
     top: int = Query(30, ge=1, le=200),

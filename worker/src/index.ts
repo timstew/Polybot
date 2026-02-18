@@ -138,6 +138,36 @@ export default {
       return jsonCors(await doResp.json(), request);
     }
 
+    if (url.pathname === "/api/detect" && env.PYTHON_API_URL) {
+      // Fetch top wallets from D1 and send to Cloud Run for detection
+      const minTrades = Number(url.searchParams.get("min_trades") ?? "5");
+      const { results } = await env.DB.prepare(
+        "SELECT wallet FROM firehose_wallets WHERE trade_count >= ? ORDER BY trade_count DESC LIMIT 200",
+      )
+        .bind(minTrades)
+        .all<{ wallet: string }>();
+
+      const wallets = (results ?? []).map((r) => r.wallet);
+      const pyUrl = `${env.PYTHON_API_URL}/api/detect/cloud?min_trades=${minTrades}`;
+      try {
+        const pyResp = await fetch(pyUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(wallets),
+        });
+        return jsonCors(await pyResp.json(), request, pyResp.status);
+      } catch {
+        return jsonCors(
+          {
+            error: "python_unavailable",
+            message: "Python backend not reachable",
+          },
+          request,
+          502,
+        );
+      }
+    }
+
     if (url.pathname === "/api/trades/clear") {
       const id = env.FIREHOSE.idFromName("singleton");
       const obj = env.FIREHOSE.get(id);
