@@ -7,10 +7,11 @@ binding = "DB"
 database_name = "polybot"
 database_id = "1a14301f-5bbd-4be9-a530-56322028ee13"
 
-[[d1_databases]]
-binding = "FIREHOSE_DB"
-database_name = "polybot-firehose"
-database_id = "2fbb7e24-7924-4563-8726-e2d8e0d94b2e"
+# FIREHOSE_DB: not yet provisioned — falls back to DB in code
+# [[d1_databases]]
+# binding = "FIREHOSE_DB"
+# database_name = "polybot-firehose"
+# database_id = "2fbb7e24-7924-4563-8726-e2d8e0d94b2e"
 
 [durable_objects]
 bindings = [

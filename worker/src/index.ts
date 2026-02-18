@@ -1022,6 +1022,105 @@ export default {
       return jsonCors({ status: "backfilled", updated: results }, request);
     }
 
+    // Backfill fees for copy trades with empty titles
+    // Wallets that only trade crypto get fees applied; non-crypto wallets are skipped
+    if (
+      url.pathname === "/api/copy/backfill-fees" &&
+      request.method === "POST"
+    ) {
+      const FEE_RATE = 0.0625;
+
+      // Find wallets that have titled non-crypto trades (sports, politics, etc.)
+      const nonCryptoWallets = await env.DB.prepare(
+        `
+        SELECT DISTINCT source_wallet FROM copy_trades
+        WHERE title != ''
+          AND title NOT LIKE '%Bitcoin%'
+          AND title NOT LIKE '%Ethereum%'
+          AND title NOT LIKE '%up or down%'
+          AND title NOT LIKE '%above%'
+          AND title NOT LIKE '%updown%'
+      `,
+      ).all<{ source_wallet: string }>();
+      const skipWallets = new Set(
+        nonCryptoWallets.results.map((r) => r.source_wallet),
+      );
+
+      // Get all trades needing fee backfill (empty title, zero fee)
+      const trades = await env.DB.prepare(
+        `
+        SELECT id, source_wallet, exec_price, size FROM copy_trades
+        WHERE title = '' AND fee_amount = 0
+      `,
+      ).all<{
+        id: number;
+        source_wallet: string;
+        exec_price: number;
+        size: number;
+      }>();
+
+      let updated = 0;
+      let skipped = 0;
+      const batchSize = 50;
+      const stmts: Array<ReturnType<typeof env.DB.prepare>> = [];
+
+      for (const t of trades.results) {
+        if (skipWallets.has(t.source_wallet)) {
+          skipped++;
+          continue;
+        }
+        const feePerShare = t.exec_price * (1 - t.exec_price) * FEE_RATE;
+        const feeAmount = feePerShare * t.size;
+        stmts.push(
+          env.DB.prepare(
+            "UPDATE copy_trades SET fee_amount = ? WHERE id = ?",
+          ).bind(feeAmount, t.id),
+        );
+        updated++;
+      }
+
+      // Execute in batches (D1 batch limit)
+      for (let i = 0; i < stmts.length; i += batchSize) {
+        await env.DB.batch(stmts.slice(i, i + batchSize));
+      }
+
+      // Also fix the few titled crypto trades that have fee_amount = 0
+      const cryptoFix = await env.DB.prepare(
+        `
+        SELECT id, exec_price, size FROM copy_trades
+        WHERE fee_amount = 0
+          AND (title LIKE '%Bitcoin%' OR title LIKE '%Ethereum%'
+               OR title LIKE '%up or down%' OR title LIKE '%above%'
+               OR title LIKE '%updown%')
+      `,
+      ).all<{ id: number; exec_price: number; size: number }>();
+
+      const cryptoStmts: Array<ReturnType<typeof env.DB.prepare>> = [];
+      for (const t of cryptoFix.results) {
+        const feePerShare = t.exec_price * (1 - t.exec_price) * FEE_RATE;
+        const feeAmount = feePerShare * t.size;
+        cryptoStmts.push(
+          env.DB.prepare(
+            "UPDATE copy_trades SET fee_amount = ? WHERE id = ?",
+          ).bind(feeAmount, t.id),
+        );
+      }
+      for (let i = 0; i < cryptoStmts.length; i += batchSize) {
+        await env.DB.batch(cryptoStmts.slice(i, i + batchSize));
+      }
+
+      return jsonCors(
+        {
+          status: "backfilled",
+          crypto_wallets_updated: updated,
+          non_crypto_wallets_skipped: skipped,
+          titled_crypto_fixed: cryptoFix.results.length,
+          total_processed: trades.results.length,
+        },
+        request,
+      );
+    }
+
     if (url.pathname === "/sync" && request.method === "POST") {
       const targets: CopyTarget[] = await request.json();
       const stmt = env.DB.prepare(
