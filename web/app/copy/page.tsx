@@ -496,7 +496,7 @@ export default function CopyTradingPage() {
                               if (
                                 next === "real" &&
                                 !confirm(
-                                  `Switch ${t.username || t.wallet.slice(0, 10)} to REAL trading? This will execute actual trades with real funds.`,
+                                  `Switch ${t.username || t.wallet.slice(0, 10)} to REAL trading?\n\nThis requires POLYMARKET_PRIVATE_KEY to be configured on Cloud Run. Real orders will be placed as FOK market orders on Polygon.`,
                                 )
                               )
                                 return;
