@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { UserPlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -32,9 +31,8 @@ export function WalletLink({
     <span className="inline-flex items-center gap-1">
       <Tooltip>
         <TooltipTrigger asChild>
-          <Link
+          <a
             href={`/wallet/${address}`}
-            prefetch={false}
             className="text-sm text-primary hover:underline"
           >
             {username ? (
@@ -42,7 +40,7 @@ export function WalletLink({
             ) : (
               <span className="font-mono">{truncate(address)}</span>
             )}
-          </Link>
+          </a>
         </TooltipTrigger>
         <TooltipContent>
           {username && <p className="text-xs">{username}</p>}
