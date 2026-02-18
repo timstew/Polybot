@@ -510,7 +510,7 @@ export default function CopyTradingPage() {
                       </TableRow>
                       {expandedWallet === t.wallet && (
                         <TableRow key={`${t.wallet}-detail`}>
-                          <TableCell colSpan={13} className="p-0 px-4 pb-4">
+                          <TableCell colSpan={10} className="p-0 px-4 pb-4">
                             <CopyTargetDetail
                               wallet={t.wallet}
                               source="cloud"
