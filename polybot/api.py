@@ -603,12 +603,21 @@ def detect_cloud(
         min_confidence=min_confidence,
     )
 
-    db.close()
-    return {
-        "status": "completed",
-        "bots_found": len(suspects),
-        "wallets_scanned": len(candidates),
-        "bots": [
+    # Fetch profitability for detected bots
+    tracker = ProfitabilityTracker(db)
+    bot_wallets = [s.wallet for s in suspects]
+    profits = tracker.fetch_wallets_profit(bot_wallets) if bot_wallets else {}
+
+    bots_out = []
+    for s in suspects:
+        p = profits.get(s.wallet, {})
+        copy_score = BotDetector.compute_copy_score(
+            s.signals,
+            pnl_pct=p.get("lb_pnl_pct", 0) or 0,
+            win_rate=0,
+            profit_all=p.get("profit_all", 0) or 0,
+        )
+        bots_out.append(
             {
                 "wallet": s.wallet,
                 "confidence": s.confidence,
@@ -617,9 +626,25 @@ def detect_cloud(
                 else s.category,
                 "trade_count": s.signals.trade_count,
                 "tags": s.tags,
+                "username": p.get("username", ""),
+                "pnl_pct": p.get("lb_pnl_pct", 0) or 0,
+                "realized_pnl": p.get("profit_all", 0) or 0,
+                "win_rate": 0,
+                "total_volume_usd": p.get("volume_all", 0) or 0,
+                "profit_1d": p.get("profit_1d", 0) or 0,
+                "profit_7d": p.get("profit_7d", 0) or 0,
+                "profit_30d": p.get("profit_30d", 0) or 0,
+                "profit_all": p.get("profit_all", 0) or 0,
+                "copy_score": round(copy_score, 1),
             }
-            for s in suspects
-        ],
+        )
+
+    db.close()
+    return {
+        "status": "completed",
+        "bots_found": len(suspects),
+        "wallets_scanned": len(candidates),
+        "bots": bots_out,
     }
 
 

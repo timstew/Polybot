@@ -224,6 +224,16 @@ export class FirehoseDO implements DurableObject {
           category: string;
           trade_count: number;
           tags: string[];
+          username?: string;
+          pnl_pct?: number;
+          realized_pnl?: number;
+          win_rate?: number;
+          total_volume_usd?: number;
+          profit_1d?: number;
+          profit_7d?: number;
+          profit_30d?: number;
+          profit_all?: number;
+          copy_score?: number;
         }>;
       };
       this.detectBotsFound += data.bots_found ?? 0;
@@ -232,8 +242,11 @@ export class FirehoseDO implements DurableObject {
       // Store detected bots in D1
       if (data.bots && data.bots.length > 0) {
         const stmt = this.env.DB.prepare(
-          `INSERT OR REPLACE INTO suspect_bots (wallet, confidence, category, trade_count, tags, detected_at)
-           VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+          `INSERT OR REPLACE INTO suspect_bots
+           (wallet, confidence, category, trade_count, tags, detected_at,
+            pnl_pct, realized_pnl, win_rate, total_volume_usd,
+            profit_1d, profit_7d, profit_30d, profit_all, username, copy_score)
+           VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         );
         const batch = data.bots.map((b) =>
           stmt.bind(
@@ -242,6 +255,16 @@ export class FirehoseDO implements DurableObject {
             b.category,
             b.trade_count,
             JSON.stringify(b.tags),
+            b.pnl_pct ?? 0,
+            b.realized_pnl ?? 0,
+            b.win_rate ?? 0,
+            b.total_volume_usd ?? 0,
+            b.profit_1d ?? 0,
+            b.profit_7d ?? 0,
+            b.profit_30d ?? 0,
+            b.profit_all ?? 0,
+            b.username ?? "",
+            b.copy_score ?? 0,
           ),
         );
         for (let i = 0; i < batch.length; i += 100) {

@@ -191,7 +191,7 @@ export default {
     }
 
     if (url.pathname === "/api/unified") {
-      // Return detected bots from D1 — the cloud equivalent of the local unified endpoint
+      // Return detected bots from D1 with profitability data
       const top = Math.min(Number(url.searchParams.get("top") ?? "200"), 500);
       const { results } = await env.DB.prepare(
         "SELECT * FROM suspect_bots ORDER BY confidence DESC LIMIT ?",
@@ -203,7 +203,16 @@ export default {
           category: string;
           trade_count: number;
           tags: string;
-          detected_at: string;
+          pnl_pct: number;
+          realized_pnl: number;
+          win_rate: number;
+          total_volume_usd: number;
+          profit_1d: number;
+          profit_7d: number;
+          profit_30d: number;
+          profit_all: number;
+          username: string;
+          copy_score: number;
         }>();
       return jsonCors(
         (results ?? []).map((r) => ({
@@ -212,26 +221,25 @@ export default {
           category: r.category,
           trade_count: r.trade_count,
           tags: JSON.parse(r.tags || "[]"),
-          // Provide defaults for fields the dashboard expects
-          username: "",
-          pnl_pct: 0,
-          realized_pnl: 0,
+          username: r.username || "",
+          pnl_pct: r.pnl_pct || 0,
+          realized_pnl: r.realized_pnl || 0,
           unrealized_pnl: 0,
-          win_rate: 0,
-          total_volume_usd: 0,
+          win_rate: r.win_rate || 0,
+          total_volume_usd: r.total_volume_usd || 0,
           active_positions: 0,
           portfolio_value: 0,
           market_categories: [],
-          copy_score: 0,
+          copy_score: r.copy_score || 0,
           avg_hold_time_hours: 0,
           trades_per_market: 0,
           avg_market_burst: 0,
           max_market_burst: 0,
           market_concentration: 0,
-          profit_1d: 0,
-          profit_7d: 0,
-          profit_30d: 0,
-          profit_all: 0,
+          profit_1d: r.profit_1d || 0,
+          profit_7d: r.profit_7d || 0,
+          profit_30d: r.profit_30d || 0,
+          profit_all: r.profit_all || 0,
         })),
         request,
       );
