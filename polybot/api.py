@@ -544,7 +544,7 @@ def execute_real_trade(body: dict):
 
     try:
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import MarketOrderArgs
+        from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import BUY, SELL
 
         client = ClobClient(
@@ -580,30 +580,27 @@ def execute_real_trade(body: dict):
                 "error": f"Below minimum: ${order_notional:.2f} < ${min_notional:.2f}",
             }
 
-        # Round to allowed precision: taker amount (notional) max 2 decimals,
-        # maker amount (shares = notional/price) max 4 decimals.
-        # Truncate (floor) instead of round to stay within limits.
+        # Use create_order (size-based) instead of create_market_order (notional-based)
+        # because the library's market order rounding is buggy for taker amounts.
+        # create_order: BUY taker=shares (2 dec), maker=USDC (4 dec) — correct.
         import math
 
         price = math.floor(price * 10000) / 10000  # 4 decimal truncate
-        order_notional = math.floor(order_notional * 100) / 100  # 2 decimal truncate
-        # Ensure maker amount (shares) also fits in 4 decimals
-        shares = order_notional / price if price > 0 else 0
-        shares = math.floor(shares * 10000) / 10000
-        order_notional = (
-            math.floor(shares * price * 100) / 100
-        )  # recompute to stay consistent
+        order_shares = order_notional / price if price > 0 else 0
+        order_shares = (
+            math.floor(order_shares * 100) / 100
+        )  # 2 decimal truncate (shares)
 
-        if order_notional < 1.0:
+        if order_shares < 5:
             return {
                 "status": "failed",
-                "error": f"Below minimum after rounding: ${order_notional:.2f}",
+                "error": f"Below minimum shares after rounding: {order_shares:.2f} < 5",
             }
 
-        order = client.create_market_order(
-            MarketOrderArgs(
+        order = client.create_order(
+            OrderArgs(
                 token_id=asset_id,
-                amount=order_notional,
+                size=order_shares,
                 side=clob_side,
                 price=price,
             )
@@ -611,21 +608,21 @@ def execute_real_trade(body: dict):
         resp = client.post_order(order, "GTC")
 
         if resp.get("success") or resp.get("orderID"):
-            actual_shares = order_notional / price if price > 0 else 0
+            filled_notional = order_shares * price
             logger.info(
                 "[REAL] %s %.2f shares of %s @ $%.4f ($%.2f notional, book had $%.2f)",
                 side,
-                actual_shares,
+                order_shares,
                 asset_id[:10],
                 price,
-                order_notional,
+                filled_notional,
                 available,
             )
             return {
                 "status": "filled",
                 "order_id": resp.get("orderID", ""),
-                "filled_notional": round(order_notional, 4),
-                "filled_size": round(actual_shares, 4),
+                "filled_notional": round(filled_notional, 2),
+                "filled_size": round(order_shares, 2),
             }
         else:
             logger.warning("Real order rejected: %s", resp)
