@@ -148,6 +148,36 @@ export function calculateCopyTrade(
 // Minimum ms between copy trades on the same (wallet, market) pair.
 const MARKET_COOLDOWN_MS = 600_000; // 10 minutes
 
+async function executeRealTrade(
+  pythonApiUrl: string,
+  copy: CopyTrade,
+): Promise<{ status: string; order_id?: string; error?: string }> {
+  try {
+    const resp = await fetch(`${pythonApiUrl}/api/copy/execute`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asset_id: copy.asset_id,
+        side: copy.side,
+        size: copy.size,
+        price: copy.exec_price,
+        source_wallet: copy.source_wallet,
+        market: copy.market,
+      }),
+    });
+    if (!resp.ok) {
+      return { status: "failed", error: `HTTP ${resp.status}` };
+    }
+    return (await resp.json()) as {
+      status: string;
+      order_id?: string;
+      error?: string;
+    };
+  } catch (e) {
+    return { status: "failed", error: String(e) };
+  }
+}
+
 async function insertCopyTrade(db: D1Database, copy: CopyTrade): Promise<void> {
   await db
     .prepare(
@@ -293,6 +323,7 @@ export async function pollCycle(
   db: D1Database,
   seenIds: Set<string>,
   lastCopy: Map<string, number>,
+  pythonApiUrl?: string,
 ): Promise<number> {
   // Get active targets
   const { results: targets } = await db
@@ -334,6 +365,25 @@ export async function pollCycle(
 
       const copy = calculateCopyTrade(event, target);
       if (!copy) continue;
+
+      // Real mode: execute via Cloud Run before recording
+      if (target.mode === "real" && pythonApiUrl) {
+        const result = await executeRealTrade(pythonApiUrl, copy);
+        copy.status = result.status === "filled" ? "filled" : "failed";
+        if (result.error) {
+          console.error(
+            `[REAL] Failed for ${target.wallet.slice(0, 10)}: ${result.error}`,
+          );
+        } else {
+          console.log(
+            `[REAL] ${copy.side} ${copy.size.toFixed(2)} shares @ $${copy.exec_price.toFixed(4)} for ${target.wallet.slice(0, 10)}`,
+          );
+        }
+      } else if (target.mode === "real" && !pythonApiUrl) {
+        // No Python API URL configured — can't execute real trades
+        copy.status = "failed";
+        console.error("[REAL] PYTHON_API_URL not configured — cannot execute");
+      }
 
       await insertCopyTrade(db, copy);
       lastCopy.set(cooldownKey, now);

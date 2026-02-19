@@ -346,7 +346,12 @@ export class CopyListenerDO implements DurableObject {
 
   async alarm(): Promise<void> {
     try {
-      await pollCycle(this.env.DB, this.seenIds, this.lastCopy);
+      await pollCycle(
+        this.env.DB,
+        this.seenIds,
+        this.lastCopy,
+        this.env.PYTHON_API_URL,
+      );
       this.pollCount++;
     } catch (e) {
       console.error("Poll cycle error:", e);

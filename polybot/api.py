@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 
 import requests as http_requests
 from fastapi import FastAPI, HTTPException, Query
@@ -513,6 +514,117 @@ def bots(min_confidence: float = Query(0.0)):
         }
         for s in suspects
     ]
+
+
+# ── Real trade execution (called by Worker for real-mode copy trades) ──
+
+
+# Daily spending limit for real trades (USD)
+_DAILY_REAL_LIMIT_USD = 500.0
+_daily_real_spent: dict[str, float] = {}  # date_str -> total notional
+
+
+@app.post("/api/copy/execute")
+def execute_real_trade(body: dict):
+    """Execute a real trade on Polymarket via py-clob-client.
+
+    Called by the Cloudflare Worker when a copy target is in 'real' mode.
+    Body: {asset_id, side, size, price, source_wallet, market}
+    Returns: {status: 'filled'|'failed', order_id?, error?}
+    """
+    from polybot.config import Config
+
+    config = Config.from_env()
+    if not config.private_key:
+        return {"status": "failed", "error": "POLYMARKET_PRIVATE_KEY not configured"}
+
+    asset_id = body.get("asset_id", "")
+    side = body.get("side", "BUY")
+    size = float(body.get("size", 0))
+    price = float(body.get("price", 0))
+    notional = price * size
+
+    if notional < 0.01:
+        return {"status": "failed", "error": "Trade too small"}
+
+    # Daily spending limit
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    spent_today = _daily_real_spent.get(today, 0.0)
+    if spent_today + notional > _DAILY_REAL_LIMIT_USD:
+        return {
+            "status": "failed",
+            "error": f"Daily limit reached (${spent_today:.2f} / ${_DAILY_REAL_LIMIT_USD:.2f})",
+        }
+
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import MarketOrderArgs
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=config.private_key,
+            chain_id=137,
+            signature_type=config.signature_type,
+            funder=config.funder_address or None,
+        )
+        client.set_api_creds(client.create_or_derive_api_creds())
+
+        clob_side = BUY if side == "BUY" else SELL
+
+        order = client.create_market_order(
+            MarketOrderArgs(
+                token_id=asset_id,
+                amount=notional,
+            )
+        )
+        resp = client.post_order(order, "FOK")
+
+        if resp.get("success") or resp.get("orderID"):
+            # Track daily spend
+            _daily_real_spent[today] = spent_today + notional
+            # Clean old days
+            for k in list(_daily_real_spent.keys()):
+                if k != today:
+                    del _daily_real_spent[k]
+
+            logger.info(
+                "[REAL] %s %.2f shares of %s @ $%.4f ($%.2f notional)",
+                side,
+                size,
+                asset_id[:10],
+                price,
+                notional,
+            )
+            return {
+                "status": "filled",
+                "order_id": resp.get("orderID", ""),
+            }
+        else:
+            logger.warning("Real order rejected: %s", resp)
+            return {"status": "failed", "error": f"Order rejected: {resp}"}
+
+    except Exception as e:
+        logger.exception("Failed to execute real trade")
+        return {"status": "failed", "error": str(e)}
+
+
+@app.get("/api/copy/execute/status")
+def execute_status():
+    """Check if real trading is configured and daily spend."""
+    from polybot.config import Config
+
+    config = Config.from_env()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {
+        "configured": bool(config.private_key),
+        "signature_type": config.signature_type,
+        "funder_address": config.funder_address[:10] + "..."
+        if config.funder_address
+        else "",
+        "daily_limit_usd": _DAILY_REAL_LIMIT_USD,
+        "spent_today_usd": _daily_real_spent.get(today, 0.0),
+    }
 
 
 @app.get("/api/rank")
