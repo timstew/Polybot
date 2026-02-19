@@ -148,7 +148,13 @@ export function calculateCopyTrade(
 async function executeRealTrade(
   pythonApiUrl: string,
   copy: CopyTrade,
-): Promise<{ status: string; order_id?: string; error?: string }> {
+): Promise<{
+  status: string;
+  order_id?: string;
+  error?: string;
+  filled_size?: number;
+  filled_notional?: number;
+}> {
   try {
     const resp = await fetch(`${pythonApiUrl}/api/copy/execute`, {
       method: "POST",
@@ -354,23 +360,54 @@ export async function pollCycle(
       const copy = calculateCopyTrade(event, target);
       if (!copy) continue;
 
-      // Real mode: execute via Cloud Run before recording
-      if (target.mode === "real" && pythonApiUrl) {
-        const result = await executeRealTrade(pythonApiUrl, copy);
-        copy.status = result.status === "filled" ? "filled" : "failed";
-        if (result.error) {
-          console.error(
-            `[REAL] Failed for ${target.wallet.slice(0, 10)}: ${result.error}`,
-          );
+      // Real mode: check position before executing
+      if (target.mode === "real") {
+        if (copy.side === "SELL") {
+          // Only sell what we actually hold
+          const pos = await db
+            .prepare(
+              `SELECT
+                 COALESCE(SUM(CASE WHEN side='BUY' THEN size ELSE 0 END), 0) -
+                 COALESCE(SUM(CASE WHEN side='SELL' THEN size ELSE 0 END), 0) AS held
+               FROM copy_trades
+               WHERE source_wallet = ? AND asset_id = ? AND mode = 'real' AND status = 'filled'`,
+            )
+            .bind(target.wallet, copy.asset_id)
+            .first<{ held: number }>();
+
+          const held = pos?.held ?? 0;
+          if (held < 0.01) {
+            // Nothing to sell — skip entirely (don't record a failed trade)
+            continue;
+          }
+          if (copy.size > held) {
+            // Cap to what we own
+            copy.size = held;
+          }
+        }
+
+        if (pythonApiUrl) {
+          const result = await executeRealTrade(pythonApiUrl, copy);
+          copy.status = result.status === "filled" ? "filled" : "failed";
+          if (result.error) {
+            console.error(
+              `[REAL] Failed for ${target.wallet.slice(0, 10)}: ${result.error}`,
+            );
+          } else {
+            // Use actual filled size from Cloud Run (may be less due to liquidity)
+            if (result.filled_size && result.filled_size > 0) {
+              copy.size = result.filled_size;
+            }
+            console.log(
+              `[REAL] ${copy.side} ${copy.size.toFixed(2)} shares @ $${copy.exec_price.toFixed(4)} for ${target.wallet.slice(0, 10)}`,
+            );
+          }
         } else {
-          console.log(
-            `[REAL] ${copy.side} ${copy.size.toFixed(2)} shares @ $${copy.exec_price.toFixed(4)} for ${target.wallet.slice(0, 10)}`,
+          copy.status = "failed";
+          console.error(
+            "[REAL] PYTHON_API_URL not configured — cannot execute",
           );
         }
-      } else if (target.mode === "real" && !pythonApiUrl) {
-        // No Python API URL configured — can't execute real trades
-        copy.status = "failed";
-        console.error("[REAL] PYTHON_API_URL not configured — cannot execute");
       }
 
       await insertCopyTrade(db, copy);

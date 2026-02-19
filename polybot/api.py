@@ -558,20 +558,25 @@ def execute_real_trade(body: dict):
 
         clob_side = BUY if side == "BUY" else SELL
 
-        # Check order book depth before placing order
+        # Check order book depth — buy/sell whatever is available
         book = client.get_order_book(asset_id)
         levels = book.asks if side == "BUY" else book.bids
         available = sum(float(l.size) * float(l.price) for l in (levels or []))
-        if available < notional * 0.5:
+        if available < 0.01:
             return {
                 "status": "failed",
-                "error": f"Insufficient liquidity: ${available:.2f} available, need ${notional:.2f}",
+                "error": f"No liquidity on {'ask' if side == 'BUY' else 'bid'} side",
             }
+
+        # Use whatever the book can support, up to our desired notional
+        order_notional = min(notional, available * 0.95)  # leave 5% margin
+        if order_notional < 0.01:
+            return {"status": "failed", "error": "Order too small after liquidity cap"}
 
         order = client.create_market_order(
             MarketOrderArgs(
                 token_id=asset_id,
-                amount=notional,
+                amount=order_notional,
                 side=clob_side,
                 price=price,
             )
@@ -579,17 +584,21 @@ def execute_real_trade(body: dict):
         resp = client.post_order(order, "GTC")
 
         if resp.get("success") or resp.get("orderID"):
+            actual_shares = order_notional / price if price > 0 else 0
             logger.info(
-                "[REAL] %s %.2f shares of %s @ $%.4f ($%.2f notional)",
+                "[REAL] %s %.2f shares of %s @ $%.4f ($%.2f notional, book had $%.2f)",
                 side,
-                size,
+                actual_shares,
                 asset_id[:10],
                 price,
-                notional,
+                order_notional,
+                available,
             )
             return {
                 "status": "filled",
                 "order_id": resp.get("orderID", ""),
+                "filled_notional": round(order_notional, 4),
+                "filled_size": round(actual_shares, 4),
             }
         else:
             logger.warning("Real order rejected: %s", resp)
