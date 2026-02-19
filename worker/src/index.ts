@@ -381,8 +381,8 @@ export class CopyListenerDO implements DurableObject {
     } catch (e) {
       console.error("Poll cycle error:", e);
     }
-    // Re-schedule next poll in 5 seconds
-    await this.state.storage.setAlarm(Date.now() + 5000);
+    // Re-schedule next poll in 2 seconds (was 5s — reduced for faster copy latency)
+    await this.state.storage.setAlarm(Date.now() + 2000);
   }
 }
 

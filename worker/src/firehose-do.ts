@@ -269,31 +269,27 @@ export class FirehoseDO implements DurableObject {
       };
       this.detectWalletsScanned += data.wallets_scanned ?? 0;
 
-      // Filter out bots that are predominantly crypto-hourly
-      // (tags come from the Python detector's category inference)
+      // Apply quality filter to crypto-only bots.
+      // Crypto-hourly bots dominate by volume, so we keep only the best ones
+      // (profitable + decent copy score). Non-crypto bots pass through freely.
       if (data.bots) {
         const beforeCount = data.bots.length;
         data.bots = data.bots.filter((b) => {
           const tags = b.tags ?? [];
-          // If the only market category tag is "crypto" or "crypto markets",
-          // and the bot has no other category diversity, skip it
-          const catTags = tags.filter(
-            (t) =>
-              t === "crypto" ||
-              t === "crypto markets" ||
-              t === "politics" ||
-              t === "sports" ||
-              t === "pop culture" ||
-              t === "finance",
-          );
-          const hasCrypto =
-            catTags.includes("crypto") || catTags.includes("crypto markets");
-          const hasOther = catTags.some(
-            (t) => t !== "crypto" && t !== "crypto markets",
-          );
-          // Keep if: has non-crypto categories, OR has no crypto tags at all
-          if (hasCrypto && !hasOther) return false;
-          return true;
+          const isCryptoOnly =
+            (tags.includes("crypto") || tags.includes("crypto markets")) &&
+            !tags.some(
+              (t) =>
+                t === "politics" ||
+                t === "sports" ||
+                t === "pop culture" ||
+                t === "finance",
+            );
+          if (!isCryptoOnly) return true; // non-crypto: always keep
+          // Crypto-only: keep only if profitable with a decent score
+          const profitable = (b.profit_all ?? 0) > 0;
+          const goodScore = (b.copy_score ?? 0) >= 15;
+          return profitable && goodScore;
         });
         this.detectCryptoFiltered += beforeCount - data.bots.length;
         this.detectBotsFound += data.bots.length;
@@ -360,8 +356,6 @@ export class FirehoseDO implements DurableObject {
       const id = item.transactionHash || item.id || "";
       if (!id || this.seenIds.has(id)) continue;
       this.seenIds.add(id);
-      // Skip crypto-hourly binary options — not copyable
-      if (item.title && isCryptoHourly(item.title)) continue;
       newTrades.push(item);
     }
 
