@@ -10,6 +10,7 @@ export interface CopyTarget {
   latency_ms: number;
   fee_rate: number;
   measured_slippage_bps: number;
+  full_copy_below_usd: number;
 }
 
 export interface CopyTrade {

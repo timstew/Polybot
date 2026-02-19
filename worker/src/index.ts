@@ -1059,6 +1059,7 @@ export default {
         wallet: string;
         trade_pct?: number;
         max_position_usd?: number;
+        full_copy_below_usd?: number;
       };
       const w = body.wallet?.toLowerCase();
       if (!w) return jsonCors({ error: "wallet required" }, request, 400);
@@ -1071,6 +1072,10 @@ export default {
       if (body.max_position_usd !== undefined) {
         updates.push("max_position_usd = ?");
         values.push(body.max_position_usd);
+      }
+      if (body.full_copy_below_usd !== undefined) {
+        updates.push("full_copy_below_usd = ?");
+        values.push(body.full_copy_below_usd);
       }
       if (updates.length === 0)
         return jsonCors({ error: "nothing to update" }, request, 400);

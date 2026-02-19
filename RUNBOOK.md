@@ -218,8 +218,9 @@ for e in envs:
 
 ### Deploy Dashboard (Cloudflare Pages)
 ```bash
-cd web && npm run build && npx wrangler pages deploy .next --project-name=polybot-dashboard
+cd web && npm run build && npx wrangler pages deploy out --project-name=polybot
 ```
+Dashboard URL: `https://polybot-b5l.pages.dev`
 
 ## Testing
 
