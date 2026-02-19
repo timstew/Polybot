@@ -375,13 +375,17 @@ export class CopyListenerDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
+    // Check if user stopped before doing any work
+    const userStopped = (await this.state.storage.get("userStopped")) ?? false;
+    if (userStopped) return; // Do NOT re-schedule — stop means stop
+
     try {
       await pollCycle(this.env.DB, this.seenIds, this.env.PYTHON_API_URL);
       this.pollCount++;
     } catch (e) {
       console.error("Poll cycle error:", e);
     }
-    // Re-schedule next poll in 2 seconds (was 5s — reduced for faster copy latency)
+    // Re-schedule next poll in 2 seconds
     await this.state.storage.setAlarm(Date.now() + 2000);
   }
 }
