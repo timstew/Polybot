@@ -238,8 +238,24 @@ export interface CopyMissedPosition {
   percent_pnl: number;
 }
 
+export interface OutcomeBreakdown {
+  resolution_win: number;
+  resolution_loss: number;
+  sold_profit: number;
+  sold_loss: number;
+}
+
+export interface OpenPositionStats {
+  count: number;
+  capital_at_risk: number;
+  avg_implied_prob: number;
+  expected_pnl: number;
+}
+
 export interface CopyDetailData {
   summary: CopyDetailSummary;
+  outcome_breakdown?: OutcomeBreakdown;
+  open_position_stats?: OpenPositionStats;
   pnl_series: PnlPoint[];
   open_positions: CopyOpenPosition[];
   closed_positions: CopyClosedPosition[];

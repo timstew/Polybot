@@ -4,12 +4,16 @@ import { useEffect, useState } from "react";
 import {
   AreaChart,
   Area,
+  PieChart,
+  Pie,
+  Cell,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip as RechartsTooltip,
   ReferenceLine,
   ResponsiveContainer,
+  Legend as RechartsLegend,
 } from "recharts";
 import {
   Table,
@@ -24,7 +28,12 @@ import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PnlCell } from "@/components/pnl-cell";
-import { api, type CopyDetailData } from "@/lib/api";
+import {
+  api,
+  type CopyDetailData,
+  type OutcomeBreakdown,
+  type OpenPositionStats,
+} from "@/lib/api";
 import { TrendingUp, Award, Hash, DollarSign, Activity } from "lucide-react";
 
 function fmt(n: number) {
@@ -111,12 +120,36 @@ export function CopyTargetDetail({
 
   const {
     summary: s,
+    outcome_breakdown: ob,
+    open_position_stats: ops,
     pnl_series,
     open_positions,
     closed_positions,
     missed_positions,
   } = data;
   const netPnl = s.total_realized_pnl + s.total_unrealized_pnl - s.total_fees;
+
+  // Build pie chart data from outcome breakdown
+  const OUTCOME_COLORS: Record<string, string> = {
+    "Resolution Win": "#22c55e",
+    "Resolution Loss": "#ef4444",
+    "Sold for Profit": "#3b82f6",
+    "Sold at Loss": "#f97316",
+    "Open Positions": "#a3a3a3",
+  };
+  const pieData: { name: string; value: number }[] = [];
+  if (ob) {
+    if (ob.resolution_win > 0)
+      pieData.push({ name: "Resolution Win", value: ob.resolution_win });
+    if (ob.resolution_loss > 0)
+      pieData.push({ name: "Resolution Loss", value: ob.resolution_loss });
+    if (ob.sold_profit > 0)
+      pieData.push({ name: "Sold for Profit", value: ob.sold_profit });
+    if (ob.sold_loss > 0)
+      pieData.push({ name: "Sold at Loss", value: ob.sold_loss });
+  }
+  if (open_positions.length > 0)
+    pieData.push({ name: "Open Positions", value: open_positions.length });
 
   return (
     <div className="space-y-4 py-4">
@@ -181,6 +214,101 @@ export function CopyTargetDetail({
                 {fmt(s.total_unrealized_pnl)}
               </span>
             </span>
+          )}
+        </div>
+      )}
+
+      {/* Section 1b: Outcome Breakdown + Open Position Risk */}
+      {pieData.length > 0 && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          {/* Pie chart */}
+          <div>
+            <h4 className="mb-2 text-sm font-medium">Position Outcomes</h4>
+            <ResponsiveContainer width="100%" height={180}>
+              <PieChart>
+                <Pie
+                  data={pieData}
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={40}
+                  outerRadius={70}
+                  paddingAngle={2}
+                  dataKey="value"
+                  label={({ value, percent }) =>
+                    `${value} (${((percent ?? 0) * 100).toFixed(0)}%)`
+                  }
+                >
+                  {pieData.map((entry) => (
+                    <Cell
+                      key={entry.name}
+                      fill={OUTCOME_COLORS[entry.name] ?? "#94a3b8"}
+                    />
+                  ))}
+                </Pie>
+                <RechartsTooltip
+                  formatter={(value, name) => [
+                    `${value} position${value !== 1 ? "s" : ""}`,
+                    String(name),
+                  ]}
+                />
+                <RechartsLegend
+                  verticalAlign="bottom"
+                  height={36}
+                  iconSize={10}
+                  wrapperStyle={{ fontSize: "11px" }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* Open position risk summary */}
+          {ops && ops.count > 0 && (
+            <div>
+              <h4 className="mb-2 text-sm font-medium">
+                Open Position Risk
+                <span className="ml-1 text-xs text-muted-foreground font-normal">
+                  ({ops.count} position{ops.count !== 1 ? "s" : ""})
+                </span>
+              </h4>
+              <div className="space-y-3 rounded-lg border p-3">
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Capital at risk</span>
+                  <span className="font-mono font-semibold tabular-nums text-amber-600">
+                    {fmt(ops.capital_at_risk)}
+                  </span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">
+                    Avg implied win probability
+                  </span>
+                  <span className="font-mono font-semibold tabular-nums">
+                    {ops.avg_implied_prob}%
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Progress
+                    value={ops.avg_implied_prob}
+                    className="h-2 flex-1"
+                  />
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">
+                    Expected P&L at resolution
+                  </span>
+                  <span
+                    className={`font-mono font-semibold tabular-nums ${
+                      ops.expected_pnl >= 0 ? "text-green-600" : "text-red-600"
+                    }`}
+                  >
+                    {fmt(ops.expected_pnl)}
+                  </span>
+                </div>
+                <p className="text-[10px] text-muted-foreground leading-tight">
+                  Based on entry prices as implied probabilities. Actual
+                  outcomes depend on current market prices and resolution.
+                </p>
+              </div>
+            </div>
           )}
         </div>
       )}

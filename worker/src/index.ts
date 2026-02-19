@@ -129,6 +129,19 @@ interface OpenPosition {
   entry_time: string;
 }
 
+type OutcomeType =
+  | "resolution_win"
+  | "resolution_loss"
+  | "sold_profit"
+  | "sold_loss";
+
+interface OutcomeBreakdown {
+  resolution_win: number;
+  resolution_loss: number;
+  sold_profit: number;
+  sold_loss: number;
+}
+
 interface PnlResult {
   realized_pnl: number;
   total_fees: number;
@@ -141,6 +154,7 @@ interface PnlResult {
   open_positions: OpenPosition[];
   pnl_series: { t: string; pnl: number }[];
   peak_capital: number;
+  outcome_breakdown: OutcomeBreakdown;
 }
 
 interface TradeRowWithMarket extends TradeRow {
@@ -168,6 +182,12 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
   const pnlEvents: { t: string; pnl: number }[] = [];
   // Track capital deployed over time to find peak
   const capitalEvents: { ts: number; delta: number }[] = [];
+  const outcomeBreakdown: OutcomeBreakdown = {
+    resolution_win: 0,
+    resolution_loss: 0,
+    sold_profit: 0,
+    sold_loss: 0,
+  };
 
   for (const [assetId, assetTrades] of byAsset) {
     assetTrades.sort(
@@ -229,6 +249,16 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
           else losses++;
           if (netPnl > bestTradePnl) bestTradePnl = netPnl;
           if (netPnl < worstTradePnl) worstTradePnl = netPnl;
+
+          // Classify outcome: resolution (price ~0 or ~1) vs active sell
+          const isResolution = t.price >= 0.99 || t.price <= 0.01;
+          if (isResolution) {
+            if (netPnl >= 0) outcomeBreakdown.resolution_win++;
+            else outcomeBreakdown.resolution_loss++;
+          } else {
+            if (netPnl >= 0) outcomeBreakdown.sold_profit++;
+            else outcomeBreakdown.sold_loss++;
+          }
 
           closedPositions.push({
             market,
@@ -297,6 +327,7 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
     open_positions: openPositions,
     pnl_series,
     peak_capital: Math.round(peakCapital * 100) / 100,
+    outcome_breakdown: outcomeBreakdown,
   };
 }
 
@@ -944,10 +975,11 @@ export default {
         totalSlippageCost += Math.abs(t.exec_price - t.source_price) * t.size;
       }
 
-      // Estimate unrealized P&L for open positions using entry price
-      // (current_price is unavailable without live CLOB calls, so use 0.5 as midpoint estimate)
+      // For open positions, entry_price ≈ implied probability at entry.
+      // Without live CLOB calls we use entry_price as "current" estimate.
       const openPositions = pnl.open_positions.map((p) => {
-        const estimatedPrice = 0.5; // midpoint estimate — real price requires CLOB API
+        // entry_price is a reasonable proxy for current price on binary markets
+        const estimatedPrice = p.entry_price;
         const unrealizedPnl =
           Math.round((estimatedPrice - p.entry_price) * p.size * 100) / 100;
         return {
@@ -959,6 +991,36 @@ export default {
       });
       const totalUnrealizedPnl = openPositions.reduce(
         (sum, p) => sum + p.unrealized_pnl,
+        0,
+      );
+
+      // Compute weighted average implied probability for open positions
+      // entry_price IS the implied probability on binary Polymarket markets
+      let openTotalNotional = 0;
+      let openWeightedProb = 0;
+      for (const p of pnl.open_positions) {
+        const notional = p.entry_price * p.size;
+        openTotalNotional += notional;
+        // If bought at $0.80, implied 80% chance of resolving to $1.00
+        openWeightedProb += p.entry_price * notional;
+      }
+      const avgImpliedProb =
+        openTotalNotional > 0
+          ? Math.round((openWeightedProb / openTotalNotional) * 1000) / 10
+          : 0;
+      // Expected value of open positions if they resolve at implied probabilities
+      let openExpectedPnl = 0;
+      for (const p of pnl.open_positions) {
+        // EV = prob * (1 - entry) * size - (1 - prob) * entry * size
+        // simplified: EV = size * (prob - entry_price), but prob ≈ entry_price so EV ≈ 0
+        // More useful: if resolution at $1 happens with prob = entry_price:
+        const winPnl = (1 - p.entry_price) * p.size; // profit if resolves YES
+        const lossPnl = -p.entry_price * p.size; // loss if resolves NO
+        openExpectedPnl +=
+          p.entry_price * winPnl + (1 - p.entry_price) * lossPnl;
+      }
+      const openCapitalAtRisk = pnl.open_positions.reduce(
+        (sum, p) => sum + p.entry_price * p.size,
         0,
       );
 
@@ -977,6 +1039,13 @@ export default {
             best_trade_pnl: pnl.best_trade_pnl,
             worst_trade_pnl: pnl.worst_trade_pnl,
             peak_capital: pnl.peak_capital,
+          },
+          outcome_breakdown: pnl.outcome_breakdown,
+          open_position_stats: {
+            count: pnl.open_positions.length,
+            capital_at_risk: Math.round(openCapitalAtRisk * 100) / 100,
+            avg_implied_prob: avgImpliedProb,
+            expected_pnl: Math.round(openExpectedPnl * 100) / 100,
           },
           pnl_series: pnl.pnl_series,
           open_positions: openPositions,
