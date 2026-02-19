@@ -580,15 +580,32 @@ def execute_real_trade(body: dict):
                 "error": f"Below minimum: ${order_notional:.2f} < ${min_notional:.2f}",
             }
 
-        # Round to allowed precision (4 decimal places for amounts)
-        order_notional = round(order_notional, 2)
+        # Round to allowed precision: taker amount (notional) max 2 decimals,
+        # maker amount (shares = notional/price) max 4 decimals.
+        # Truncate (floor) instead of round to stay within limits.
+        import math
+
+        price = math.floor(price * 10000) / 10000  # 4 decimal truncate
+        order_notional = math.floor(order_notional * 100) / 100  # 2 decimal truncate
+        # Ensure maker amount (shares) also fits in 4 decimals
+        shares = order_notional / price if price > 0 else 0
+        shares = math.floor(shares * 10000) / 10000
+        order_notional = (
+            math.floor(shares * price * 100) / 100
+        )  # recompute to stay consistent
+
+        if order_notional < 1.0:
+            return {
+                "status": "failed",
+                "error": f"Below minimum after rounding: ${order_notional:.2f}",
+            }
 
         order = client.create_market_order(
             MarketOrderArgs(
                 token_id=asset_id,
                 amount=order_notional,
                 side=clob_side,
-                price=round(price, 4),
+                price=price,
             )
         )
         resp = client.post_order(order, "GTC")

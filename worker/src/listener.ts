@@ -226,6 +226,7 @@ async function handlePositionExit(
   db: D1Database,
   event: DataApiTrade,
   target: CopyTarget,
+  pendingSells: Map<string, number>,
 ): Promise<number> {
   // Skip zero-size redeems (losing outcomes with no value)
   if (event.size <= 0 && event.usdcSize <= 0) {
@@ -246,7 +247,8 @@ async function handlePositionExit(
 
     let count = 0;
     for (const pos of openBuys) {
-      const remainingSize = pos.buy_total - pos.sell_total;
+      const alreadyPending = pendingSells.get(pos.asset_id) ?? 0;
+      const remainingSize = pos.buy_total - pos.sell_total - alreadyPending;
       if (remainingSize < 0.001) continue;
 
       const copy: CopyTrade = {
@@ -268,6 +270,8 @@ async function handlePositionExit(
         title: event.title || "",
       };
       await insertCopyTrade(db, copy);
+      // Track this sell in pendingSells
+      pendingSells.set(pos.asset_id, alreadyPending + remainingSize);
       count++;
     }
     return count;
@@ -293,11 +297,10 @@ async function handlePositionExit(
 
   let count = 0;
   for (const pos of positions) {
-    const openSize = pos.buy_total - pos.sell_total;
+    const alreadyPending = pendingSells.get(pos.asset_id) ?? 0;
+    const openSize = pos.buy_total - pos.sell_total - alreadyPending;
     if (openSize < 0.001) continue;
 
-    // Scale the exit: source converted `event.size` shares, our position
-    // is proportional to trade_pct. Close our full open position.
     const copy: CopyTrade = {
       id: crypto.randomUUID(),
       source_trade_id: event.id,
@@ -317,6 +320,8 @@ async function handlePositionExit(
       title: event.title || "",
     };
     await insertCopyTrade(db, copy);
+    // Track this sell in pendingSells
+    pendingSells.set(pos.asset_id, alreadyPending + openSize);
     count++;
   }
   return count;
@@ -336,6 +341,10 @@ export async function pollCycle(
 
   let newCount = 0;
 
+  // Track in-flight sell sizes within this poll cycle to prevent overselling
+  // when multiple SELLs for the same asset are processed before DB writes settle
+  const pendingSells = new Map<string, number>();
+
   for (const target of targets) {
     let activity: DataApiTrade[];
     try {
@@ -353,7 +362,7 @@ export async function pollCycle(
         event.activity_type === "CONVERSION" ||
         event.activity_type === "REDEEM"
       ) {
-        newCount += await handlePositionExit(db, event, target);
+        newCount += await handlePositionExit(db, event, target, pendingSells);
         continue;
       }
 
@@ -363,7 +372,7 @@ export async function pollCycle(
       // Real mode: check position before executing
       if (target.mode === "real") {
         if (copy.side === "SELL") {
-          // Only sell what we actually hold
+          // Only sell what we actually hold (minus any pending sells this cycle)
           const pos = await db
             .prepare(
               `SELECT
@@ -375,14 +384,15 @@ export async function pollCycle(
             .bind(target.wallet, copy.asset_id)
             .first<{ held: number }>();
 
-          const held = pos?.held ?? 0;
-          if (held < 0.01) {
-            // Nothing to sell — skip entirely (don't record a failed trade)
+          const dbHeld = pos?.held ?? 0;
+          const alreadyPending = pendingSells.get(copy.asset_id) ?? 0;
+          const available = dbHeld - alreadyPending;
+
+          if (available < 0.01) {
             continue;
           }
-          if (copy.size > held) {
-            // Cap to what we own
-            copy.size = held;
+          if (copy.size > available) {
+            copy.size = available;
           }
         }
 
@@ -408,6 +418,18 @@ export async function pollCycle(
             "[REAL] PYTHON_API_URL not configured — cannot execute",
           );
         }
+
+        // Track sells that went through (or were attempted) to prevent double-selling
+        if (copy.side === "SELL" && copy.status === "filled") {
+          const prev = pendingSells.get(copy.asset_id) ?? 0;
+          pendingSells.set(copy.asset_id, prev + copy.size);
+        }
+      }
+
+      // Paper mode: also track pending sells to prevent phantom bookkeeping
+      if (target.mode === "paper" && copy.side === "SELL") {
+        const prev = pendingSells.get(copy.asset_id) ?? 0;
+        pendingSells.set(copy.asset_id, prev + copy.size);
       }
 
       await insertCopyTrade(db, copy);
