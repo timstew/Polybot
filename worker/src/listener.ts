@@ -339,9 +339,12 @@ export async function pollCycle(
   seenIds: Set<string>,
   pythonApiUrl?: string,
 ): Promise<number> {
-  // Get active targets
+  // Get active targets — real mode first so they always get processed
+  // even if the poll cycle runs long on many paper targets
   const { results: targets } = await db
-    .prepare("SELECT * FROM copy_targets WHERE active = 1")
+    .prepare(
+      "SELECT * FROM copy_targets WHERE active = 1 ORDER BY CASE mode WHEN 'real' THEN 0 ELSE 1 END",
+    )
     .all<CopyTarget>();
 
   if (!targets || targets.length === 0) return 0;
