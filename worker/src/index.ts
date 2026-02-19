@@ -856,6 +856,14 @@ export default {
 
         const categories = walletCategories(walletTrades);
 
+        const openCount = pnl?.open_positions.length ?? 0;
+        const wins = pnl?.wins ?? 0;
+        const losses = pnl?.losses ?? 0;
+        const rated = wins + losses;
+        const winRate = rated > 0 ? Math.round((wins / rated) * 1000) / 10 : 0;
+        const peakCap = pnl?.peak_capital ?? 0;
+        const realizedPnl = pnl?.realized_pnl ?? 0;
+
         return {
           wallet: r.wallet,
           username: r.display_username || r.username || "",
@@ -863,7 +871,7 @@ export default {
           trade_pct: r.trade_pct,
           max_position_usd: r.max_position_usd,
           active: !!r.active,
-          total_paper_pnl: pnl?.realized_pnl ?? 0,
+          total_paper_pnl: realizedPnl,
           total_real_pnl: r.total_real_pnl,
           slippage_bps: r.slippage_bps,
           latency_ms: r.latency_ms,
@@ -874,8 +882,14 @@ export default {
           trade_count: tradeCount,
           listening_hours,
           avg_hold_time_hours: pnl?.avg_hold_time_hours ?? 0,
-          peak_capital: pnl?.peak_capital ?? 0,
+          peak_capital: peakCap,
           categories,
+          wins,
+          losses,
+          win_rate: winRate,
+          open_positions_count: openCount,
+          roi_pct:
+            peakCap > 0 ? Math.round((realizedPnl / peakCap) * 1000) / 10 : 0,
         };
       });
       return jsonCors(enriched, request);
@@ -930,6 +944,24 @@ export default {
         totalSlippageCost += Math.abs(t.exec_price - t.source_price) * t.size;
       }
 
+      // Estimate unrealized P&L for open positions using entry price
+      // (current_price is unavailable without live CLOB calls, so use 0.5 as midpoint estimate)
+      const openPositions = pnl.open_positions.map((p) => {
+        const estimatedPrice = 0.5; // midpoint estimate — real price requires CLOB API
+        const unrealizedPnl =
+          Math.round((estimatedPrice - p.entry_price) * p.size * 100) / 100;
+        return {
+          ...p,
+          title: "",
+          current_price: estimatedPrice,
+          unrealized_pnl: unrealizedPnl,
+        };
+      });
+      const totalUnrealizedPnl = openPositions.reduce(
+        (sum, p) => sum + p.unrealized_pnl,
+        0,
+      );
+
       return jsonCors(
         {
           summary: {
@@ -937,8 +969,9 @@ export default {
             wins: pnl.wins,
             losses: pnl.losses,
             win_rate: winRate,
+            open_positions_count: pnl.open_positions.length,
             total_realized_pnl: pnl.realized_pnl,
-            total_unrealized_pnl: 0,
+            total_unrealized_pnl: Math.round(totalUnrealizedPnl * 100) / 100,
             total_fees: pnl.total_fees,
             total_slippage_cost: Math.round(totalSlippageCost * 100) / 100,
             best_trade_pnl: pnl.best_trade_pnl,
@@ -946,13 +979,8 @@ export default {
             peak_capital: pnl.peak_capital,
           },
           pnl_series: pnl.pnl_series,
-          open_positions: pnl.open_positions.map((p) => ({
-            ...p,
-            title: "",
-            current_price: 0,
-            unrealized_pnl: 0,
-          })),
-          closed_positions: pnl.closed_positions.slice(0, 100).map((p) => ({
+          open_positions: openPositions,
+          closed_positions: pnl.closed_positions.map((p) => ({
             ...p,
             title: "",
           })),

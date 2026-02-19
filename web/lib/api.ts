@@ -135,6 +135,11 @@ export interface CopyTarget {
   listening_hours: number;
   peak_capital: number;
   categories: string[];
+  wins: number;
+  losses: number;
+  win_rate: number;
+  open_positions_count: number;
+  roi_pct: number;
 }
 
 export interface CopyTradeRow {
@@ -187,6 +192,7 @@ export interface CopyDetailSummary {
   wins: number;
   losses: number;
   win_rate: number;
+  open_positions_count: number;
   total_realized_pnl: number;
   total_unrealized_pnl: number;
   total_fees: number;

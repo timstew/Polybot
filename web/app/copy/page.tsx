@@ -377,8 +377,16 @@ export default function CopyTradingPage() {
                 desc: "Total number of filled copy trades for this target",
               },
               {
-                term: "Listening",
-                desc: "Time span from first to most recent copy trade",
+                term: "Win Rate",
+                desc: "Percentage of closed positions that were profitable. Hover for W/L breakdown. Does not include open positions.",
+              },
+              {
+                term: "Open",
+                desc: "Number of positions still open (not yet sold or resolved). High counts mean win rate is unreliable.",
+              },
+              {
+                term: "ROI %",
+                desc: "Realized P&L divided by peak capital deployed. Measures return on the capital that was at risk.",
               },
               {
                 term: "Avg Hold",
@@ -386,7 +394,7 @@ export default function CopyTradingPage() {
               },
               {
                 term: "Paper P&L",
-                desc: "Simulated profit/loss from all paper trades for this target",
+                desc: "Realized profit/loss from closed paper trades only. Does not include open position risk.",
               },
             ]}
           />
@@ -417,9 +425,10 @@ export default function CopyTradingPage() {
                     <TableHead className="text-right">Copy %</TableHead>
                     <TableHead className="text-right">Max Pos</TableHead>
                     <TableHead className="text-right">Trades</TableHead>
-                    <TableHead className="text-right">Listening</TableHead>
+                    <TableHead className="text-right">Win Rate</TableHead>
+                    <TableHead className="text-right">Open</TableHead>
+                    <TableHead className="text-right">ROI %</TableHead>
                     <TableHead className="text-right">Avg Hold</TableHead>
-                    <TableHead className="text-right">Peak Capital</TableHead>
                     <TableHead className="text-right">Paper P&L</TableHead>
                     <TableHead className="w-24"></TableHead>
                   </TableRow>
@@ -532,13 +541,50 @@ export default function CopyTradingPage() {
                           {t.trade_count ?? 0}
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {fmtHold(t.listening_hours ?? 0)}
+                          {(t.wins ?? 0) + (t.losses ?? 0) > 0 ? (
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span>{t.win_rate ?? 0}%</span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">
+                                  <p className="text-xs">
+                                    {t.wins ?? 0}W / {t.losses ?? 0}L (closed
+                                    only)
+                                  </p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-sm tabular-nums">
+                          {(t.open_positions_count ?? 0) > 0 ? (
+                            <span className="text-amber-600">
+                              {t.open_positions_count}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">0</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-sm tabular-nums">
+                          {(t.roi_pct ?? 0) !== 0 ? (
+                            <span
+                              className={
+                                t.roi_pct >= 0
+                                  ? "text-green-600"
+                                  : "text-red-600"
+                              }
+                            >
+                              {t.roi_pct}%
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
                           {fmtHold(t.avg_hold_time_hours)}
-                        </TableCell>
-                        <TableCell className="text-right font-mono text-sm tabular-nums text-muted-foreground">
-                          {fmt(t.peak_capital ?? 0)}
                         </TableCell>
                         <TableCell className="text-right">
                           <span
@@ -566,7 +612,7 @@ export default function CopyTradingPage() {
                       </TableRow>
                       {expandedWallet === t.wallet && (
                         <TableRow key={`${t.wallet}-detail`}>
-                          <TableCell colSpan={12} className="p-0 px-4 pb-4">
+                          <TableCell colSpan={13} className="p-0 px-4 pb-4">
                             <CopyTargetDetail
                               wallet={t.wallet}
                               source="cloud"

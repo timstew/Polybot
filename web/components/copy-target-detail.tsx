@@ -129,11 +129,21 @@ export function CopyTargetDetail({
         </Stat>
         <Stat icon={Award} label="Win Rate">
           <div className="flex items-center gap-2">
-            <span>{s.win_rate.toFixed(0)}%</span>
-            <Progress value={s.win_rate} className="h-1.5 w-12" />
+            <span>
+              {s.wins + s.losses > 0 ? `${s.win_rate.toFixed(0)}%` : "N/A"}
+            </span>
+            {s.wins + s.losses > 0 && (
+              <Progress value={s.win_rate} className="h-1.5 w-12" />
+            )}
           </div>
           <span className="text-xs text-muted-foreground font-normal">
             {s.wins}W / {s.losses}L
+            {(s.open_positions_count ?? 0) > 0 && (
+              <span className="text-amber-600">
+                {" "}
+                / {s.open_positions_count} open
+              </span>
+            )}
           </span>
         </Stat>
         <Stat icon={Hash} label="Trades">
