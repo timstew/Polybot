@@ -280,22 +280,8 @@ export const api = {
   listenerStop: () =>
     postJSON<{ status: string; new_trades?: number }>("/api/listener/stop"),
   copyTargets: () => fetchJSON<CopyTarget[]>("/api/copy/targets"),
-  copyAdd: (
-    wallet: string,
-    tradePct = 10,
-    maxPositionUsd = 100,
-    slippageBps = 50,
-    latencyMs = 2000,
-    feeRate = 0,
-  ) =>
-    postJSON<{ status: string; wallet: string }>("/api/copy/add", {
-      wallet,
-      trade_pct: tradePct,
-      max_position_usd: maxPositionUsd,
-      slippage_bps: slippageBps,
-      latency_ms: latencyMs,
-      fee_rate: feeRate,
-    }),
+  copyAdd: (wallet: string) =>
+    postJSON<{ status: string; wallet: string }>("/api/copy/add", { wallet }),
   copyRemove: (wallet: string) =>
     postJSON<{ status: string; wallet: string }>("/api/copy/remove", {
       wallet,
@@ -309,6 +295,14 @@ export const api = {
       "/api/copy/set-mode",
       { wallet, mode },
     ),
+  copyUpdate: (
+    wallet: string,
+    updates: { trade_pct?: number; max_position_usd?: number },
+  ) =>
+    postJSON<{ status: string; wallet: string }>("/api/copy/update", {
+      wallet,
+      ...updates,
+    }),
   copyTrades: (wallet = "", limit = 200) =>
     fetchJSON<CopyTradeRow[]>(
       `/api/copy/trades?wallet=${wallet}&limit=${limit}`,

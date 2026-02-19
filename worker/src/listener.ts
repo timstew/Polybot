@@ -146,7 +146,8 @@ export function calculateCopyTrade(
 // ── Poll cycle ─────────────────────────────────────────────────────
 
 // Minimum ms between copy trades on the same (wallet, market) pair.
-const MARKET_COOLDOWN_MS = 600_000; // 10 minutes
+// Short cooldown to deduplicate near-simultaneous events from the activity API.
+const MARKET_COOLDOWN_MS = 60_000; // 1 minute
 
 async function executeRealTrade(
   pythonApiUrl: string,

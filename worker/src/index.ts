@@ -1059,6 +1059,36 @@ export default {
       return jsonCors({ status: "updated", wallet: w, mode }, request);
     }
 
+    // Update copy target settings (trade_pct, max_position_usd)
+    if (url.pathname === "/api/copy/update" && request.method === "POST") {
+      const body = (await request.json()) as {
+        wallet: string;
+        trade_pct?: number;
+        max_position_usd?: number;
+      };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+      const updates: string[] = [];
+      const values: (string | number)[] = [];
+      if (body.trade_pct !== undefined) {
+        updates.push("trade_pct = ?");
+        values.push(body.trade_pct);
+      }
+      if (body.max_position_usd !== undefined) {
+        updates.push("max_position_usd = ?");
+        values.push(body.max_position_usd);
+      }
+      if (updates.length === 0)
+        return jsonCors({ error: "nothing to update" }, request, 400);
+      values.push(w);
+      await env.DB.prepare(
+        `UPDATE copy_targets SET ${updates.join(", ")} WHERE wallet = ?`,
+      )
+        .bind(...values)
+        .run();
+      return jsonCors({ status: "updated", wallet: w }, request);
+    }
+
     // Backfill usernames for all copy targets missing them
     if (
       url.pathname === "/api/copy/backfill-usernames" &&

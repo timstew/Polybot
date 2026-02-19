@@ -67,6 +67,63 @@ function CategoryIcons({ categories }: { categories: string[] }) {
   );
 }
 
+function EditableNumber({
+  value,
+  onSave,
+  prefix = "",
+  suffix = "",
+}: {
+  value: number;
+  onSave: (v: number) => void;
+  prefix?: string;
+  suffix?: string;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(String(value));
+
+  if (!editing) {
+    return (
+      <span
+        className="cursor-pointer hover:underline decoration-dotted"
+        onClick={(e) => {
+          e.stopPropagation();
+          setDraft(String(value));
+          setEditing(true);
+        }}
+        title="Click to edit"
+      >
+        {prefix}
+        {value}
+        {suffix}
+      </span>
+    );
+  }
+
+  return (
+    <input
+      type="number"
+      className="w-20 rounded border px-1 py-0.5 text-right font-mono text-sm"
+      value={draft}
+      autoFocus
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        const n = parseFloat(draft);
+        if (!isNaN(n) && n > 0 && n !== value) onSave(n);
+        setEditing(false);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          const n = parseFloat(draft);
+          if (!isNaN(n) && n > 0 && n !== value) onSave(n);
+          setEditing(false);
+        }
+        if (e.key === "Escape") setEditing(false);
+      }}
+    />
+  );
+}
+
 function fmtHold(hours: number): string {
   if (!hours || hours <= 0) return "—";
   if (hours >= 24) return `${(hours / 24).toFixed(1)}d`;
@@ -86,11 +143,6 @@ export default function CopyTradingPage() {
 
   // Form state
   const [wallet, setWallet] = useState("");
-  const [tradePct, setTradePct] = useState("10");
-  const [maxUsd, setMaxUsd] = useState("100");
-  const [slippageBps, setSlippageBps] = useState("50");
-  const [latencyMs, setLatencyMs] = useState("2000");
-  const [feeRate, setFeeRate] = useState("0");
   const [adding, setAdding] = useState(false);
 
   const [cloudRunning, setCloudRunning] = useState(false);
@@ -161,14 +213,7 @@ export default function CopyTradingPage() {
     setAdding(true);
     setError(null);
     try {
-      await api.copyAdd(
-        wallet.trim(),
-        parseFloat(tradePct),
-        parseFloat(maxUsd),
-        parseFloat(slippageBps),
-        parseFloat(latencyMs),
-        parseFloat(feeRate),
-      );
+      await api.copyAdd(wallet.trim());
       setWallet("");
       refresh();
     } catch (err) {
@@ -268,7 +313,7 @@ export default function CopyTradingPage() {
           <CardTitle>Add Copy Target</CardTitle>
         </CardHeader>
         <CardContent>
-          <form onSubmit={handleAdd} className="flex flex-wrap items-end gap-4">
+          <form onSubmit={handleAdd} className="flex items-end gap-4">
             <div className="flex-1 min-w-[300px]">
               <label className="text-sm font-medium text-muted-foreground">
                 Wallet Address
@@ -280,80 +325,14 @@ export default function CopyTradingPage() {
                 className="mt-1 font-mono"
               />
             </div>
-            <div className="w-32">
-              <label className="text-sm font-medium text-muted-foreground">
-                Copy % of Size
-              </label>
-              <Input
-                type="number"
-                min="1"
-                max="100"
-                step="1"
-                value={tradePct}
-                onChange={(e) => setTradePct(e.target.value)}
-                className="mt-1"
-              />
-            </div>
-            <div className="w-36">
-              <label className="text-sm font-medium text-muted-foreground">
-                Max Position ($)
-              </label>
-              <Input
-                type="number"
-                min="1"
-                step="10"
-                value={maxUsd}
-                onChange={(e) => setMaxUsd(e.target.value)}
-                className="mt-1"
-              />
-            </div>
-            <div className="w-32">
-              <label className="text-sm font-medium text-muted-foreground">
-                Slippage (bps)
-              </label>
-              <Input
-                type="number"
-                min="0"
-                step="10"
-                value={slippageBps}
-                onChange={(e) => setSlippageBps(e.target.value)}
-                className="mt-1"
-                title="Price slippage estimate in basis points (50 = 0.5%)"
-              />
-            </div>
-            <div className="w-32">
-              <label className="text-sm font-medium text-muted-foreground">
-                Latency (ms)
-              </label>
-              <Input
-                type="number"
-                min="0"
-                step="500"
-                value={latencyMs}
-                onChange={(e) => setLatencyMs(e.target.value)}
-                className="mt-1"
-                title="Estimated execution delay in milliseconds"
-              />
-            </div>
-            <div className="w-28">
-              <label className="text-sm font-medium text-muted-foreground">
-                Fee Rate
-              </label>
-              <Input
-                type="number"
-                min="0"
-                max="1"
-                step="0.01"
-                value={feeRate}
-                onChange={(e) => setFeeRate(e.target.value)}
-                className="mt-1"
-                title="0 = auto-detect from market category, or override (e.g. 0.0625)"
-              />
-            </div>
             <Button type="submit" disabled={adding || !wallet.trim()}>
               {adding ? "Adding..." : "Start Paper Trading"}
             </Button>
           </form>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Paper mode copies 100% of the bot&apos;s trades. Switch to real mode
+            to configure sizing.
+          </p>
           {error && <p className="mt-2 text-sm text-red-500">{error}</p>}
         </CardContent>
       </Card>
@@ -387,23 +366,11 @@ export default function CopyTradingPage() {
               },
               {
                 term: "Copy %",
-                desc: "Percentage of the target's trade size to mirror",
+                desc: "Percentage of the bot's trade size to mirror. Paper always copies 100%. Click to edit in real mode.",
               },
               {
-                term: "Max Position",
-                desc: "Maximum dollar exposure per market per target",
-              },
-              {
-                term: "Slippage",
-                desc: 'Price impact estimate in basis points (100bps = 1%). "measured" = computed from real market data; "fallback" = static guess before enough data',
-              },
-              {
-                term: "Latency",
-                desc: 'Time delay before simulated execution. "measured" = actual detection delay observed; "fallback" = configured estimate',
-              },
-              {
-                term: "Fee Rate",
-                desc: 'Trading fee applied to paper trades. "auto" = derived from market category',
+                term: "Max Pos",
+                desc: "Per-trade safety cap in USD. Only applies in real mode. Click to edit.",
               },
               {
                 term: "Trades",
@@ -448,6 +415,7 @@ export default function CopyTradingPage() {
                     <TableHead>Cat</TableHead>
                     <TableHead>Mode</TableHead>
                     <TableHead className="text-right">Copy %</TableHead>
+                    <TableHead className="text-right">Max Pos</TableHead>
                     <TableHead className="text-right">Trades</TableHead>
                     <TableHead className="text-right">Listening</TableHead>
                     <TableHead className="text-right">Avg Hold</TableHead>
@@ -489,21 +457,41 @@ export default function CopyTradingPage() {
                                 ? "bg-green-100 text-green-800 hover:bg-green-200"
                                 : "bg-blue-100 text-blue-800 hover:bg-blue-200"
                             }`}
-                            onClick={(e) => {
+                            onClick={async (e) => {
                               e.stopPropagation();
                               const next =
                                 t.mode === "paper" ? "real" : "paper";
-                              if (
-                                next === "real" &&
-                                !confirm(
-                                  `Switch ${t.username || t.wallet.slice(0, 10)} to REAL trading?\n\nThis requires POLYMARKET_PRIVATE_KEY to be configured on Cloud Run. Real orders will be placed as FOK market orders on Polygon.`,
-                                )
-                              )
-                                return;
-                              api
-                                .copySetMode(t.wallet, next)
-                                .then(refresh)
-                                .catch(() => {});
+                              if (next === "real") {
+                                const pctStr = prompt(
+                                  `Switch ${t.username || t.wallet.slice(0, 10)} to REAL trading.\n\nCopy what % of the bot's trade size?`,
+                                  "10",
+                                );
+                                if (!pctStr) return;
+                                const pct = parseFloat(pctStr);
+                                if (isNaN(pct) || pct <= 0 || pct > 100) return;
+                                const maxStr = prompt(
+                                  `Max position size per market (USD)?\n\nThis is a per-trade safety cap.`,
+                                  "500",
+                                );
+                                if (!maxStr) return;
+                                const maxPos = parseFloat(maxStr);
+                                if (isNaN(maxPos) || maxPos <= 0) return;
+                                try {
+                                  await api.copyUpdate(t.wallet, {
+                                    trade_pct: pct,
+                                    max_position_usd: maxPos,
+                                  });
+                                  await api.copySetMode(t.wallet, "real");
+                                  refresh();
+                                } catch {
+                                  /* ignore */
+                                }
+                              } else {
+                                api
+                                  .copySetMode(t.wallet, "paper")
+                                  .then(refresh)
+                                  .catch(() => {});
+                              }
                             }}
                             title={`Click to switch to ${t.mode === "paper" ? "real" : "paper"} mode`}
                           >
@@ -511,7 +499,34 @@ export default function CopyTradingPage() {
                           </Badge>
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {t.trade_pct}%
+                          {t.mode === "real" ? (
+                            <EditableNumber
+                              value={t.trade_pct}
+                              suffix="%"
+                              onSave={(v) =>
+                                api
+                                  .copyUpdate(t.wallet, { trade_pct: v })
+                                  .then(refresh)
+                              }
+                            />
+                          ) : (
+                            <span className="text-muted-foreground">100%</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-sm tabular-nums">
+                          {t.mode === "real" ? (
+                            <EditableNumber
+                              value={t.max_position_usd}
+                              prefix="$"
+                              onSave={(v) =>
+                                api
+                                  .copyUpdate(t.wallet, { max_position_usd: v })
+                                  .then(refresh)
+                              }
+                            />
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
                           {t.trade_count ?? 0}
@@ -551,7 +566,7 @@ export default function CopyTradingPage() {
                       </TableRow>
                       {expandedWallet === t.wallet && (
                         <TableRow key={`${t.wallet}-detail`}>
-                          <TableCell colSpan={11} className="p-0 px-4 pb-4">
+                          <TableCell colSpan={12} className="p-0 px-4 pb-4">
                             <CopyTargetDetail
                               wallet={t.wallet}
                               source="cloud"

@@ -519,16 +519,14 @@ def bots(min_confidence: float = Query(0.0)):
 # ── Real trade execution (called by Worker for real-mode copy trades) ──
 
 
-# Daily spending limit for real trades (USD)
-_DAILY_REAL_LIMIT_USD = 500.0
-_daily_real_spent: dict[str, float] = {}  # date_str -> total notional
-
-
 @app.post("/api/copy/execute")
 def execute_real_trade(body: dict):
     """Execute a real trade on Polymarket via py-clob-client.
 
     Called by the Cloudflare Worker when a copy target is in 'real' mode.
+    The Worker already applies trade_pct sizing and max_position_usd cap
+    before calling this endpoint — no additional limits here.
+
     Body: {asset_id, side, size, price, source_wallet, market}
     Returns: {status: 'filled'|'failed', order_id?, error?}
     """
@@ -543,18 +541,6 @@ def execute_real_trade(body: dict):
     size = float(body.get("size", 0))
     price = float(body.get("price", 0))
     notional = price * size
-
-    if notional < 0.01:
-        return {"status": "failed", "error": "Trade too small"}
-
-    # Daily spending limit
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    spent_today = _daily_real_spent.get(today, 0.0)
-    if spent_today + notional > _DAILY_REAL_LIMIT_USD:
-        return {
-            "status": "failed",
-            "error": f"Daily limit reached (${spent_today:.2f} / ${_DAILY_REAL_LIMIT_USD:.2f})",
-        }
 
     try:
         from py_clob_client.client import ClobClient
@@ -581,13 +567,6 @@ def execute_real_trade(body: dict):
         resp = client.post_order(order, "FOK")
 
         if resp.get("success") or resp.get("orderID"):
-            # Track daily spend
-            _daily_real_spent[today] = spent_today + notional
-            # Clean old days
-            for k in list(_daily_real_spent.keys()):
-                if k != today:
-                    del _daily_real_spent[k]
-
             logger.info(
                 "[REAL] %s %.2f shares of %s @ $%.4f ($%.2f notional)",
                 side,
@@ -611,19 +590,16 @@ def execute_real_trade(body: dict):
 
 @app.get("/api/copy/execute/status")
 def execute_status():
-    """Check if real trading is configured and daily spend."""
+    """Check if real trading is configured."""
     from polybot.config import Config
 
     config = Config.from_env()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return {
         "configured": bool(config.private_key),
         "signature_type": config.signature_type,
         "funder_address": config.funder_address[:10] + "..."
         if config.funder_address
         else "",
-        "daily_limit_usd": _DAILY_REAL_LIMIT_USD,
-        "spent_today_usd": _daily_real_spent.get(today, 0.0),
     }
 
 

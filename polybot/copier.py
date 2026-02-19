@@ -32,9 +32,8 @@ class CopyTrader:
     """
 
     # Minimum seconds between copy trades on the same (wallet, market) pair.
-    # Prevents micro-trading bots from flooding us with hundreds of copies
-    # on the same market within minutes.
-    MARKET_COOLDOWN_SECONDS = 600  # 10 minutes
+    # Short cooldown to deduplicate near-simultaneous events.
+    MARKET_COOLDOWN_SECONDS = 60  # 1 minute
 
     def __init__(
         self, db: Database, config: Optional[Config] = None, slippage_tracker=None
