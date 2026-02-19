@@ -376,33 +376,35 @@ export async function pollCycle(
       const copy = calculateCopyTrade(event, target);
       if (!copy) continue;
 
-      // Real mode: check position before executing
-      if (target.mode === "real") {
-        if (copy.side === "SELL") {
-          // Only sell what we actually hold (minus any pending sells this cycle)
-          const pos = await db
-            .prepare(
-              `SELECT
-                 COALESCE(SUM(CASE WHEN side='BUY' THEN size ELSE 0 END), 0) -
-                 COALESCE(SUM(CASE WHEN side='SELL' THEN size ELSE 0 END), 0) AS held
-               FROM copy_trades
-               WHERE source_wallet = ? AND asset_id = ? AND mode = 'real' AND status = 'filled'`,
-            )
-            .bind(target.wallet, copy.asset_id)
-            .first<{ held: number }>();
+      // For ALL modes: check position before selling.
+      // Without this, we create phantom sells for shares the target
+      // accumulated before we started copying (we never bought them).
+      if (copy.side === "SELL") {
+        const pos = await db
+          .prepare(
+            `SELECT
+               COALESCE(SUM(CASE WHEN side='BUY' THEN size ELSE 0 END), 0) -
+               COALESCE(SUM(CASE WHEN side='SELL' THEN size ELSE 0 END), 0) AS held
+             FROM copy_trades
+             WHERE source_wallet = ? AND asset_id = ? AND status = 'filled'`,
+          )
+          .bind(target.wallet, copy.asset_id)
+          .first<{ held: number }>();
 
-          const dbHeld = pos?.held ?? 0;
-          const alreadyPending = pendingSells.get(copy.asset_id) ?? 0;
-          const available = dbHeld - alreadyPending;
+        const dbHeld = pos?.held ?? 0;
+        const alreadyPending = pendingSells.get(copy.asset_id) ?? 0;
+        const available = dbHeld - alreadyPending;
 
-          if (available < 0.01) {
-            continue;
-          }
-          if (copy.size > available) {
-            copy.size = available;
-          }
+        if (available < 0.01) {
+          continue; // skip — we don't hold this asset
         }
+        if (copy.size > available) {
+          copy.size = available; // cap to what we actually hold
+        }
+      }
 
+      // Real mode: execute via CLOB API
+      if (target.mode === "real") {
         if (pythonApiUrl) {
           const result = await executeRealTrade(pythonApiUrl, copy);
           copy.status = result.status === "filled" ? "filled" : "failed";
@@ -426,17 +428,17 @@ export async function pollCycle(
           );
         }
 
-        // Track sells that went through (or were attempted) to prevent double-selling
+        // Track sells in pendingSells (real mode)
         if (copy.side === "SELL" && copy.status === "filled") {
           const prev = pendingSells.get(copy.asset_id) ?? 0;
           pendingSells.set(copy.asset_id, prev + copy.size);
         }
-      }
-
-      // Paper mode: also track pending sells to prevent phantom bookkeeping
-      if (target.mode === "paper" && copy.side === "SELL") {
-        const prev = pendingSells.get(copy.asset_id) ?? 0;
-        pendingSells.set(copy.asset_id, prev + copy.size);
+      } else {
+        // Track pending sells for paper mode to prevent overselling within a poll cycle
+        if (copy.side === "SELL") {
+          const prev = pendingSells.get(copy.asset_id) ?? 0;
+          pendingSells.set(copy.asset_id, prev + copy.size);
+        }
       }
 
       await insertCopyTrade(db, copy);
