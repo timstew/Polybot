@@ -14,6 +14,27 @@ const LEADERBOARD_PERIODS = ["DAY", "WEEK", "MONTH", "ALL"];
 const HARVEST_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const POLL_INTERVAL_MS = 5_000; // 5 seconds
 
+// Crypto-hourly binary options ("Bitcoin Up or Down - Feb 19, 5AM ET") dominate
+// the trade stream by volume but are not copyable (latency-sensitive, sub-minute).
+// Filter them at ingestion so detection focuses on politics, sports, macro, etc.
+const CRYPTO_HOURLY_RE =
+  /\b(bitcoin|btc|ethereum|eth|solana|sol|cardano|ada|dogecoin|doge|xrp|bnb|avalanche|avax|matic|polkadot|dot|litecoin|ltc)\b.*\b(up or down|updown)\b/i;
+
+/** Returns true if a trade title looks like a crypto-hourly binary option. */
+function isCryptoHourly(title: string): boolean {
+  return CRYPTO_HOURLY_RE.test(title);
+}
+
+// Market categories we actively want to discover traders for.
+// Used to fetch position holders from non-volume-dominant markets.
+const DESIRED_MARKET_TAGS = [
+  "politics",
+  "sports",
+  "science",
+  "finance",
+  "world-events",
+];
+
 interface TradeItem {
   transactionHash?: string;
   id?: string;
@@ -44,6 +65,7 @@ export class FirehoseDO implements DurableObject {
   private detectRunning = false;
   private detectOffset = 0;
   private detectBotsFound = 0;
+  private detectCryptoFiltered = 0;
   private detectWalletsScanned = 0;
   private detectTotalWallets = 0;
   private detectMinTrades = 1;
@@ -117,6 +139,7 @@ export class FirehoseDO implements DurableObject {
       this.detectTotalWallets = countRow?.cnt ?? 0;
       this.detectOffset = 0;
       this.detectBotsFound = 0;
+      this.detectCryptoFiltered = 0;
       this.detectWalletsScanned = 0;
       this.detectRunning = true;
       // Ensure alarm is running to process batches
@@ -186,6 +209,7 @@ export class FirehoseDO implements DurableObject {
   private detectProgress() {
     return {
       bots_found: this.detectBotsFound,
+      crypto_filtered: this.detectCryptoFiltered,
       wallets_scanned: this.detectWalletsScanned,
       total_wallets: this.detectTotalWallets,
     };
@@ -243,8 +267,37 @@ export class FirehoseDO implements DurableObject {
           copy_score?: number;
         }>;
       };
-      this.detectBotsFound += data.bots_found ?? 0;
       this.detectWalletsScanned += data.wallets_scanned ?? 0;
+
+      // Filter out bots that are predominantly crypto-hourly
+      // (tags come from the Python detector's category inference)
+      if (data.bots) {
+        const beforeCount = data.bots.length;
+        data.bots = data.bots.filter((b) => {
+          const tags = b.tags ?? [];
+          // If the only market category tag is "crypto" or "crypto markets",
+          // and the bot has no other category diversity, skip it
+          const catTags = tags.filter(
+            (t) =>
+              t === "crypto" ||
+              t === "crypto markets" ||
+              t === "politics" ||
+              t === "sports" ||
+              t === "pop culture" ||
+              t === "finance",
+          );
+          const hasCrypto =
+            catTags.includes("crypto") || catTags.includes("crypto markets");
+          const hasOther = catTags.some(
+            (t) => t !== "crypto" && t !== "crypto markets",
+          );
+          // Keep if: has non-crypto categories, OR has no crypto tags at all
+          if (hasCrypto && !hasOther) return false;
+          return true;
+        });
+        this.detectCryptoFiltered += beforeCount - data.bots.length;
+        this.detectBotsFound += data.bots.length;
+      }
 
       // Store detected bots in D1
       if (data.bots && data.bots.length > 0) {
@@ -307,6 +360,8 @@ export class FirehoseDO implements DurableObject {
       const id = item.transactionHash || item.id || "";
       if (!id || this.seenIds.has(id)) continue;
       this.seenIds.add(id);
+      // Skip crypto-hourly binary options — not copyable
+      if (item.title && isCryptoHourly(item.title)) continue;
       newTrades.push(item);
     }
 
@@ -420,33 +475,60 @@ export class FirehoseDO implements DurableObject {
       }
     }
 
-    // 2. Top market position holders
+    // 2. Top market position holders (general + category-specific)
+    // Fetch from both top-volume markets AND markets in desired categories
+    const marketConditionIds = new Set<string>();
+
+    // 2a. Top 20 by volume (but filter out crypto-hourly)
     try {
       const marketsResp = await fetch(
-        `${GAMMA_API}/markets?active=true&limit=20&order=volume24hr&ascending=false`,
+        `${GAMMA_API}/markets?active=true&limit=40&order=volume24hr&ascending=false`,
       );
       if (marketsResp.ok) {
-        const markets: Array<{ conditionId?: string }> =
+        const markets: Array<{ conditionId?: string; question?: string }> =
           await marketsResp.json();
         for (const m of markets) {
           if (!m.conditionId) continue;
-          try {
-            const posResp = await fetch(
-              `${DATA_API}/v1/market-positions?market=${m.conditionId}&limit=500&status=ALL`,
-            );
-            if (!posResp.ok) continue;
-            const positions: Array<{ proxyWallet?: string }> =
-              await posResp.json();
-            for (const p of positions) {
-              if (p.proxyWallet) wallets.add(p.proxyWallet);
-            }
-          } catch {
-            // skip
-          }
+          if (m.question && isCryptoHourly(m.question)) continue;
+          marketConditionIds.add(m.conditionId);
+          if (marketConditionIds.size >= 20) break;
         }
       }
     } catch {
       // skip
+    }
+
+    // 2b. Category-specific markets we want to find traders for
+    for (const tag of DESIRED_MARKET_TAGS) {
+      try {
+        const resp = await fetch(
+          `${GAMMA_API}/markets?active=true&limit=10&tag=${tag}&order=volume24hr&ascending=false`,
+        );
+        if (!resp.ok) continue;
+        const markets: Array<{ conditionId?: string; question?: string }> =
+          await resp.json();
+        for (const m of markets) {
+          if (m.conditionId) marketConditionIds.add(m.conditionId);
+        }
+      } catch {
+        // skip
+      }
+    }
+
+    // Fetch position holders for all collected markets
+    for (const conditionId of marketConditionIds) {
+      try {
+        const posResp = await fetch(
+          `${DATA_API}/v1/market-positions?market=${conditionId}&limit=500&status=ALL`,
+        );
+        if (!posResp.ok) continue;
+        const positions: Array<{ proxyWallet?: string }> = await posResp.json();
+        for (const p of positions) {
+          if (p.proxyWallet) wallets.add(p.proxyWallet);
+        }
+      } catch {
+        // skip
+      }
     }
 
     if (!wallets.size) return;
