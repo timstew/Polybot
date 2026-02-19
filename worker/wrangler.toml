@@ -29,7 +29,7 @@ new_classes = ["FirehoseDO"]
 
 # Python API (Cloud Run) — set after deploying Cloud Run
 [vars]
-PYTHON_API_URL = "https://polybot-api-182262919086.us-central1.run.app"
+PYTHON_API_URL = "https://polybot-api-182262919086.europe-west4.run.app"
 
 # Auto-start: runs every minute to ensure the listener is alive
 [triggers]

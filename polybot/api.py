@@ -558,13 +558,25 @@ def execute_real_trade(body: dict):
 
         clob_side = BUY if side == "BUY" else SELL
 
+        # Check order book depth before placing order
+        book = client.get_order_book(asset_id)
+        levels = book.asks if side == "BUY" else book.bids
+        available = sum(float(l.size) * float(l.price) for l in (levels or []))
+        if available < notional * 0.5:
+            return {
+                "status": "failed",
+                "error": f"Insufficient liquidity: ${available:.2f} available, need ${notional:.2f}",
+            }
+
         order = client.create_market_order(
             MarketOrderArgs(
                 token_id=asset_id,
                 amount=notional,
+                side=clob_side,
+                price=price,
             )
         )
-        resp = client.post_order(order, "FOK")
+        resp = client.post_order(order, "GTC")
 
         if resp.get("success") or resp.get("orderID"):
             logger.info(

@@ -145,10 +145,6 @@ export function calculateCopyTrade(
 
 // ── Poll cycle ─────────────────────────────────────────────────────
 
-// Minimum ms between copy trades on the same (wallet, market) pair.
-// Short cooldown to deduplicate near-simultaneous events from the activity API.
-const MARKET_COOLDOWN_MS = 60_000; // 1 minute
-
 async function executeRealTrade(
   pythonApiUrl: string,
   copy: CopyTrade,
@@ -323,7 +319,6 @@ async function handlePositionExit(
 export async function pollCycle(
   db: D1Database,
   seenIds: Set<string>,
-  lastCopy: Map<string, number>,
   pythonApiUrl?: string,
 ): Promise<number> {
   // Get active targets
@@ -334,7 +329,6 @@ export async function pollCycle(
   if (!targets || targets.length === 0) return 0;
 
   let newCount = 0;
-  const now = Date.now();
 
   for (const target of targets) {
     let activity: DataApiTrade[];
@@ -354,13 +348,6 @@ export async function pollCycle(
         event.activity_type === "REDEEM"
       ) {
         newCount += await handlePositionExit(db, event, target);
-        continue;
-      }
-
-      // Regular TRADE: apply intra-market cooldown
-      const cooldownKey = `${target.wallet}:${event.market}`;
-      const lastTs = lastCopy.get(cooldownKey);
-      if (lastTs !== undefined && now - lastTs < MARKET_COOLDOWN_MS) {
         continue;
       }
 
@@ -387,15 +374,16 @@ export async function pollCycle(
       }
 
       await insertCopyTrade(db, copy);
-      lastCopy.set(cooldownKey, now);
       newCount++;
     }
   }
 
-  // Prune seen IDs if too large
-  if (seenIds.size > 50_000) seenIds.clear();
-  // Prune stale cooldown entries
-  if (lastCopy.size > 10_000) lastCopy.clear();
+  // Prune seen IDs if too large (keep recent half)
+  if (seenIds.size > 50_000) {
+    const arr = Array.from(seenIds);
+    seenIds.clear();
+    for (let i = arr.length >> 1; i < arr.length; i++) seenIds.add(arr[i]);
+  }
 
   return newCount;
 }

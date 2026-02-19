@@ -304,7 +304,6 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
 
 export class CopyListenerDO implements DurableObject {
   private seenIds = new Set<string>();
-  private lastCopy = new Map<string, number>();
   private state: DurableObjectState;
   private env: Env;
   private pollCount = 0;
@@ -346,12 +345,7 @@ export class CopyListenerDO implements DurableObject {
 
   async alarm(): Promise<void> {
     try {
-      await pollCycle(
-        this.env.DB,
-        this.seenIds,
-        this.lastCopy,
-        this.env.PYTHON_API_URL,
-      );
+      await pollCycle(this.env.DB, this.seenIds, this.env.PYTHON_API_URL);
       this.pollCount++;
     } catch (e) {
       console.error("Poll cycle error:", e);
