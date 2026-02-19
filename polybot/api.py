@@ -570,15 +570,25 @@ def execute_real_trade(body: dict):
 
         # Use whatever the book can support, up to our desired notional
         order_notional = min(notional, available * 0.95)  # leave 5% margin
-        if order_notional < 0.01:
-            return {"status": "failed", "error": "Order too small after liquidity cap"}
+
+        # Polymarket minimums: $1 notional, 5 shares
+        min_shares = 5
+        min_notional = max(1.0, min_shares * price)
+        if order_notional < min_notional:
+            return {
+                "status": "failed",
+                "error": f"Below minimum: ${order_notional:.2f} < ${min_notional:.2f}",
+            }
+
+        # Round to allowed precision (4 decimal places for amounts)
+        order_notional = round(order_notional, 2)
 
         order = client.create_market_order(
             MarketOrderArgs(
                 token_id=asset_id,
                 amount=order_notional,
                 side=clob_side,
-                price=price,
+                price=round(price, 4),
             )
         )
         resp = client.post_order(order, "GTC")
