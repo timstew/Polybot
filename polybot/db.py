@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -485,7 +485,7 @@ class Database:
         self.conn.execute(
             """INSERT OR REPLACE INTO analyzed_wallets (wallet, analyzed_at, status)
                VALUES (?, ?, ?)""",
-            (wallet, datetime.utcnow().isoformat(), status),
+            (wallet, datetime.now(timezone.utc).isoformat(), status),
         )
         self.conn.commit()
 

@@ -24,7 +24,7 @@ npm run build:pages                             # static export for Cloudflare P
 npx wrangler pages deploy out --project-name polybot --branch main
 
 # Cloud Run (from repo root)
-gcloud run deploy polybot-api --source . --region us-central1 --allow-unauthenticated
+gcloud run deploy polybot-api --source . --region europe-west4 --allow-unauthenticated
 
 # E2E tests (from web/)
 npx playwright test                             # run all e2e tests
@@ -42,7 +42,7 @@ Polymarket APIs (Data API, Leaderboard API, Gamma API, CLOB API)
     │      ├── D1 "polybot": copy_targets, copy_trades, suspect_bots, firehose_trades, firehose_wallets
     │      └── Cron: auto-restarts both DOs every minute if not user-stopped
     │
-    ├──> Cloud Run / Python  (polybot-api-182262919086.us-central1.run.app)
+    ├──> Cloud Run / Python  (polybot-api-182262919086.europe-west4.run.app)
     │      ├── Bot detection engine (CPU-intensive signal analysis)
     │      ├── /api/detect/cloud: called BY the Worker for batch detection
     │      ├── /api/wallet/{address}: detailed wallet view with remote positions
@@ -166,12 +166,12 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 - **Market categories**: `classifyTitle()` in worker categorizes by title keywords → crypto/sports/politics/other.
 - **SPA routing on CF Pages**: `/wallet/[address]` uses `_redirects` rewrite to `/_spa/wallet` (extensionless). The build script moves the generated HTML out of `/wallet/` to avoid CF Pages near-miss 308 redirects.
 - **Cron auto-restart**: Worker cron runs every minute, restarts DOs if not user-stopped. `userStopped` flag persisted in DO storage.
-- **Copy sizing**: Paper=100% of source notional (no cap). Real=trade_pct% of source (capped at max_position_usd).
+- **Copy sizing**: Paper=100% of source notional (no cap). Real=trade_pct% of source (capped at max_position_usd). If `full_copy_below_usd` is set and the source trade notional is below that threshold, real trades are copied at 100% instead of trade_pct%.
 - **Continuous detection**: FirehoseDO processes 100 wallets per batch, calling Cloud Run `/api/detect/cloud` for analysis.
 
 ## Deployment Checklist
 
-1. **Cloud Run**: `gcloud run deploy polybot-api --source . --region us-central1 --allow-unauthenticated`
+1. **Cloud Run**: `gcloud run deploy polybot-api --source . --region europe-west4 --allow-unauthenticated --env-vars-file=/tmp/polybot-env.yaml` (see RUNBOOK.md for extracting env vars from previous revision — **never use `--set-env-vars` from .env**, it overwrites the private key)
 2. **Worker**: `cd worker && npx wrangler deploy`
 3. **Pages**: `cd web && npm run build:pages && npx wrangler pages deploy out --project-name polybot --branch main`
 4. **D1 schema changes**: `npx wrangler d1 execute polybot --remote --file=schema.sql` (or ALTER TABLE for migrations)

@@ -154,7 +154,7 @@ class CopyTrade(BaseModel):
     price: float
     size: float
     mode: CopyMode
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     status: str = "pending"  # pending, filled, failed
     pnl: float = 0.0
     # Execution details for realistic paper trading

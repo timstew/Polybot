@@ -978,6 +978,9 @@ def unified(
             "avg_market_burst": round(signals.avg_market_burst, 1),
             "max_market_burst": signals.max_market_burst,
             "market_concentration": round(signals.market_concentration, 2),
+            "efficiency": round(profit_all / vol * 100, 2)
+            if (vol := (p.get("volume_all") or r.total_volume_usd)) > 0
+            else 0,
             **{k: v for k, v in p.items() if k not in ("lb_pnl_pct", "volume_all")},
         }
         rows.append(row)
@@ -1011,6 +1014,7 @@ def unified(
                 "avg_market_burst": round(signals.avg_market_burst, 1),
                 "max_market_burst": signals.max_market_burst,
                 "market_concentration": round(signals.market_concentration, 2),
+                "efficiency": 0,
             }
         )
 

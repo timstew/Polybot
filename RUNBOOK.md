@@ -252,3 +252,16 @@ Multiple SELLs in the same poll cycle could each read the same DB position and a
 
 ### Minimum order sizes
 Polymarket requires: minimum 5 shares, minimum $1 notional. Orders below these thresholds are rejected.
+
+### full_copy_below_usd threshold
+When set on a copy target, trades with notional below this threshold are copied at 100% regardless of trade_pct. Trades above the threshold use the configured percentage. This prevents tiny trades from being sized down to below the minimum. **Caution**: many small trades copied at 100% can still drain the account if a bot makes dozens of sub-threshold trades on the same market. Consider pairing with a per-market capital cap.
+
+### Account draining from many small trades
+MuseumOfBees copied 98 sub-$20 trades at 100% on one market, totaling $699. The per-trade threshold was met but aggregate exposure was not capped. Future improvement: add per-market capital cap to the Worker.
+
+### Durable Object caching old code
+After deploying the Worker, the Durable Object may keep running old code. Restart it:
+```bash
+curl -s -X POST https://polybot-copy-listener.timstew.workers.dev/stop
+curl -s -X POST https://polybot-copy-listener.timstew.workers.dev/start
+```

@@ -109,13 +109,11 @@ export function calculateCopyTrade(
   // If full_copy_below_usd is set and source trade is below that threshold,
   // copy at 100% regardless of trade_pct (small trades aren't worth scaling down)
   const sourceNotional = trade.price * trade.size;
+  const fullCopyBelow = target.full_copy_below_usd ?? 0;
   let copyNotional: number;
   if (target.mode === "paper") {
     copyNotional = sourceNotional;
-  } else if (
-    target.full_copy_below_usd > 0 &&
-    sourceNotional <= target.full_copy_below_usd
-  ) {
+  } else if (fullCopyBelow > 0 && sourceNotional <= fullCopyBelow) {
     copyNotional = sourceNotional;
   } else {
     copyNotional = sourceNotional * (target.trade_pct / 100);
