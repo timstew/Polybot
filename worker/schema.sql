@@ -60,6 +60,38 @@ CREATE TABLE IF NOT EXISTS firehose_wallets (
     trade_count INTEGER NOT NULL DEFAULT 0
 );
 
+-- Watchlist: lightweight monitoring tier between detection and copy-trading
+CREATE TABLE IF NOT EXISTS watchlist (
+    wallet TEXT PRIMARY KEY,
+    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+    added_by TEXT NOT NULL DEFAULT 'user',
+    category TEXT NOT NULL DEFAULT 'unknown',
+    check_interval_min INTEGER NOT NULL DEFAULT 60,
+    last_checked TEXT,
+    notes TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS watchlist_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT NOT NULL,
+    snapshot_at TEXT NOT NULL DEFAULT (datetime('now')),
+    profit_1d REAL NOT NULL DEFAULT 0,
+    profit_7d REAL NOT NULL DEFAULT 0,
+    profit_30d REAL NOT NULL DEFAULT 0,
+    profit_all REAL NOT NULL DEFAULT 0,
+    volume_24h REAL NOT NULL DEFAULT 0,
+    win_rate REAL NOT NULL DEFAULT 0,
+    open_positions INTEGER NOT NULL DEFAULT 0,
+    active_markets INTEGER NOT NULL DEFAULT 0,
+    avg_trade_size REAL NOT NULL DEFAULT 0,
+    trades_24h INTEGER NOT NULL DEFAULT 0,
+    copy_score REAL NOT NULL DEFAULT 0,
+    positions_json TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchlist_snap_wallet ON watchlist_snapshots(wallet, snapshot_at);
+
 -- Detected bots from cloud scanning
 CREATE TABLE IF NOT EXISTS suspect_bots (
     wallet TEXT PRIMARY KEY,

@@ -269,6 +269,62 @@ export interface UnifiedResponse {
   limit: number;
 }
 
+export interface WatchlistLatest {
+  profit_1d: number;
+  profit_7d: number;
+  profit_30d: number;
+  profit_all: number;
+  volume_24h: number;
+  win_rate: number;
+  open_positions: number;
+  active_markets: number;
+  avg_trade_size: number;
+  trades_24h: number;
+  copy_score: number;
+  trend_7d: number | null;
+  snapshot_at: string;
+}
+
+export interface WatchlistEntry {
+  wallet: string;
+  username: string;
+  added_at: string;
+  added_by: string;
+  category: string;
+  check_interval_min: number;
+  last_checked: string | null;
+  notes: string;
+  latest: WatchlistLatest | null;
+}
+
+export interface WatchlistSnapshot {
+  id: number;
+  wallet: string;
+  snapshot_at: string;
+  profit_1d: number;
+  profit_7d: number;
+  profit_30d: number;
+  profit_all: number;
+  volume_24h: number;
+  win_rate: number;
+  open_positions: number;
+  active_markets: number;
+  avg_trade_size: number;
+  trades_24h: number;
+  copy_score: number;
+  positions_json: string;
+}
+
+export interface WatchlistPosition {
+  title: string;
+  outcome: string;
+  size: number;
+  avgPrice: number;
+  curPrice: number;
+  value: number;
+  pnl: number;
+}
+
 export const api = {
   stats: () => fetchJSON<Stats>("/api/stats"),
   bots: (minConfidence = 0) =>
@@ -371,4 +427,44 @@ export const api = {
     postJSON<{ status: string; wallet: string }>("/api/bots/undismiss", {
       wallet,
     }),
+
+  // Watchlist
+  watchlist: () => fetchJSON<WatchlistEntry[]>("/api/watchlist"),
+  watchlistAdd: (
+    wallet: string,
+    opts?: { notes?: string; category?: string; added_by?: string },
+  ) =>
+    postJSON<{
+      status: string;
+      wallet: string;
+      category: string;
+      username: string;
+      check_interval_min: number;
+    }>("/api/watchlist/add", { wallet, ...opts }),
+  watchlistRemove: (wallet: string) =>
+    postJSON<{ status: string; wallet: string }>("/api/watchlist/remove", {
+      wallet,
+    }),
+  watchlistPromote: (
+    wallet: string,
+    mode: "paper" | "real" = "paper",
+    opts?: { trade_pct?: number; max_position_usd?: number },
+  ) =>
+    postJSON<{ status: string; wallet: string; mode: string }>(
+      "/api/watchlist/promote",
+      { wallet, mode, ...opts },
+    ),
+  watchlistHistory: (wallet: string, limit = 100) =>
+    fetchJSON<WatchlistSnapshot[]>(
+      `/api/watchlist/${wallet}/history?limit=${limit}`,
+    ),
+  watchlistPositions: (wallet: string) =>
+    fetchJSON<WatchlistPosition[]>(`/api/watchlist/${wallet}/positions`),
+  watchlistStatus: () =>
+    fetchJSON<{
+      running: boolean;
+      userStopped: boolean;
+      lastRun: string | null;
+      walletsChecked: number;
+    }>("/api/watchlist/status"),
 };

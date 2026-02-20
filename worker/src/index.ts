@@ -2,6 +2,7 @@ import { pollCycle } from "./listener";
 import type { CopyTarget, CopyTrade, Env } from "./types";
 
 export { FirehoseDO } from "./firehose-do";
+export { WatchlistDO } from "./watchlist-do";
 
 // ── CORS ───────────────────────────────────────────────────────────
 
@@ -36,6 +37,16 @@ function jsonCors(data: unknown, request: Request, status = 200): Response {
     },
   });
 }
+
+// ── Category-specific check intervals for watchlist (minutes) ──────
+
+const CATEGORY_INTERVALS: Record<string, number> = {
+  crypto: 20,
+  sports: 90,
+  politics: 240,
+  finance: 120,
+  unknown: 60,
+};
 
 // ── Market category detection ──────────────────────────────────────
 
@@ -567,6 +578,259 @@ export default {
         },
         request,
       );
+    }
+
+    // ── Watchlist routes ───────────────────────────────────────────────
+
+    if (url.pathname === "/api/watchlist" && request.method === "GET") {
+      // List all watchlist entries with their latest snapshot
+      const { results: entries } = await env.DB.prepare(
+        `SELECT w.*,
+                s.profit_1d, s.profit_7d, s.profit_30d, s.profit_all,
+                s.volume_24h, s.win_rate, s.open_positions, s.active_markets,
+                s.avg_trade_size, s.trades_24h, s.copy_score, s.positions_json,
+                s.snapshot_at
+         FROM watchlist w
+         LEFT JOIN watchlist_snapshots s ON s.wallet = w.wallet
+           AND s.snapshot_at = (
+             SELECT MAX(s2.snapshot_at) FROM watchlist_snapshots s2
+             WHERE s2.wallet = w.wallet
+           )
+         ORDER BY w.added_at DESC`,
+      ).all<{
+        wallet: string;
+        added_at: string;
+        added_by: string;
+        category: string;
+        check_interval_min: number;
+        last_checked: string | null;
+        notes: string;
+        username: string;
+        profit_1d: number | null;
+        profit_7d: number | null;
+        profit_30d: number | null;
+        profit_all: number | null;
+        volume_24h: number | null;
+        win_rate: number | null;
+        open_positions: number | null;
+        active_markets: number | null;
+        avg_trade_size: number | null;
+        trades_24h: number | null;
+        copy_score: number | null;
+        positions_json: string | null;
+        snapshot_at: string | null;
+      }>();
+
+      // For trend calculation, get snapshot from ~7 days ago for each wallet
+      const wallets = (entries ?? []).map((e) => e.wallet);
+      const trends: Record<string, number> = {};
+      for (const w of wallets) {
+        const old = await env.DB.prepare(
+          `SELECT profit_all FROM watchlist_snapshots
+           WHERE wallet = ? AND snapshot_at <= datetime('now', '-7 days')
+           ORDER BY snapshot_at DESC LIMIT 1`,
+        )
+          .bind(w)
+          .first<{ profit_all: number }>();
+        if (old && old.profit_all !== 0) {
+          const current = entries?.find((e) => e.wallet === w)?.profit_all ?? 0;
+          trends[w] =
+            Math.round(
+              ((current - old.profit_all) / Math.abs(old.profit_all)) * 1000,
+            ) / 10;
+        }
+      }
+
+      const result = (entries ?? []).map((e) => ({
+        wallet: e.wallet,
+        username: e.username || "",
+        added_at: e.added_at,
+        added_by: e.added_by,
+        category: e.category,
+        check_interval_min: e.check_interval_min,
+        last_checked: e.last_checked,
+        notes: e.notes,
+        latest: e.snapshot_at
+          ? {
+              profit_1d: e.profit_1d ?? 0,
+              profit_7d: e.profit_7d ?? 0,
+              profit_30d: e.profit_30d ?? 0,
+              profit_all: e.profit_all ?? 0,
+              volume_24h: e.volume_24h ?? 0,
+              win_rate: e.win_rate ?? 0,
+              open_positions: e.open_positions ?? 0,
+              active_markets: e.active_markets ?? 0,
+              avg_trade_size: e.avg_trade_size ?? 0,
+              trades_24h: e.trades_24h ?? 0,
+              copy_score: e.copy_score ?? 0,
+              trend_7d: trends[e.wallet] ?? null,
+              snapshot_at: e.snapshot_at,
+            }
+          : null,
+      }));
+
+      return jsonCors(result, request);
+    }
+
+    if (url.pathname === "/api/watchlist/add" && request.method === "POST") {
+      const body = (await request.json()) as {
+        wallet: string;
+        notes?: string;
+        category?: string;
+        added_by?: string;
+      };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+
+      const category = body.category || "unknown";
+      const interval =
+        CATEGORY_INTERVALS[category] ?? CATEGORY_INTERVALS["unknown"];
+
+      // Try to fetch username
+      let username = "";
+      try {
+        const resp = await fetch(
+          `https://data-api.polymarket.com/activity?user=${w}&limit=1`,
+        );
+        if (resp.ok) {
+          const entries = (await resp.json()) as Array<{ name?: string }>;
+          const n = entries?.[0]?.name;
+          if (n && !n.startsWith("0x")) username = n;
+        }
+      } catch {
+        /* optional */
+      }
+
+      await env.DB.prepare(
+        `INSERT OR REPLACE INTO watchlist
+         (wallet, added_by, category, check_interval_min, notes, username)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+        .bind(
+          w,
+          body.added_by || "user",
+          category,
+          interval,
+          body.notes || "",
+          username,
+        )
+        .run();
+
+      // Ensure WatchlistDO is running
+      const wlId = env.WATCHLIST.idFromName("singleton");
+      const wlObj = env.WATCHLIST.get(wlId);
+      await wlObj.fetch(new Request("https://dummy/start", { method: "POST" }));
+
+      return jsonCors(
+        {
+          status: "added",
+          wallet: w,
+          category,
+          username,
+          check_interval_min: interval,
+        },
+        request,
+      );
+    }
+
+    if (url.pathname === "/api/watchlist/remove" && request.method === "POST") {
+      const body = (await request.json()) as { wallet: string };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM watchlist WHERE wallet = ?").bind(w),
+        env.DB.prepare("DELETE FROM watchlist_snapshots WHERE wallet = ?").bind(
+          w,
+        ),
+      ]);
+
+      return jsonCors({ status: "removed", wallet: w }, request);
+    }
+
+    if (
+      url.pathname === "/api/watchlist/promote" &&
+      request.method === "POST"
+    ) {
+      const body = (await request.json()) as {
+        wallet: string;
+        mode?: string;
+        trade_pct?: number;
+        max_position_usd?: number;
+      };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+
+      const mode = body.mode === "real" ? "real" : "paper";
+
+      // Get username from watchlist
+      const wlEntry = await env.DB.prepare(
+        "SELECT username FROM watchlist WHERE wallet = ?",
+      )
+        .bind(w)
+        .first<{ username: string }>();
+
+      await env.DB.prepare(
+        `INSERT OR REPLACE INTO copy_targets
+         (wallet, mode, trade_pct, max_position_usd, active,
+          total_paper_pnl, total_real_pnl,
+          slippage_bps, latency_ms, fee_rate, measured_slippage_bps, username)
+         VALUES (?, ?, ?, ?, 1, 0, 0, 50, 2000, 0, -1, ?)`,
+      )
+        .bind(
+          w,
+          mode,
+          body.trade_pct ?? 100,
+          body.max_position_usd ?? 10000,
+          wlEntry?.username || "",
+        )
+        .run();
+
+      return jsonCors({ status: "promoted", wallet: w, mode }, request);
+    }
+
+    // Watchlist history — snapshots over time for a wallet
+    const watchlistHistoryMatch = url.pathname.match(
+      /^\/api\/watchlist\/(0x[a-fA-F0-9]+)\/history$/,
+    );
+    if (watchlistHistoryMatch) {
+      const w = watchlistHistoryMatch[1].toLowerCase();
+      const limit = Number(url.searchParams.get("limit") ?? "100");
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM watchlist_snapshots
+         WHERE wallet = ?
+         ORDER BY snapshot_at DESC
+         LIMIT ?`,
+      )
+        .bind(w, limit)
+        .all();
+
+      return jsonCors(results ?? [], request);
+    }
+
+    // Watchlist positions — latest positions_json for a wallet
+    const watchlistPosMatch = url.pathname.match(
+      /^\/api\/watchlist\/(0x[a-fA-F0-9]+)\/positions$/,
+    );
+    if (watchlistPosMatch) {
+      const w = watchlistPosMatch[1].toLowerCase();
+      const snap = await env.DB.prepare(
+        `SELECT positions_json FROM watchlist_snapshots
+         WHERE wallet = ?
+         ORDER BY snapshot_at DESC LIMIT 1`,
+      )
+        .bind(w)
+        .first<{ positions_json: string }>();
+
+      return jsonCors(JSON.parse(snap?.positions_json || "[]"), request);
+    }
+
+    // Watchlist DO status
+    if (url.pathname === "/api/watchlist/status") {
+      const wlId = env.WATCHLIST.idFromName("singleton");
+      const wlObj = env.WATCHLIST.get(wlId);
+      const doResp = await wlObj.fetch(new Request("https://dummy/status"));
+      return jsonCors(await doResp.json(), request);
     }
 
     // ── Wallet detail (D1 bot data + copy trade FIFO + Polymarket positions)
@@ -1440,6 +1704,29 @@ export default {
       await firehoseObj.fetch(
         new Request("https://dummy/firehose/start", { method: "POST" }),
       );
+    }
+
+    // Auto-start watchlist DO (if there are entries)
+    try {
+      const wlCount = await env.DB.prepare(
+        "SELECT COUNT(*) as cnt FROM watchlist",
+      ).first<{ cnt: number }>();
+      if (wlCount && wlCount.cnt > 0) {
+        const wlId = env.WATCHLIST.idFromName("singleton");
+        const wlObj = env.WATCHLIST.get(wlId);
+        const wlResp = await wlObj.fetch(new Request("https://dummy/status"));
+        const wlStatus = (await wlResp.json()) as {
+          running: boolean;
+          userStopped?: boolean;
+        };
+        if (!wlStatus.running && !wlStatus.userStopped) {
+          await wlObj.fetch(
+            new Request("https://dummy/start", { method: "POST" }),
+          );
+        }
+      }
+    } catch {
+      // watchlist table might not exist yet
     }
   },
 };
