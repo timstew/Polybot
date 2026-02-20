@@ -489,60 +489,82 @@ export default {
 
     if (url.pathname === "/api/unified") {
       // Return detected bots from D1 with profitability data
-      const top = Math.min(Number(url.searchParams.get("top") ?? "200"), 500);
+      // Supports pagination: offset (default 0), limit (default 50, max 500)
+      const offset = Math.max(Number(url.searchParams.get("offset") ?? "0"), 0);
+      const limit = Math.min(
+        Math.max(Number(url.searchParams.get("limit") ?? "50"), 1),
+        500,
+      );
+
+      type SuspectBotRow = {
+        wallet: string;
+        confidence: number;
+        category: string;
+        trade_count: number;
+        tags: string;
+        pnl_pct: number;
+        realized_pnl: number;
+        win_rate: number;
+        total_volume_usd: number;
+        profit_1d: number;
+        profit_7d: number;
+        profit_30d: number;
+        profit_all: number;
+        username: string;
+        copy_score: number;
+      };
+
+      // Get total count for pagination
+      const countResult = await env.DB.prepare(
+        "SELECT COUNT(*) as total FROM suspect_bots",
+      ).first<{ total: number }>();
+      const total = countResult?.total ?? 0;
+
       const { results } = await env.DB.prepare(
-        "SELECT * FROM suspect_bots ORDER BY confidence DESC LIMIT ?",
+        "SELECT * FROM suspect_bots ORDER BY copy_score DESC, confidence DESC LIMIT ? OFFSET ?",
       )
-        .bind(top)
-        .all<{
-          wallet: string;
-          confidence: number;
-          category: string;
-          trade_count: number;
-          tags: string;
-          pnl_pct: number;
-          realized_pnl: number;
-          win_rate: number;
-          total_volume_usd: number;
-          profit_1d: number;
-          profit_7d: number;
-          profit_30d: number;
-          profit_all: number;
-          username: string;
-          copy_score: number;
-        }>();
+        .bind(limit, offset)
+        .all<SuspectBotRow>();
+
+      function mapBotRow(r: SuspectBotRow) {
+        const vol = r.total_volume_usd || 0;
+        const pall = r.profit_all || 0;
+        return {
+          wallet: r.wallet,
+          confidence: r.confidence,
+          category: r.category,
+          trade_count: r.trade_count,
+          tags: JSON.parse(r.tags || "[]"),
+          username: r.username || "",
+          pnl_pct: r.pnl_pct || 0,
+          realized_pnl: r.realized_pnl || 0,
+          unrealized_pnl: 0,
+          win_rate: r.win_rate || 0,
+          total_volume_usd: vol,
+          active_positions: 0,
+          portfolio_value: pall,
+          market_categories: [],
+          copy_score: r.copy_score ?? 0,
+          avg_hold_time_hours: 0,
+          trades_per_market: 0,
+          avg_market_burst: 0,
+          max_market_burst: 0,
+          market_concentration: 0,
+          profit_1d: r.profit_1d || 0,
+          profit_7d: r.profit_7d || 0,
+          profit_30d: r.profit_30d || 0,
+          profit_all: pall,
+          efficiency: vol > 0 ? Math.round((pall / vol) * 10000) / 100 : 0,
+        };
+      }
+
       return jsonCors(
-        (results ?? []).map((r) => {
-          const vol = r.total_volume_usd || 0;
-          const pall = r.profit_all || 0;
-          return {
-            wallet: r.wallet,
-            confidence: r.confidence,
-            category: r.category,
-            trade_count: r.trade_count,
-            tags: JSON.parse(r.tags || "[]"),
-            username: r.username || "",
-            pnl_pct: r.pnl_pct || 0,
-            realized_pnl: r.realized_pnl || 0,
-            unrealized_pnl: 0,
-            win_rate: r.win_rate || 0,
-            total_volume_usd: vol,
-            active_positions: 0,
-            portfolio_value: pall,
-            market_categories: [],
-            copy_score: r.copy_score ?? 0,
-            avg_hold_time_hours: 0,
-            trades_per_market: 0,
-            avg_market_burst: 0,
-            max_market_burst: 0,
-            market_concentration: 0,
-            profit_1d: r.profit_1d || 0,
-            profit_7d: r.profit_7d || 0,
-            profit_30d: r.profit_30d || 0,
-            profit_all: pall,
-            efficiency: vol > 0 ? Math.round((pall / vol) * 10000) / 100 : 0,
-          };
-        }),
+        {
+          bots: (results ?? []).map(mapBotRow),
+          total,
+          offset,
+          limit,
+        },
         request,
       );
     }

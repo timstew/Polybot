@@ -262,6 +262,13 @@ export interface CopyDetailData {
   missed_positions: CopyMissedPosition[];
 }
 
+export interface UnifiedResponse {
+  bots: UnifiedBotRow[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 export const api = {
   stats: () => fetchJSON<Stats>("/api/stats"),
   bots: (minConfidence = 0) =>
@@ -270,11 +277,15 @@ export const api = {
     fetchJSON<RankRow[]>(
       `/api/rank?top=${top}&min_confidence=${minConfidence}&sort_by=${sortBy}`,
     ),
-  unified: async (top = 30, minConfidence = 0, sortBy = "pnl_pct") => {
-    const data = await fetchJSON<UnifiedBotRow[] | unknown>(
-      `/api/unified?top=${top}&min_confidence=${minConfidence}&sort_by=${sortBy}`,
+  unified: async (limit = 50, offset = 0): Promise<UnifiedResponse> => {
+    const data = await fetchJSON<UnifiedResponse | UnifiedBotRow[]>(
+      `/api/unified?limit=${limit}&offset=${offset}`,
     );
-    return Array.isArray(data) ? data : [];
+    // Handle both old (array) and new (object) response shapes
+    if (Array.isArray(data)) {
+      return { bots: data, total: data.length, offset: 0, limit: data.length };
+    }
+    return data;
   },
   detect: (minTrades = 1) =>
     postJSON<{
