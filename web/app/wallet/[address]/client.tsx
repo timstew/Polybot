@@ -31,8 +31,20 @@ import {
   BarChart3,
   Bot,
   UserPlus,
+  Activity,
+  Search,
+  Eye,
 } from "lucide-react";
-import { api, type WalletDetail, type TradeRow, type Stats } from "@/lib/api";
+import { WalletLink } from "@/components/wallet-link";
+import { CategoryBadge } from "@/components/category-badge";
+import {
+  api,
+  type WalletDetail,
+  type TradeRow,
+  type Stats,
+  type StrategyAnalysis,
+  type SimilarBot,
+} from "@/lib/api";
 
 function Tip({ children, text }: { children: React.ReactNode; text: string }) {
   return (
@@ -79,6 +91,430 @@ const tagDescriptions: Record<string, string> = {
   "pop culture": "Trades in pop culture prediction markets",
   "crypto markets": "Trades in crypto-specific markets",
 };
+
+// ── Activity Heatmap ───────────────────────────────────────────────
+
+const DOW_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+function ActivityHeatmap({ data }: { data: number[][] }) {
+  // data is 24x7 (hour x day-of-week)
+  const max = Math.max(1, ...data.flat());
+  return (
+    <div className="overflow-x-auto">
+      <div
+        className="inline-grid gap-px"
+        style={{ gridTemplateColumns: `40px repeat(7, 1fr)` }}
+      >
+        {/* Header row */}
+        <div />
+        {DOW_LABELS.map((d) => (
+          <div
+            key={d}
+            className="text-center text-[10px] text-muted-foreground px-1"
+          >
+            {d}
+          </div>
+        ))}
+        {/* Data rows */}
+        {Array.from({ length: 24 }, (_, h) => (
+          <>
+            <div
+              key={`h-${h}`}
+              className="text-right text-[10px] text-muted-foreground pr-2 leading-[18px]"
+            >
+              {h.toString().padStart(2, "0")}:00
+            </div>
+            {Array.from({ length: 7 }, (_, d) => {
+              const val = data[h]?.[d] ?? 0;
+              const intensity = val / max;
+              const bg =
+                intensity === 0
+                  ? "bg-muted/30"
+                  : intensity < 0.25
+                    ? "bg-emerald-100"
+                    : intensity < 0.5
+                      ? "bg-emerald-300"
+                      : intensity < 0.75
+                        ? "bg-emerald-500"
+                        : "bg-emerald-700";
+              return (
+                <Tooltip key={`${h}-${d}`}>
+                  <TooltipTrigger asChild>
+                    <div
+                      className={`h-[18px] min-w-[28px] rounded-sm ${bg} cursor-help`}
+                    />
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {DOW_LABELS[d]} {h}:00 UTC — {val} trades
+                  </TooltipContent>
+                </Tooltip>
+              );
+            })}
+          </>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Hold Time Chart ────────────────────────────────────────────────
+
+function HoldTimeChart({ data }: { data: Record<string, number> }) {
+  const entries = Object.entries(data).filter(([, v]) => v > 0);
+  if (entries.length === 0)
+    return <p className="text-sm text-muted-foreground">No hold time data</p>;
+  const max = Math.max(1, ...entries.map(([, v]) => v));
+  return (
+    <div className="space-y-1">
+      {entries.map(([label, count]) => (
+        <div key={label} className="flex items-center gap-2">
+          <span className="w-16 text-right text-xs text-muted-foreground">
+            {label}
+          </span>
+          <div className="flex-1 h-5 bg-muted/30 rounded-sm overflow-hidden">
+            <div
+              className="h-full bg-blue-500 rounded-sm"
+              style={{ width: `${(count / max) * 100}%` }}
+            />
+          </div>
+          <span className="w-10 text-right text-xs font-mono">{count}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Strategy Section ───────────────────────────────────────────────
+
+function StrategySection({ address }: { address: string }) {
+  const [strategy, setStrategy] = useState<StrategyAnalysis | null>(null);
+  const [similar, setSimilar] = useState<SimilarBot[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadStrategy = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [strat, sim] = await Promise.all([
+        api.walletStrategy(address),
+        api.similarBots(address, 10),
+      ]);
+      setStrategy(strat);
+      setSimilar(sim.similar);
+      setLoaded(true);
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "Failed to load strategy analysis",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [address]);
+
+  const addToWatchlist = async (wallet: string) => {
+    try {
+      await api.watchlistAdd(wallet);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  if (!loaded && !loading) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm font-medium">
+            <Activity className="h-4 w-4" />
+            Strategy Analysis
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Button onClick={loadStrategy} variant="outline" size="sm">
+            <Search className="mr-1.5 h-3.5 w-3.5" />
+            Analyze Trading Strategy
+          </Button>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Deep-dive into trading patterns, market categories, hold times, and
+            find similar bots.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (loading) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm font-medium">
+            <Activity className="h-4 w-4 animate-pulse" />
+            Analyzing Strategy...
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2">
+            <Skeleton className="h-6 w-3/4" />
+            <Skeleton className="h-40 w-full" />
+            <Skeleton className="h-20 w-full" />
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (error) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm font-medium text-red-500">
+            <Activity className="h-4 w-4" />
+            Strategy Analysis Failed
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-red-500">{error}</p>
+          <Button
+            onClick={loadStrategy}
+            variant="outline"
+            size="sm"
+            className="mt-2"
+          >
+            Retry
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!strategy) return null;
+
+  // Build key insights text
+  const topCat = strategy.category_breakdown[0];
+  const quietStart = strategy.quiet_window.start_hour_utc;
+  const quietEnd = strategy.quiet_window.end_hour_utc;
+  const tz = strategy.quiet_window.timezone_guess;
+  const holdBuckets = Object.entries(strategy.hold_times);
+  const topHold = holdBuckets.sort((a, b) => b[1] - a[1])[0];
+
+  return (
+    <div className="space-y-4">
+      {/* Key Insights */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm font-medium">
+            <Activity className="h-4 w-4" />
+            Strategy Analysis
+            <span className="text-xs font-normal text-muted-foreground">
+              ({strategy.total_trades} trades analyzed)
+            </span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="rounded-lg bg-muted/50 p-3 text-sm space-y-1">
+            {topCat && (
+              <p>
+                Best performance in <strong>{topCat.category}</strong> category
+                ({fmtUsd(topCat.pnl)} P&L, {(topCat.win_rate * 100).toFixed(0)}%
+                win rate, {topCat.trade_count} trades).
+              </p>
+            )}
+            {quietStart !== quietEnd && (
+              <p>
+                Quiet window: {quietStart}:00 - {quietEnd}:00 UTC
+                {tz && ` (likely ${tz})`}.
+              </p>
+            )}
+            {topHold && (
+              <p>
+                Most common hold time: <strong>{topHold[0]}</strong> (
+                {topHold[1]} trades).
+                {strategy.entry_exit.avg_loss_exit_time_min > 0 && (
+                  <>
+                    {" "}
+                    Cuts losses in avg{" "}
+                    {strategy.entry_exit.avg_loss_exit_time_min.toFixed(0)} min,
+                    holds winners for{" "}
+                    {strategy.entry_exit.avg_win_exit_time_min.toFixed(0)} min.
+                  </>
+                )}
+              </p>
+            )}
+            {strategy.side_analysis.both_sides_pct > 0.1 && (
+              <p>
+                Trades both sides in{" "}
+                {(strategy.side_analysis.both_sides_pct * 100).toFixed(0)}% of
+                markets. Net{" "}
+                {strategy.side_analysis.net_long_bias > 0.55
+                  ? "long"
+                  : strategy.side_analysis.net_long_bias < 0.45
+                    ? "short"
+                    : "neutral"}{" "}
+                bias ({(strategy.side_analysis.net_long_bias * 100).toFixed(0)}%
+                long).
+              </p>
+            )}
+            <p>
+              Typical trade size: ${strategy.sizing.median.toFixed(2)} median ($
+              {strategy.sizing.p25.toFixed(2)} - $
+              {strategy.sizing.p75.toFixed(2)} interquartile).
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        {/* Activity Heatmap */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">
+              Activity Heatmap (UTC)
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ActivityHeatmap data={strategy.active_hours} />
+          </CardContent>
+        </Card>
+
+        {/* Hold Time Distribution */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">
+              Hold Time Distribution
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <HoldTimeChart data={strategy.hold_times} />
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Category Breakdown */}
+      {strategy.category_breakdown.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">
+              Category P&L Breakdown
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Category</TableHead>
+                  <TableHead className="text-right">P&L</TableHead>
+                  <TableHead className="text-right">Win %</TableHead>
+                  <TableHead className="text-right">Trades</TableHead>
+                  <TableHead className="text-right">Volume</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {strategy.category_breakdown.map((c) => (
+                  <TableRow key={c.category}>
+                    <TableCell>
+                      <CategoryBadge category={c.category} />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <PnlCell value={c.pnl} />
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      {(c.win_rate * 100).toFixed(1)}%
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      {c.trade_count}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      {fmtUsd(c.volume)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Similar Bots */}
+      {similar.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">
+              Similar Bots ({similar.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Wallet</TableHead>
+                  <TableHead className="text-right">Similarity</TableHead>
+                  <TableHead>Category</TableHead>
+                  <TableHead className="text-right">P&L</TableHead>
+                  <TableHead className="text-right">Win %</TableHead>
+                  <TableHead className="text-right">Score</TableHead>
+                  <TableHead></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {similar.map((bot) => (
+                  <TableRow key={bot.wallet}>
+                    <TableCell>
+                      <WalletLink
+                        address={bot.wallet}
+                        username={bot.username}
+                      />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <span
+                        className={`font-mono text-sm ${
+                          bot.similarity >= 70
+                            ? "text-emerald-600 font-bold"
+                            : bot.similarity >= 50
+                              ? "text-amber-600"
+                              : "text-muted-foreground"
+                        }`}
+                      >
+                        {bot.similarity.toFixed(1)}%
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <CategoryBadge category={bot.category} />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <PnlCell value={bot.profit_all} />
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      {(bot.win_rate * 100).toFixed(1)}%
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-sm">
+                      {bot.copy_score.toFixed(0)}
+                    </TableCell>
+                    <TableCell>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6"
+                            onClick={() => addToWatchlist(bot.wallet)}
+                          >
+                            <Eye className="h-3 w-3" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Add to watchlist</TooltipContent>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
 
 export default function WalletPageClient() {
   const { address } = useParams<{ address: string }>();
@@ -570,6 +1006,9 @@ export default function WalletPageClient() {
                 </CardContent>
               </Card>
             )}
+
+            {/* Strategy Analysis Section */}
+            <StrategySection address={address} />
 
             <Separator />
 

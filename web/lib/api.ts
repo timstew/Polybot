@@ -269,6 +269,67 @@ export interface UnifiedResponse {
   limit: number;
 }
 
+export interface CategoryBreakdown {
+  category: string;
+  pnl: number;
+  win_rate: number;
+  volume: number;
+  trade_count: number;
+}
+
+export interface StrategyAnalysis {
+  wallet: string;
+  username: string;
+  analysis_time: string;
+  total_trades: number;
+  active_hours: number[][]; // 24x7 heatmap
+  active_hours_utc: number[];
+  quiet_window: {
+    start_hour_utc: number;
+    end_hour_utc: number;
+    timezone_guess: string;
+  };
+  category_breakdown: CategoryBreakdown[];
+  sizing: {
+    median: number;
+    p25: number;
+    p75: number;
+    max: number;
+    count: number;
+  };
+  hold_times: Record<string, number>;
+  hold_time_median_min: number;
+  entry_exit: {
+    avg_loss_exit_time_min: number;
+    avg_win_exit_time_min: number;
+    total_closed_trades: number;
+  };
+  side_analysis: {
+    both_sides_pct: number;
+    net_long_bias: number;
+    markets_traded: number;
+  };
+  profits: {
+    profit_1d: number;
+    profit_7d: number;
+    profit_30d: number;
+    profit_all: number;
+  };
+  open_positions: number;
+}
+
+export interface SimilarBot {
+  wallet: string;
+  username: string;
+  similarity: number;
+  category: string;
+  categories: string[];
+  win_rate: number;
+  profit_all: number;
+  copy_score: number;
+  trade_count: number;
+}
+
 export interface WatchlistLatest {
   profit_1d: number;
   profit_7d: number;
@@ -427,6 +488,14 @@ export const api = {
     postJSON<{ status: string; wallet: string }>("/api/bots/undismiss", {
       wallet,
     }),
+
+  // Strategy analysis
+  walletStrategy: (address: string) =>
+    fetchJSON<StrategyAnalysis>(`/api/wallet/${address}/strategy`),
+  similarBots: (address: string, top = 20) =>
+    fetchJSON<{ reference: string; similar: SimilarBot[] }>(
+      `/api/bots/similar/${address}?top=${top}`,
+    ),
 
   // Watchlist
   watchlist: () => fetchJSON<WatchlistEntry[]>("/api/watchlist"),

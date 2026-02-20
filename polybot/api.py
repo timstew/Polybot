@@ -20,6 +20,7 @@ from polybot.firehose import fetch_asset_trades, fetch_wallet_trades, listen_tra
 from polybot.models import BotSignals, CopyMode
 from polybot.profitability import ProfitabilityTracker
 from polybot.slippage import SlippageTracker
+from polybot.strategy import analyze_strategy, find_similar_bots
 
 logger = logging.getLogger(__name__)
 
@@ -1465,3 +1466,70 @@ def copy_trades(wallet: str = Query(""), limit: int = Query(200, ge=1, le=1000))
         }
         for ct in trades
     ]
+
+
+# ── Strategy analysis ───────────────────────────────────────────────
+
+# In-memory cache for strategy analysis (wallet -> (result, timestamp))
+_strategy_cache: dict[str, tuple[dict, float]] = {}
+_STRATEGY_CACHE_TTL = 600  # 10 minutes
+
+
+@app.get("/api/wallet/{address}/strategy")
+def wallet_strategy(address: str):
+    """Deep strategy analysis for a wallet."""
+    w = address.lower()
+
+    # Check cache
+    cached = _strategy_cache.get(w)
+    if cached and (time.time() - cached[1]) < _STRATEGY_CACHE_TTL:
+        return cached[0]
+
+    result = analyze_strategy(w)
+    _strategy_cache[w] = (result, time.time())
+    return result
+
+
+@app.get("/api/bots/similar/{address}")
+def similar_bots(address: str, top: int = Query(20, ge=1, le=50)):
+    """Find bots with similar trading strategies."""
+    w = address.lower()
+
+    # Get or compute reference analysis
+    cached = _strategy_cache.get(w)
+    if cached and (time.time() - cached[1]) < _STRATEGY_CACHE_TTL:
+        ref = cached[0]
+    else:
+        ref = analyze_strategy(w)
+        _strategy_cache[w] = (ref, time.time())
+
+    # Get all detected bots as candidates
+    db = _db()
+    suspects = db.get_suspect_bots(min_confidence=0.0)
+    db.close()
+
+    candidates = []
+    for s in suspects:
+        tags = s.tags if isinstance(s.tags, list) else []
+        candidates.append(
+            {
+                "wallet": s.wallet,
+                "username": getattr(s, "username", ""),
+                "category": s.category.value
+                if hasattr(s.category, "value")
+                else str(s.category),
+                "categories": tags,
+                "win_rate": getattr(s, "win_rate", 0) or 0,
+                "volume_all": getattr(s, "total_volume_usd", 0) or 0,
+                "profit_all": getattr(s, "profit_all", 0) or 0,
+                "copy_score": getattr(s, "copy_score", 0) or 0,
+                "trade_count": s.signals.trade_count if s.signals else 0,
+                # These would come from strategy_profiles cache in D1 (future)
+                "active_hours_utc": [],
+                "median_hold_min": 0,
+                "trades_per_day": 0,
+            }
+        )
+
+    results = find_similar_bots(ref, candidates, top=top)
+    return {"reference": w, "similar": results}
