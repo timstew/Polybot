@@ -596,29 +596,74 @@ export default {
 
     if (url.pathname === "/api/firehose/cleanup" && request.method === "POST") {
       const fdb = env.FIREHOSE_DB ?? env.DB;
-      const tradeResult = await fdb
-        .prepare(
-          `DELETE FROM firehose_trades WHERE taker NOT IN (
-             SELECT wallet FROM suspect_bots
-             UNION SELECT wallet FROM copy_targets
-             UNION SELECT wallet FROM watchlist
-           )`,
-        )
-        .run();
-      const walletResult = await fdb
-        .prepare(
-          `DELETE FROM firehose_wallets WHERE wallet NOT IN (
-             SELECT wallet FROM suspect_bots
-             UNION SELECT wallet FROM copy_targets
-             UNION SELECT wallet FROM watchlist
-           )`,
-        )
-        .run();
+      const BATCH = 50_000;
+      let tradesDeleted = 0;
+      let walletsDeleted = 0;
+
+      // Step 1: Delete old trades (> 3 days) in batches — fastest path
+      for (;;) {
+        const r = await fdb
+          .prepare(
+            `DELETE FROM firehose_trades WHERE rowid IN (
+               SELECT rowid FROM firehose_trades
+               WHERE timestamp < datetime('now', '-3 days')
+               LIMIT ?
+             )`,
+          )
+          .bind(BATCH)
+          .run();
+        const changed = r.meta?.changes ?? 0;
+        tradesDeleted += changed;
+        if (changed < BATCH) break;
+      }
+
+      // Step 2: Delete non-bot trades in batches
+      for (;;) {
+        const r = await fdb
+          .prepare(
+            `DELETE FROM firehose_trades WHERE rowid IN (
+               SELECT rowid FROM firehose_trades
+               WHERE taker NOT IN (
+                 SELECT wallet FROM suspect_bots
+                 UNION SELECT wallet FROM copy_targets
+                 UNION SELECT wallet FROM watchlist
+               )
+               LIMIT ?
+             )`,
+          )
+          .bind(BATCH)
+          .run();
+        const changed = r.meta?.changes ?? 0;
+        tradesDeleted += changed;
+        if (changed < BATCH) break;
+      }
+
+      // Step 3: Delete non-bot wallets in batches
+      for (;;) {
+        const r = await fdb
+          .prepare(
+            `DELETE FROM firehose_wallets WHERE rowid IN (
+               SELECT rowid FROM firehose_wallets
+               WHERE wallet NOT IN (
+                 SELECT wallet FROM suspect_bots
+                 UNION SELECT wallet FROM copy_targets
+                 UNION SELECT wallet FROM watchlist
+               )
+               LIMIT ?
+             )`,
+          )
+          .bind(BATCH)
+          .run();
+        const changed = r.meta?.changes ?? 0;
+        walletsDeleted += changed;
+        if (changed < BATCH) break;
+      }
+
       return jsonCors(
         {
           status: "cleaned",
-          trades_deleted: tradeResult.meta?.changes ?? 0,
-          wallets_deleted: walletResult.meta?.changes ?? 0,
+          trades_deleted: tradesDeleted,
+          wallets_deleted: walletsDeleted,
         },
         request,
       );

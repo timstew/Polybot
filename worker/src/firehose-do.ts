@@ -237,28 +237,51 @@ export class FirehoseDO implements DurableObject {
         `Detection complete: ${this.detectBotsFound} bots from ${this.detectWalletsScanned} wallets`,
       );
 
-      // Post-detection cleanup: prune trades/wallets for non-bot, non-tracked wallets
+      // Post-detection cleanup: prune trades/wallets for non-bot, non-tracked wallets (batched)
       try {
-        const deleted = await this.fdb
-          .prepare(
-            `DELETE FROM firehose_trades WHERE taker NOT IN (
-               SELECT wallet FROM suspect_bots
-               UNION SELECT wallet FROM copy_targets
-               UNION SELECT wallet FROM watchlist
-             )`,
-          )
-          .run();
-        const walletDeleted = await this.fdb
-          .prepare(
-            `DELETE FROM firehose_wallets WHERE wallet NOT IN (
-               SELECT wallet FROM suspect_bots
-               UNION SELECT wallet FROM copy_targets
-               UNION SELECT wallet FROM watchlist
-             )`,
-          )
-          .run();
+        const BATCH = 50_000;
+        let totalTrades = 0;
+        let totalWallets = 0;
+        for (;;) {
+          const r = await this.fdb
+            .prepare(
+              `DELETE FROM firehose_trades WHERE rowid IN (
+                 SELECT rowid FROM firehose_trades
+                 WHERE taker NOT IN (
+                   SELECT wallet FROM suspect_bots
+                   UNION SELECT wallet FROM copy_targets
+                   UNION SELECT wallet FROM watchlist
+                 )
+                 LIMIT ?
+               )`,
+            )
+            .bind(BATCH)
+            .run();
+          const changed = r.meta?.changes ?? 0;
+          totalTrades += changed;
+          if (changed < BATCH) break;
+        }
+        for (;;) {
+          const r = await this.fdb
+            .prepare(
+              `DELETE FROM firehose_wallets WHERE rowid IN (
+                 SELECT rowid FROM firehose_wallets
+                 WHERE wallet NOT IN (
+                   SELECT wallet FROM suspect_bots
+                   UNION SELECT wallet FROM copy_targets
+                   UNION SELECT wallet FROM watchlist
+                 )
+                 LIMIT ?
+               )`,
+            )
+            .bind(BATCH)
+            .run();
+          const changed = r.meta?.changes ?? 0;
+          totalWallets += changed;
+          if (changed < BATCH) break;
+        }
         console.log(
-          `[CLEANUP] Pruned ${deleted.meta?.changes ?? 0} non-bot trades, ${walletDeleted.meta?.changes ?? 0} non-bot wallets`,
+          `[CLEANUP] Pruned ${totalTrades} non-bot trades, ${totalWallets} non-bot wallets`,
         );
       } catch (e) {
         console.error("[CLEANUP] Post-detection prune failed:", e);
@@ -462,13 +485,22 @@ export class FirehoseDO implements DurableObject {
       await this.fdb.batch(batch.slice(i, i + 100));
     }
 
-    // Retention pruning: delete firehose_trades older than 3 days
+    // Retention pruning: delete firehose_trades older than 3 days (batched)
     try {
-      await this.fdb
-        .prepare(
-          "DELETE FROM firehose_trades WHERE timestamp < datetime('now', '-3 days')",
-        )
-        .run();
+      const BATCH = 50_000;
+      for (;;) {
+        const r = await this.fdb
+          .prepare(
+            `DELETE FROM firehose_trades WHERE rowid IN (
+               SELECT rowid FROM firehose_trades
+               WHERE timestamp < datetime('now', '-3 days')
+               LIMIT ?
+             )`,
+          )
+          .bind(BATCH)
+          .run();
+        if ((r.meta?.changes ?? 0) < BATCH) break;
+      }
     } catch {
       // non-critical
     }
