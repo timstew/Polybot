@@ -619,62 +619,96 @@ export default function DashboardPage() {
                 tip="Wallets being copy-traded"
               />
 
-              {stats && (stats.db_ops || stats.db_firehose) && (
-                <>
-                  <Separator orientation="vertical" className="h-6" />
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <div className="flex items-center gap-1.5 cursor-help text-xs text-muted-foreground">
-                        <Database className="h-3 w-3" />
-                        <span className="tabular-nums">
-                          {(
-                            (stats.db_ops?.size_mb ?? 0) +
-                            (stats.db_firehose?.size_mb ?? 0)
-                          ).toFixed(1)}{" "}
-                          MB / 1,000 MB
-                        </span>
-                      </div>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom">
-                      <div className="space-y-1.5 text-xs">
-                        {stats.db_ops && (
-                          <div>
-                            <div className="font-medium">
-                              Ops DB: {stats.db_ops.size_mb ?? 0} MB / 500 MB
-                            </div>
-                            <div className="text-muted-foreground">
-                              {Object.entries(stats.db_ops)
-                                .filter(([t]) => t !== "size_mb")
-                                .map(
-                                  ([t, c]) =>
-                                    `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
-                                )
-                                .join(", ")}
-                            </div>
+              {stats &&
+                (stats.db_ops || stats.db_firehose) &&
+                (() => {
+                  const isSplit = stats.db_split;
+                  const totalMb = isSplit
+                    ? (stats.db_ops?.size_mb ?? 0) +
+                      (stats.db_firehose?.size_mb ?? 0)
+                    : (stats.db_ops?.size_mb ?? 0);
+                  const maxMb = isSplit ? 1000 : 500;
+                  return (
+                    <>
+                      <Separator orientation="vertical" className="h-6" />
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <div className="flex items-center gap-1.5 cursor-help text-xs text-muted-foreground">
+                            <Database className="h-3 w-3" />
+                            <span className="tabular-nums">
+                              {totalMb.toFixed(1)} MB / {maxMb.toLocaleString()}{" "}
+                              MB
+                            </span>
                           </div>
-                        )}
-                        {stats.db_firehose && (
-                          <div>
-                            <div className="font-medium">
-                              Firehose DB: {stats.db_firehose.size_mb ?? 0} MB /
-                              500 MB
-                            </div>
-                            <div className="text-muted-foreground">
-                              {Object.entries(stats.db_firehose)
-                                .filter(([t]) => t !== "size_mb")
-                                .map(
-                                  ([t, c]) =>
-                                    `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
-                                )
-                                .join(", ")}
-                            </div>
+                        </TooltipTrigger>
+                        <TooltipContent side="bottom">
+                          <div className="space-y-1.5 text-xs">
+                            {isSplit ? (
+                              <>
+                                {stats.db_ops && (
+                                  <div>
+                                    <div className="font-medium">
+                                      Ops DB: {stats.db_ops.size_mb ?? 0} MB /
+                                      500 MB
+                                    </div>
+                                    <div className="text-muted-foreground">
+                                      {Object.entries(stats.db_ops)
+                                        .filter(([t]) => t !== "size_mb")
+                                        .map(
+                                          ([t, c]) =>
+                                            `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
+                                        )
+                                        .join(", ")}
+                                    </div>
+                                  </div>
+                                )}
+                                {stats.db_firehose && (
+                                  <div>
+                                    <div className="font-medium">
+                                      Firehose DB:{" "}
+                                      {stats.db_firehose.size_mb ?? 0} MB / 500
+                                      MB
+                                    </div>
+                                    <div className="text-muted-foreground">
+                                      {Object.entries(stats.db_firehose)
+                                        .filter(([t]) => t !== "size_mb")
+                                        .map(
+                                          ([t, c]) =>
+                                            `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
+                                        )
+                                        .join(", ")}
+                                    </div>
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              <div>
+                                <div className="font-medium">
+                                  D1: {totalMb.toFixed(1)} MB / {maxMb} MB
+                                </div>
+                                <div className="text-muted-foreground">
+                                  {[
+                                    ...Object.entries(
+                                      stats.db_ops ?? {},
+                                    ).filter(([t]) => t !== "size_mb"),
+                                    ...Object.entries(
+                                      stats.db_firehose ?? {},
+                                    ).filter(([t]) => t !== "size_mb"),
+                                  ]
+                                    .map(
+                                      ([t, c]) =>
+                                        `${t.replace(/_/g, " ")} ${c.toLocaleString()}`,
+                                    )
+                                    .join(", ")}
+                                </div>
+                              </div>
+                            )}
                           </div>
-                        )}
-                      </div>
-                    </TooltipContent>
-                  </Tooltip>
-                </>
-              )}
+                        </TooltipContent>
+                      </Tooltip>
+                    </>
+                  );
+                })()}
             </div>
           </CardContent>
         </Card>

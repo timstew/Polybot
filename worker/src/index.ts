@@ -1343,6 +1343,7 @@ export default {
       ]);
 
       // Get DB sizes from D1 query metadata (size_after is returned on every query)
+      const isSplitDb = !!env.FIREHOSE_DB;
       const [opsMetaResult, firehoseMetaResult] = await Promise.all([
         env.DB.prepare("SELECT 1").run(),
         fdb.prepare("SELECT 1").run(),
@@ -1367,6 +1368,7 @@ export default {
           copy_listening: listener.running ?? false,
           copy_trade_count: copyTradeRow?.cnt ?? 0,
           unique_wallets: botRow?.cnt ?? 0,
+          db_split: isSplitDb,
           db_ops: {
             copy_trades: copyTradeRow?.cnt ?? 0,
             copy_targets: targetRow?.cnt ?? 0,

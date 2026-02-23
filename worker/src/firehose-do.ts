@@ -191,6 +191,14 @@ export class FirehoseDO implements DurableObject {
         await this.state.storage.put("lastHarvestTime", Date.now());
       }
 
+      // Periodic cleanup: prune non-bot trades/wallets every 30 min
+      const lastCleanup =
+        ((await this.state.storage.get("lastCleanupTime")) as number) ?? 0;
+      if (Date.now() - lastCleanup >= HARVEST_INTERVAL_MS) {
+        await this.periodicCleanup();
+        await this.state.storage.put("lastCleanupTime", Date.now());
+      }
+
       // Process a detection batch if running
       if (this.detectRunning) {
         await this.processDetectBatch();
@@ -503,6 +511,83 @@ export class FirehoseDO implements DurableObject {
       }
     } catch {
       // non-critical
+    }
+  }
+
+  // ── Periodic cleanup ──────────────────────────────────────────────
+
+  private async periodicCleanup(): Promise<void> {
+    try {
+      const BATCH = 50_000;
+      let totalTrades = 0;
+      let totalWallets = 0;
+
+      // Retention: delete trades older than 3 days
+      for (;;) {
+        const r = await this.fdb
+          .prepare(
+            `DELETE FROM firehose_trades WHERE rowid IN (
+               SELECT rowid FROM firehose_trades
+               WHERE timestamp < datetime('now', '-3 days')
+               LIMIT ?
+             )`,
+          )
+          .bind(BATCH)
+          .run();
+        const changed = r.meta?.changes ?? 0;
+        totalTrades += changed;
+        if (changed < BATCH) break;
+      }
+
+      // Prune non-bot trades
+      for (;;) {
+        const r = await this.fdb
+          .prepare(
+            `DELETE FROM firehose_trades WHERE rowid IN (
+               SELECT rowid FROM firehose_trades
+               WHERE taker NOT IN (
+                 SELECT wallet FROM suspect_bots
+                 UNION SELECT wallet FROM copy_targets
+                 UNION SELECT wallet FROM watchlist
+               )
+               LIMIT ?
+             )`,
+          )
+          .bind(BATCH)
+          .run();
+        const changed = r.meta?.changes ?? 0;
+        totalTrades += changed;
+        if (changed < BATCH) break;
+      }
+
+      // Prune non-bot wallets
+      for (;;) {
+        const r = await this.fdb
+          .prepare(
+            `DELETE FROM firehose_wallets WHERE rowid IN (
+               SELECT rowid FROM firehose_wallets
+               WHERE wallet NOT IN (
+                 SELECT wallet FROM suspect_bots
+                 UNION SELECT wallet FROM copy_targets
+                 UNION SELECT wallet FROM watchlist
+               )
+               LIMIT ?
+             )`,
+          )
+          .bind(BATCH)
+          .run();
+        const changed = r.meta?.changes ?? 0;
+        totalWallets += changed;
+        if (changed < BATCH) break;
+      }
+
+      if (totalTrades > 0 || totalWallets > 0) {
+        console.log(
+          `[CLEANUP] Periodic: pruned ${totalTrades} trades, ${totalWallets} wallets`,
+        );
+      }
+    } catch (e) {
+      console.error("[CLEANUP] Periodic cleanup failed:", e);
     }
   }
 

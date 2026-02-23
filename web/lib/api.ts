@@ -31,6 +31,7 @@ export interface Stats {
   listener_polls: number;
   listener_cumulative_seconds: number;
   copy_listening: boolean;
+  db_split?: boolean;
   db_ops?: DbTableCounts;
   db_firehose?: DbTableCounts;
 }
