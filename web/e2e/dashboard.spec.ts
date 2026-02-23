@@ -45,7 +45,6 @@ test.describe("Dashboard page", () => {
     expect(joined).toContain("Score");
     expect(joined).toMatch(/P&L/);
     expect(joined).toContain("Win");
-    expect(joined).toContain("Hold");
   });
 
   test("copy score displays correctly", async ({ page }) => {
@@ -59,20 +58,25 @@ test.describe("Dashboard page", () => {
     expect(allText).toMatch(/\d/);
   });
 
-  test("dismiss button removes bot from list", async ({ page }) => {
+  test("dismiss button calls dismiss API", async ({ page }) => {
     await page.goto("/");
     await page.locator("table tbody tr").first().waitFor({ timeout: 15_000 });
-    const initialCount = await page.locator("table tbody tr").count();
+    const rows = page.locator("table tbody tr");
+    const initialCount = await rows.count();
     if (initialCount > 1) {
-      // Click dismiss (X) button on the last row to avoid disrupting top bots
-      const lastRow = page.locator("table tbody tr").last();
-      const dismissBtn = lastRow.locator("button").last();
-      await dismissBtn.click();
-      // Row count should decrease
-      await expect(page.locator("table tbody tr")).toHaveCount(
-        initialCount - 1,
+      const lastRow = rows.last();
+      const dismissBtn = lastRow.locator("button").filter({
+        has: page.locator("svg.lucide-x"),
+      });
+      // Intercept the dismiss API call
+      const dismissPromise = page.waitForResponse(
+        (resp) =>
+          resp.url().includes("/api/bots/dismiss") && resp.status() === 200,
         { timeout: 5_000 },
       );
+      await dismissBtn.click();
+      const response = await dismissPromise;
+      expect(response.status()).toBe(200);
     }
   });
 

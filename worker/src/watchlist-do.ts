@@ -1,6 +1,7 @@
 import type { Env } from "./types";
 
 const DATA_API = "https://data-api.polymarket.com";
+const LB_API = "https://lb-api.polymarket.com";
 
 // Category-specific check intervals (minutes)
 const CATEGORY_INTERVALS: Record<string, number> = {
@@ -74,14 +75,34 @@ export class WatchlistDO implements DurableObject {
       return json({ status: "stopped" });
     }
 
+    if (url.pathname === "/snapshot") {
+      const body = (await request.json()) as { wallet: string };
+      if (!body.wallet) return json({ error: "wallet required" }, 400);
+      try {
+        const entry = await this.env.DB.prepare(
+          "SELECT wallet, category, check_interval_min, last_checked, username FROM watchlist WHERE wallet = ?",
+        )
+          .bind(body.wallet)
+          .first<WatchlistEntry>();
+        if (entry) {
+          await this.snapshotWallet(entry);
+          return json({ status: "snapshotted", wallet: body.wallet });
+        }
+        return json({ error: "not found" }, 404);
+      } catch (e) {
+        return json({ error: String(e) }, 500);
+      }
+    }
+
     if (url.pathname === "/status") {
       const alarm = await this.state.storage.getAlarm();
       const userStopped =
         (await this.state.storage.get("userStopped")) ?? false;
-      const lastRun =
-        (await this.state.storage.get("lastRunTime")) as string | null;
+      const lastRun = (await this.state.storage.get("lastRunTime")) as
+        | string
+        | null;
       const walletsChecked =
-        (await this.state.storage.get("walletsCheckedTotal")) as number ?? 0;
+        ((await this.state.storage.get("walletsCheckedTotal")) as number) ?? 0;
       return json({
         running: alarm !== null,
         userStopped,
@@ -143,13 +164,13 @@ export class WatchlistDO implements DurableObject {
     // Fetch activity (last 100 trades)
     let activities: ActivityItem[] = [];
     try {
-      const resp = await fetch(
-        `${DATA_API}/activity?user=${w}&limit=100`,
-      );
+      const resp = await fetch(`${DATA_API}/activity?user=${w}&limit=100`);
       if (resp.ok) {
         activities = (await resp.json()) as ActivityItem[];
       }
-    } catch { /* skip */ }
+    } catch {
+      /* skip */
+    }
 
     // Fetch profit data for multiple windows
     const profitWindows = ["1d", "7d", "30d", "all"];
@@ -157,13 +178,16 @@ export class WatchlistDO implements DurableObject {
     for (const window of profitWindows) {
       try {
         const resp = await fetch(
-          `${DATA_API}/profit?window=${window}&user=${w}`,
+          `${LB_API}/profit?window=${window}&address=${w}`,
         );
         if (resp.ok) {
-          const data = (await resp.json()) as ProfitData;
-          profits[window] = data?.amount ?? 0;
+          const data = (await resp.json()) as ProfitData | ProfitData[];
+          const entry = Array.isArray(data) ? data[0] : data;
+          profits[window] = entry?.amount ?? 0;
         }
-      } catch { /* skip */ }
+      } catch {
+        /* skip */
+      }
     }
 
     // Fetch positions
@@ -175,7 +199,9 @@ export class WatchlistDO implements DurableObject {
       if (resp.ok) {
         positions = (await resp.json()) as PositionItem[];
       }
-    } catch { /* skip */ }
+    } catch {
+      /* skip */
+    }
 
     // Compute metrics from activity data
     const now = Date.now();
@@ -198,8 +224,7 @@ export class WatchlistDO implements DurableObject {
       (sum, t) => sum + (t.usdcSize ?? (t.price ?? 0) * (t.size ?? 0)),
       0,
     );
-    const avgTradeSize =
-      trades24h > 0 ? volume24h / trades24h : 0;
+    const avgTradeSize = trades24h > 0 ? volume24h / trades24h : 0;
 
     // Count unique active markets from positions
     const activeMarkets = new Set(
@@ -283,7 +308,9 @@ export class WatchlistDO implements DurableObject {
       await this.env.DB.prepare(
         "DELETE FROM watchlist_snapshots WHERE snapshot_at < datetime('now', '-30 days')",
       ).run();
-    } catch { /* non-critical */ }
+    } catch {
+      /* non-critical */
+    }
   }
 }
 

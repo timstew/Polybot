@@ -236,6 +236,34 @@ export class FirehoseDO implements DurableObject {
       console.log(
         `Detection complete: ${this.detectBotsFound} bots from ${this.detectWalletsScanned} wallets`,
       );
+
+      // Post-detection cleanup: prune trades/wallets for non-bot, non-tracked wallets
+      try {
+        const deleted = await this.fdb
+          .prepare(
+            `DELETE FROM firehose_trades WHERE taker NOT IN (
+               SELECT wallet FROM suspect_bots
+               UNION SELECT wallet FROM copy_targets
+               UNION SELECT wallet FROM watchlist
+             )`,
+          )
+          .run();
+        const walletDeleted = await this.fdb
+          .prepare(
+            `DELETE FROM firehose_wallets WHERE wallet NOT IN (
+               SELECT wallet FROM suspect_bots
+               UNION SELECT wallet FROM copy_targets
+               UNION SELECT wallet FROM watchlist
+             )`,
+          )
+          .run();
+        console.log(
+          `[CLEANUP] Pruned ${deleted.meta?.changes ?? 0} non-bot trades, ${walletDeleted.meta?.changes ?? 0} non-bot wallets`,
+        );
+      } catch (e) {
+        console.error("[CLEANUP] Post-detection prune failed:", e);
+      }
+
       return;
     }
 
@@ -434,11 +462,11 @@ export class FirehoseDO implements DurableObject {
       await this.fdb.batch(batch.slice(i, i + 100));
     }
 
-    // Retention pruning: delete firehose_trades older than 7 days
+    // Retention pruning: delete firehose_trades older than 3 days
     try {
       await this.fdb
         .prepare(
-          "DELETE FROM firehose_trades WHERE timestamp < datetime('now', '-7 days')",
+          "DELETE FROM firehose_trades WHERE timestamp < datetime('now', '-3 days')",
         )
         .run();
     } catch {

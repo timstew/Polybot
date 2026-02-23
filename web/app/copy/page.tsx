@@ -23,7 +23,7 @@ import {
 import { WalletLink } from "@/components/wallet-link";
 import { CopyTargetDetail } from "@/components/copy-target-detail";
 import { Legend } from "@/components/legend";
-import { ChevronRight, RotateCcw } from "lucide-react";
+import { ChevronDown, ChevronRight, RotateCcw } from "lucide-react";
 import { api, type CopyTarget, type CopyTradeRow, type Stats } from "@/lib/api";
 
 function fmt(n: number) {
@@ -133,6 +133,140 @@ function fmtHold(hours: number): string {
   return `${(mins * 60).toFixed(0)}s`;
 }
 
+const COLLAPSE_THRESHOLD = 8;
+
+function InactiveTargets({
+  targets,
+  onReactivate,
+}: {
+  targets: CopyTarget[];
+  onReactivate: (addr: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const shouldCollapse = targets.length > COLLAPSE_THRESHOLD;
+  const visible =
+    shouldCollapse && !expanded
+      ? targets.slice(0, COLLAPSE_THRESHOLD)
+      : targets;
+
+  return (
+    <div className="mt-4">
+      <button
+        className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground mb-2"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {shouldCollapse ? (
+          expanded ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronRight className="h-3 w-3" />
+          )
+        ) : null}
+        Inactive ({targets.length})
+      </button>
+      <div className="flex flex-wrap gap-2">
+        {visible.map((t) => (
+          <Badge
+            key={t.wallet}
+            variant="outline"
+            className="font-mono text-xs flex items-center gap-1.5"
+          >
+            {t.username || `${t.wallet.slice(0, 6)}...${t.wallet.slice(-4)}`}
+            <button
+              onClick={() => onReactivate(t.wallet)}
+              className="p-0.5 rounded hover:bg-accent hover:text-foreground text-muted-foreground transition-colors"
+              title="Reactivate"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+            </button>
+          </Badge>
+        ))}
+        {shouldCollapse && !expanded && (
+          <Badge
+            variant="outline"
+            className="text-xs cursor-pointer hover:bg-accent"
+            onClick={() => setExpanded(true)}
+          >
+            +{targets.length - COLLAPSE_THRESHOLD} more
+          </Badge>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ModeDialog({
+  target,
+  onClose,
+  onConfirm,
+}: {
+  target: CopyTarget;
+  onClose: () => void;
+  onConfirm: (pct: number, maxPos: number) => void;
+}) {
+  const [pct, setPct] = useState("10");
+  const [maxPos, setMaxPos] = useState("500");
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      onClick={onClose}
+    >
+      <Card className="w-96" onClick={(e) => e.stopPropagation()}>
+        <CardHeader>
+          <CardTitle className="text-base">Switch to Real Trading</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Configure real trading for{" "}
+            <span className="font-mono font-medium">
+              {target.username || target.wallet.slice(0, 10)}
+            </span>
+          </p>
+          <div>
+            <label className="text-sm font-medium">Copy % of trade size</label>
+            <Input
+              type="number"
+              min={1}
+              max={100}
+              value={pct}
+              onChange={(e) => setPct(e.target.value)}
+              className="mt-1"
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium">Max position (USD)</label>
+            <Input
+              type="number"
+              min={1}
+              value={maxPos}
+              onChange={(e) => setMaxPos(e.target.value)}
+              className="mt-1"
+            />
+          </div>
+          <div className="flex gap-2 justify-end">
+            <Button variant="outline" size="sm" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                const p = parseFloat(pct);
+                const m = parseFloat(maxPos);
+                if (!isNaN(p) && p > 0 && p <= 100 && !isNaN(m) && m > 0) {
+                  onConfirm(p, m);
+                }
+              }}
+            >
+              Switch to Real
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 export default function CopyTradingPage() {
   const [targets, setTargets] = useState<CopyTarget[] | null>(null);
   const [trades, setTrades] = useState<CopyTradeRow[] | null>(null);
@@ -145,9 +279,17 @@ export default function CopyTradingPage() {
   const [wallet, setWallet] = useState("");
   const [adding, setAdding] = useState(false);
 
+  const [modeDialogTarget, setModeDialogTarget] = useState<CopyTarget | null>(
+    null,
+  );
+
   const [cloudRunning, setCloudRunning] = useState(false);
   const [cloudTradeCount, setCloudTradeCount] = useState(0);
   const [cloudLoading, setCloudLoading] = useState(false);
+  const [listenerState, setListenerState] = useState<
+    "running" | "winding_down" | "stopped"
+  >("stopped");
+  const [openPositions, setOpenPositions] = useState(0);
 
   const isAnyListenerActive =
     stats?.listening || stats?.copy_listening || cloudRunning;
@@ -184,6 +326,8 @@ export default function CopyTradingPage() {
       .then((s) => {
         setCloudRunning(s.running);
         setCloudTradeCount(s.trade_count ?? 0);
+        setListenerState(s.state ?? (s.running ? "running" : "stopped"));
+        setOpenPositions(s.open_positions ?? 0);
       })
       .catch(() => {});
   }, []);
@@ -242,9 +386,16 @@ export default function CopyTradingPage() {
 
   // Poll cloud listener status
   const updateCloudStatus = useCallback(
-    (s: { running: boolean; trade_count?: number }) => {
+    (s: {
+      running: boolean;
+      trade_count?: number;
+      state?: "running" | "winding_down" | "stopped";
+      open_positions?: number;
+    }) => {
       setCloudRunning(s.running);
       setCloudTradeCount(s.trade_count ?? 0);
+      setListenerState(s.state ?? (s.running ? "running" : "stopped"));
+      setOpenPositions(s.open_positions ?? 0);
     },
     [],
   );
@@ -261,13 +412,21 @@ export default function CopyTradingPage() {
   async function handleCloudListenerToggle() {
     setCloudLoading(true);
     try {
-      if (cloudRunning) {
+      if (listenerState === "running") {
+        // Running → Wind Down
         await api.cloudListenerStop();
+        setListenerState("winding_down");
+      } else if (listenerState === "winding_down") {
+        // Winding Down → Force Stop
+        await api.cloudListenerForceStop();
         setCloudRunning(false);
+        setListenerState("stopped");
       } else {
+        // Stopped → Start
         await api.cloudSyncTargets();
         await api.cloudListenerStart();
         setCloudRunning(true);
+        setListenerState("running");
       }
     } catch (err) {
       setError(
@@ -286,14 +445,26 @@ export default function CopyTradingPage() {
         <h1 className="text-2xl font-bold tracking-tight">Copy Trading</h1>
         <div className="flex items-center gap-3">
           <Button
-            variant={cloudRunning ? "destructive" : "default"}
+            variant={
+              listenerState === "running"
+                ? "destructive"
+                : listenerState === "winding_down"
+                  ? "destructive"
+                  : "default"
+            }
             size="sm"
             disabled={cloudLoading}
             onClick={handleCloudListenerToggle}
           >
-            {cloudLoading ? "..." : cloudRunning ? "Stop" : "Start"}
+            {cloudLoading
+              ? "..."
+              : listenerState === "running"
+                ? "Wind Down"
+                : listenerState === "winding_down"
+                  ? "Force Stop"
+                  : "Start"}
           </Button>
-          {cloudRunning && (
+          {listenerState === "running" && (
             <Badge
               variant="outline"
               className="border-green-300 text-green-700"
@@ -301,11 +472,40 @@ export default function CopyTradingPage() {
               Listening
             </Badge>
           )}
-          {!isAnyListenerActive && (
+          {listenerState === "winding_down" && (
+            <Badge
+              variant="outline"
+              className="border-amber-300 text-amber-700"
+            >
+              Winding Down
+              {openPositions > 0
+                ? ` — ${openPositions} position${openPositions !== 1 ? "s" : ""} remaining`
+                : ""}
+            </Badge>
+          )}
+          {listenerState === "stopped" && !isAnyListenerActive && (
             <span className="text-xs text-amber-600">No listener running</span>
           )}
         </div>
       </div>
+
+      {/* Circuit breaker alerts */}
+      {activeTargets.some((t) => t.circuit_triggered_at) && (
+        <div className="rounded-lg border border-red-300 bg-red-50 p-3">
+          {activeTargets
+            .filter((t) => t.circuit_triggered_at)
+            .map((t) => (
+              <p key={t.wallet} className="text-sm text-red-700">
+                Circuit breaker triggered for{" "}
+                <span className="font-mono font-medium">
+                  {t.username || `${t.wallet.slice(0, 10)}...`}
+                </span>{" "}
+                at {new Date(t.circuit_triggered_at!).toLocaleString()} — loss
+                exceeded ${t.circuit_breaker_usd} threshold
+              </p>
+            ))}
+        </div>
+      )}
 
       {/* Add target form */}
       <Card>
@@ -420,7 +620,7 @@ export default function CopyTradingPage() {
                   <TableRow>
                     <TableHead className="w-8"></TableHead>
                     <TableHead>Wallet</TableHead>
-                    <TableHead>Cat</TableHead>
+                    <TableHead>Category</TableHead>
                     <TableHead>Mode</TableHead>
                     <TableHead className="text-right">Copy %</TableHead>
                     <TableHead className="text-right">Max Pos</TableHead>
@@ -466,35 +666,10 @@ export default function CopyTradingPage() {
                                 ? "bg-green-100 text-green-800 hover:bg-green-200"
                                 : "bg-blue-100 text-blue-800 hover:bg-blue-200"
                             }`}
-                            onClick={async (e) => {
+                            onClick={(e) => {
                               e.stopPropagation();
-                              const next =
-                                t.mode === "paper" ? "real" : "paper";
-                              if (next === "real") {
-                                const pctStr = prompt(
-                                  `Switch ${t.username || t.wallet.slice(0, 10)} to REAL trading.\n\nCopy what % of the bot's trade size?`,
-                                  "10",
-                                );
-                                if (!pctStr) return;
-                                const pct = parseFloat(pctStr);
-                                if (isNaN(pct) || pct <= 0 || pct > 100) return;
-                                const maxStr = prompt(
-                                  `Max position size per market (USD)?\n\nThis is a per-trade safety cap.`,
-                                  "500",
-                                );
-                                if (!maxStr) return;
-                                const maxPos = parseFloat(maxStr);
-                                if (isNaN(maxPos) || maxPos <= 0) return;
-                                try {
-                                  await api.copyUpdate(t.wallet, {
-                                    trade_pct: pct,
-                                    max_position_usd: maxPos,
-                                  });
-                                  await api.copySetMode(t.wallet, "real");
-                                  refresh();
-                                } catch {
-                                  /* ignore */
-                                }
+                              if (t.mode === "paper") {
+                                setModeDialogTarget(t);
                               } else {
                                 api
                                   .copySetMode(t.wallet, "paper")
@@ -538,7 +713,13 @@ export default function CopyTradingPage() {
                           )}
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
-                          {t.trade_count ?? 0}
+                          {(t.trade_count ?? 0) > 0 ? (
+                            t.trade_count
+                          ) : (
+                            <span className="text-muted-foreground">
+                              &mdash;
+                            </span>
+                          )}
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
                           {(t.wins ?? 0) + (t.losses ?? 0) > 0 ? (
@@ -565,7 +746,9 @@ export default function CopyTradingPage() {
                               {t.open_positions_count}
                             </span>
                           ) : (
-                            <span className="text-muted-foreground">0</span>
+                            <span className="text-muted-foreground">
+                              &mdash;
+                            </span>
                           )}
                         </TableCell>
                         <TableCell className="text-right font-mono text-sm tabular-nums">
@@ -589,25 +772,47 @@ export default function CopyTradingPage() {
                         <TableCell className="text-right">
                           <span
                             className={`font-mono text-sm font-semibold tabular-nums ${
-                              t.total_paper_pnl >= 0
+                              t.total_paper_pnl > 0
                                 ? "text-green-600"
-                                : "text-red-600"
+                                : t.total_paper_pnl < 0
+                                  ? "text-red-600"
+                                  : "text-muted-foreground"
                             }`}
                           >
                             {fmt(t.total_paper_pnl)}
                           </span>
+                          {t.mode === "paper" && (
+                            <div className="text-xs text-muted-foreground mt-0.5">
+                              {fmt(t.virtual_balance)} /{" "}
+                              {fmt(t.virtual_balance_initial)}
+                            </div>
+                          )}
                         </TableCell>
                         <TableCell>
-                          <Button
-                            variant="destructive"
-                            size="sm"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleRemove(t.wallet);
-                            }}
-                          >
-                            Stop
-                          </Button>
+                          <div className="flex gap-1">
+                            {t.mode === "paper" && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  api.copyResetPaper(t.wallet).then(refresh);
+                                }}
+                              >
+                                Reset
+                              </Button>
+                            )}
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRemove(t.wallet);
+                              }}
+                            >
+                              Stop
+                            </Button>
+                          </div>
                         </TableCell>
                       </TableRow>
                       {expandedWallet === t.wallet && (
@@ -628,30 +833,10 @@ export default function CopyTradingPage() {
           )}
 
           {inactiveTargets.length > 0 && (
-            <div className="mt-4">
-              <p className="text-xs text-muted-foreground mb-2">
-                Inactive ({inactiveTargets.length})
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {inactiveTargets.map((t) => (
-                  <Badge
-                    key={t.wallet}
-                    variant="outline"
-                    className="font-mono text-xs flex items-center gap-1"
-                  >
-                    {t.username ||
-                      `${t.wallet.slice(0, 6)}...${t.wallet.slice(-4)}`}
-                    <button
-                      onClick={() => handleReactivate(t.wallet)}
-                      className="ml-1 hover:text-foreground text-muted-foreground transition-colors"
-                      title="Reactivate"
-                    >
-                      <RotateCcw className="h-3 w-3" />
-                    </button>
-                  </Badge>
-                ))}
-              </div>
-            </div>
+            <InactiveTargets
+              targets={inactiveTargets}
+              onReactivate={handleReactivate}
+            />
           )}
         </CardContent>
       </Card>
@@ -739,6 +924,26 @@ export default function CopyTradingPage() {
           )}
         </CardContent>
       </Card>
+
+      {modeDialogTarget && (
+        <ModeDialog
+          target={modeDialogTarget}
+          onClose={() => setModeDialogTarget(null)}
+          onConfirm={async (pct, maxPos) => {
+            try {
+              await api.copyUpdate(modeDialogTarget.wallet, {
+                trade_pct: pct,
+                max_position_usd: maxPos,
+              });
+              await api.copySetMode(modeDialogTarget.wallet, "real");
+              refresh();
+            } catch {
+              /* ignore */
+            }
+            setModeDialogTarget(null);
+          }}
+        />
+      )}
     </div>
   );
 }

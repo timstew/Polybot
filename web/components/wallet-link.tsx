@@ -1,6 +1,6 @@
 "use client";
 
-import { UserPlus } from "lucide-react";
+import { Binoculars, Check, UserPlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -22,10 +22,14 @@ export function WalletLink({
   address,
   username,
   onCopyTrade,
+  onWatchlist,
+  isWatchlisted,
 }: {
   address: string;
   username?: string;
   onCopyTrade?: (wallet: string) => void;
+  onWatchlist?: (wallet: string) => void;
+  isWatchlisted?: boolean;
 }) {
   return (
     <span className="inline-flex items-center gap-1">
@@ -88,6 +92,31 @@ export function WalletLink({
             </Button>
           </TooltipTrigger>
           <TooltipContent>Copy trade this wallet</TooltipContent>
+        </Tooltip>
+      )}
+      {onWatchlist && !isWatchlisted && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-5 w-5"
+              onClick={() => onWatchlist(address)}
+            >
+              <Binoculars className="h-3 w-3" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Add to watchlist</TooltipContent>
+        </Tooltip>
+      )}
+      {isWatchlisted && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex h-5 w-5 items-center justify-center text-emerald-500">
+              <Check className="h-3 w-3" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>On watchlist</TooltipContent>
         </Tooltip>
       )}
     </span>

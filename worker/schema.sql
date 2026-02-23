@@ -11,7 +11,11 @@ CREATE TABLE IF NOT EXISTS copy_targets (
     fee_rate REAL NOT NULL DEFAULT 0.0,
     measured_slippage_bps REAL NOT NULL DEFAULT -1,
     username TEXT NOT NULL DEFAULT '',
-    full_copy_below_usd REAL NOT NULL DEFAULT 0.0
+    full_copy_below_usd REAL NOT NULL DEFAULT 0.0,
+    circuit_breaker_usd REAL NOT NULL DEFAULT 50.0,
+    circuit_triggered_at TEXT,
+    virtual_balance REAL NOT NULL DEFAULT 1000.0,
+    virtual_balance_initial REAL NOT NULL DEFAULT 1000.0
 );
 
 CREATE TABLE IF NOT EXISTS copy_trades (

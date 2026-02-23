@@ -11,6 +11,10 @@ export interface CopyTarget {
   fee_rate: number;
   measured_slippage_bps: number;
   full_copy_below_usd: number;
+  circuit_breaker_usd: number;
+  circuit_triggered_at: string | null;
+  virtual_balance: number;
+  virtual_balance_initial: number;
 }
 
 export interface CopyTrade {

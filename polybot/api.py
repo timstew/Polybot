@@ -338,8 +338,15 @@ def cloud_start():
 
 @app.post("/api/copy/listener/cloud-stop")
 def cloud_stop():
-    """Stop the Cloudflare Worker copy listener."""
+    """Stop the Cloudflare Worker copy listener (wind-down mode)."""
     resp = http_requests.post(f"{_cf_url()}/stop", timeout=10)
+    return resp.json()
+
+
+@app.post("/api/copy/listener/cloud-force-stop")
+def cloud_force_stop():
+    """Force-stop the Cloudflare Worker copy listener immediately."""
+    resp = http_requests.post(f"{_cf_url()}/force-stop", timeout=10)
     return resp.json()
 
 
@@ -569,6 +576,23 @@ def execute_real_trade(body: dict):
                 "error": f"No liquidity on {'ask' if side == 'BUY' else 'bid'} side",
             }
 
+        # Balance check for BUY orders
+        if side == "BUY":
+            try:
+                balances = client.get_balances()
+                usdc_balance = (
+                    float(balances.get("USDC", 0)) if isinstance(balances, dict) else 0
+                )
+                if usdc_balance < notional:
+                    return {
+                        "status": "failed",
+                        "error": f"insufficient_balance",
+                        "balance": round(usdc_balance, 2),
+                        "required": round(notional, 2),
+                    }
+            except Exception:
+                pass  # Balance check is best-effort; proceed if it fails
+
         # Use whatever the book can support, up to our desired notional
         order_notional = min(notional, available * 0.95)  # leave 5% margin
 
@@ -632,6 +656,49 @@ def execute_real_trade(body: dict):
     except Exception as e:
         logger.exception("Failed to execute real trade")
         return {"status": "failed", "error": str(e)}
+
+
+@app.get("/api/book-check")
+def book_check(
+    asset_id: str = Query(..., description="Polymarket asset/token ID"),
+    side: str = Query(..., pattern="^(BUY|SELL)$"),
+    size: float = Query(..., gt=0, description="Desired size in shares"),
+):
+    """Check order book depth for paper trade fill simulation."""
+    import requests as http_requests
+
+    try:
+        resp = http_requests.get(
+            f"https://clob.polymarket.com/book?token_id={asset_id}",
+            timeout=5,
+        )
+        if not resp.ok:
+            return {
+                "available_size": 0,
+                "available_notional": 0,
+                "would_fill": False,
+                "error": f"CLOB API {resp.status_code}",
+            }
+        book = resp.json()
+        # BUY: we hit the asks; SELL: we hit the bids
+        levels = book.get("asks", []) if side == "BUY" else book.get("bids", [])
+        total_size = sum(float(l.get("size", 0)) for l in levels)
+        total_notional = sum(
+            float(l.get("size", 0)) * float(l.get("price", 0)) for l in levels
+        )
+        would_fill = total_size >= size
+        return {
+            "available_size": round(total_size, 4),
+            "available_notional": round(total_notional, 4),
+            "would_fill": would_fill,
+        }
+    except Exception as e:
+        return {
+            "available_size": 0,
+            "available_notional": 0,
+            "would_fill": False,
+            "error": str(e),
+        }
 
 
 @app.get("/api/copy/execute/status")

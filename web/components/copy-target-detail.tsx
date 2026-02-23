@@ -76,6 +76,8 @@ function Stat({
   );
 }
 
+type ComparisonData = Awaited<ReturnType<typeof api.copyComparison>>;
+
 export function CopyTargetDetail({
   wallet,
   source = "local",
@@ -84,6 +86,7 @@ export function CopyTargetDetail({
   source?: "local" | "cloud";
 }) {
   const [data, setData] = useState<CopyDetailData | null>(null);
+  const [comparison, setComparison] = useState<ComparisonData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -91,6 +94,10 @@ export function CopyTargetDetail({
       .copyDetail(wallet, source)
       .then(setData)
       .catch((e) => setError(e.message));
+    api
+      .copyComparison(wallet)
+      .then(setComparison)
+      .catch(() => {}); // comparison is optional
   }, [wallet, source]);
 
   if (error) {
@@ -476,7 +483,93 @@ export function CopyTargetDetail({
         </div>
       )}
 
-      {/* Section 4: Missed Positions */}
+      {/* Section 4: Source vs Our Copies Comparison */}
+      {comparison && comparison.ours.trades_attempted > 0 && (
+        <>
+          <Separator />
+          <div>
+            <h4 className="mb-3 text-sm font-medium">
+              Source Bot vs Our Copies
+            </h4>
+            <div className="grid grid-cols-2 gap-4 rounded-lg border p-4">
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">
+                  Source Bot
+                </div>
+                <div className="space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">All-time P&L</span>
+                    <span
+                      className={`font-mono font-semibold ${comparison.source.pnl_all >= 0 ? "text-green-600" : "text-red-600"}`}
+                    >
+                      {fmt(comparison.source.pnl_all)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Fill rate</span>
+                    <span className="font-mono font-semibold">100%</span>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">
+                  Our Copies
+                </div>
+                <div className="space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Realized P&L</span>
+                    <span
+                      className={`font-mono font-semibold ${comparison.ours.pnl_realized >= 0 ? "text-green-600" : "text-red-600"}`}
+                    >
+                      {fmt(comparison.ours.pnl_realized)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Fill rate</span>
+                    <span
+                      className={`font-mono font-semibold ${comparison.ours.fill_rate < 80 ? "text-red-600" : ""}`}
+                    >
+                      {comparison.ours.fill_rate}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">BUY fill rate</span>
+                    <span
+                      className={`font-mono text-xs ${comparison.ours.buy_fill_rate < 80 ? "text-red-600" : ""}`}
+                    >
+                      {comparison.ours.buy_fill_rate}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">
+                      SELL fill rate
+                    </span>
+                    <span
+                      className={`font-mono text-xs ${comparison.ours.sell_fill_rate < 80 ? "text-red-600" : ""}`}
+                    >
+                      {comparison.ours.sell_fill_rate}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Avg slippage</span>
+                    <span className="font-mono text-xs">
+                      {comparison.ours.avg_slippage_bps} bps
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Missed trades</span>
+                    <span className="font-mono text-xs text-amber-600">
+                      {comparison.divergence.missed_trades}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Section 5: Missed Positions */}
       {missed_positions.length > 0 && (
         <details className="group">
           <summary className="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground">

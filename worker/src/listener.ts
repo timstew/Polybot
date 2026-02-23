@@ -3,6 +3,77 @@ import type { CopyTarget, CopyTrade, DataApiTrade } from "./types";
 
 const DATA_API = "https://data-api.polymarket.com";
 
+// ── Market time guard ──────────────────────────────────────────────
+
+const marketEndTimeCache = new Map<string, number>(); // title → epoch ms
+
+/**
+ * Parse settlement time from Polymarket crypto market titles like:
+ * "Will the price of Bitcoin be above $97,250 at 2:45 PM on February 23, 2026?"
+ * Returns epoch ms or 0 if unparseable.
+ */
+function parseMarketEndTime(title: string): number {
+  if (!title) return 0;
+  // Match "at H:MM AM/PM on Month DD, YYYY"
+  const m = title.match(
+    /at (\d{1,2}):(\d{2})\s*(AM|PM)\s+on\s+(\w+)\s+(\d{1,2}),?\s*(\d{4})/i,
+  );
+  if (!m) return 0;
+  let hour = parseInt(m[1]);
+  const minute = parseInt(m[2]);
+  const ampm = m[3].toUpperCase();
+  const monthStr = m[4];
+  const day = parseInt(m[5]);
+  const year = parseInt(m[6]);
+
+  if (ampm === "PM" && hour !== 12) hour += 12;
+  if (ampm === "AM" && hour === 12) hour = 0;
+
+  const months: Record<string, number> = {
+    january: 0,
+    february: 1,
+    march: 2,
+    april: 3,
+    may: 4,
+    june: 5,
+    july: 6,
+    august: 7,
+    september: 8,
+    october: 9,
+    november: 10,
+    december: 11,
+  };
+  const monthNum = months[monthStr.toLowerCase()];
+  if (monthNum === undefined) return 0;
+
+  // Polymarket times are ET (Eastern Time)
+  // Build date string and parse as ET
+  const dateStr = `${year}-${String(monthNum + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
+  // Approximate ET offset: UTC-5 (EST) or UTC-4 (EDT)
+  // Use -5 as conservative (slightly earlier cutoff is safer)
+  return new Date(dateStr + "-05:00").getTime();
+}
+
+/**
+ * Check if a market is too close to settlement for a BUY trade.
+ * Returns true if the trade should be skipped.
+ */
+function isMarketExpiringSoon(title: string, minMinutes = 2): boolean {
+  let endTime = marketEndTimeCache.get(title);
+  if (endTime === undefined) {
+    endTime = parseMarketEndTime(title);
+    marketEndTimeCache.set(title, endTime);
+    // Prune cache if too large
+    if (marketEndTimeCache.size > 1000) {
+      const keys = Array.from(marketEndTimeCache.keys());
+      for (let i = 0; i < 500; i++) marketEndTimeCache.delete(keys[i]);
+    }
+  }
+  if (endTime === 0) return false; // Can't parse — don't block
+  const minsRemaining = (endTime - Date.now()) / 60_000;
+  return minsRemaining < minMinutes;
+}
+
 // ── Polymarket Data API ────────────────────────────────────────────
 
 const RELEVANT_TYPES = new Set(["TRADE", "CONVERSION", "REDEEM"]);
@@ -105,23 +176,18 @@ export function calculateCopyTrade(
   }
   const feePerShare = execPrice * (1 - execPrice) * feeRate;
 
-  // Copy size — paper mode uses 100% of source, real mode uses configured %
+  // Copy size — both paper and real use same sizing rules
   // If full_copy_below_usd is set and source trade is below that threshold,
   // copy at 100% regardless of trade_pct (small trades aren't worth scaling down)
   const sourceNotional = trade.price * trade.size;
   const fullCopyBelow = target.full_copy_below_usd ?? 0;
   let copyNotional: number;
-  if (target.mode === "paper") {
-    copyNotional = sourceNotional;
-  } else if (fullCopyBelow > 0 && sourceNotional <= fullCopyBelow) {
+  if (fullCopyBelow > 0 && sourceNotional <= fullCopyBelow) {
     copyNotional = sourceNotional;
   } else {
     copyNotional = sourceNotional * (target.trade_pct / 100);
   }
-  // Only apply max position cap for real trades
-  if (target.mode !== "paper") {
-    copyNotional = Math.min(copyNotional, target.max_position_usd);
-  }
+  copyNotional = Math.min(copyNotional, target.max_position_usd);
   if (copyNotional < 0.01) return null;
 
   const costPerShare = execPrice + feePerShare;
@@ -151,6 +217,17 @@ export function calculateCopyTrade(
 }
 
 // ── Poll cycle ─────────────────────────────────────────────────────
+
+// Track consecutive balance failures per wallet for wind-down trigger
+const balanceFailures = new Map<string, number>();
+
+export function getMaxBalanceFailures(): number {
+  let max = 0;
+  for (const v of balanceFailures.values()) {
+    if (v > max) max = v;
+  }
+  return max;
+}
 
 async function executeRealTrade(
   pythonApiUrl: string,
@@ -334,10 +411,88 @@ async function handlePositionExit(
   return count;
 }
 
+/**
+ * Count open positions (filled BUYs minus filled SELLs) across all active real targets.
+ */
+export async function getOpenPositionCount(db: D1Database): Promise<number> {
+  const { results } = await db
+    .prepare(
+      `SELECT ct.asset_id,
+              SUM(CASE WHEN ct.side='BUY' THEN ct.size ELSE 0 END) -
+              SUM(CASE WHEN ct.side='SELL' THEN ct.size ELSE 0 END) AS held
+       FROM copy_trades ct
+       JOIN copy_targets tgt ON ct.source_wallet = tgt.wallet
+       WHERE ct.status = 'filled' AND tgt.active = 1 AND tgt.mode = 'real'
+       GROUP BY ct.asset_id
+       HAVING held > 0.01`,
+    )
+    .all<{ asset_id: string; held: number }>();
+  return results?.length ?? 0;
+}
+
+/**
+ * Compute simple realized P&L for a real-mode target.
+ * Uses paired BUY/SELL on same asset_id: sum of (sell_notional - buy_notional).
+ */
+async function computeSessionPnl(
+  db: D1Database,
+  wallet: string,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN side='SELL' THEN price * size ELSE 0 END), 0) -
+         COALESCE(SUM(CASE WHEN side='BUY' THEN price * size ELSE 0 END), 0) -
+         COALESCE(SUM(fee_amount), 0) AS pnl
+       FROM copy_trades
+       WHERE source_wallet = ? AND status = 'filled' AND mode = 'real'`,
+    )
+    .bind(wallet)
+    .first<{ pnl: number }>();
+  return row?.pnl ?? 0;
+}
+
+/**
+ * Check circuit breaker for all real targets. Returns true if any tripped.
+ */
+export async function checkCircuitBreaker(db: D1Database): Promise<boolean> {
+  const { results: realTargets } = await db
+    .prepare(
+      "SELECT wallet, circuit_breaker_usd, circuit_triggered_at FROM copy_targets WHERE active = 1 AND mode = 'real'",
+    )
+    .all<{
+      wallet: string;
+      circuit_breaker_usd: number;
+      circuit_triggered_at: string | null;
+    }>();
+
+  if (!realTargets || realTargets.length === 0) return false;
+
+  let anyTripped = false;
+  for (const target of realTargets) {
+    if (target.circuit_triggered_at) continue; // already tripped
+    const pnl = await computeSessionPnl(db, target.wallet);
+    if (pnl < 0 && Math.abs(pnl) >= target.circuit_breaker_usd) {
+      console.log(
+        `[CIRCUIT] Loss of $${Math.abs(pnl).toFixed(2)} exceeds $${target.circuit_breaker_usd} threshold for ${target.wallet.slice(0, 10)} — winding down`,
+      );
+      await db
+        .prepare(
+          "UPDATE copy_targets SET circuit_triggered_at = ? WHERE wallet = ?",
+        )
+        .bind(new Date().toISOString(), target.wallet)
+        .run();
+      anyTripped = true;
+    }
+  }
+  return anyTripped;
+}
+
 export async function pollCycle(
   db: D1Database,
   seenIds: Set<string>,
   pythonApiUrl?: string,
+  buysDisabled?: boolean,
 ): Promise<number> {
   // Get active targets — real mode first so they always get processed
   // even if the poll cycle runs long on many paper targets
@@ -379,6 +534,21 @@ export async function pollCycle(
       const copy = calculateCopyTrade(event, target);
       if (!copy) continue;
 
+      // Wind-down mode: skip new BUYs, only allow SELLs
+      if (buysDisabled && copy.side === "BUY") continue;
+
+      // Market time guard: skip BUYs on markets about to expire
+      if (
+        copy.side === "BUY" &&
+        event.title &&
+        isMarketExpiringSoon(event.title)
+      ) {
+        console.log(
+          `[SKIP] Market "${event.title.slice(0, 60)}..." resolves too soon — skipping BUY`,
+        );
+        continue;
+      }
+
       // For ALL modes: check position before selling.
       // Without this, we create phantom sells for shares the target
       // accumulated before we started copying (we never bought them).
@@ -412,10 +582,27 @@ export async function pollCycle(
           const result = await executeRealTrade(pythonApiUrl, copy);
           copy.status = result.status === "filled" ? "filled" : "failed";
           if (result.error) {
-            console.error(
-              `[REAL] Failed for ${target.wallet.slice(0, 10)}: ${result.error}`,
-            );
+            if (result.error === "insufficient_balance") {
+              console.warn(
+                `[REAL] Insufficient balance for ${target.wallet.slice(0, 10)} — skipping`,
+              );
+              const fails = (balanceFailures.get(target.wallet) ?? 0) + 1;
+              balanceFailures.set(target.wallet, fails);
+              if (fails >= 5) {
+                console.warn(
+                  `[REAL] 5 consecutive balance failures for ${target.wallet.slice(0, 10)} — triggering wind-down`,
+                );
+              }
+            } else {
+              // Reset balance failure counter on non-balance errors
+              balanceFailures.set(target.wallet, 0);
+              console.error(
+                `[REAL] Failed for ${target.wallet.slice(0, 10)}: ${result.error}`,
+              );
+            }
           } else {
+            // Reset balance failure counter on success
+            balanceFailures.set(target.wallet, 0);
             // Use actual filled size from Cloud Run (may be less due to liquidity)
             if (result.filled_size && result.filled_size > 0) {
               copy.size = result.filled_size;
@@ -437,8 +624,77 @@ export async function pollCycle(
           pendingSells.set(copy.asset_id, prev + copy.size);
         }
       } else {
+        // Paper mode: realistic fill simulation
+        const copyNotional = copy.price * copy.size;
+
+        // Virtual balance check for paper BUYs
+        if (copy.side === "BUY") {
+          const vb = target.virtual_balance ?? 1000;
+          if (vb < copyNotional) {
+            copy.status = "failed";
+            console.log(
+              `[PAPER] Insufficient balance: $${vb.toFixed(2)} < $${copyNotional.toFixed(2)} for ${target.wallet.slice(0, 10)}`,
+            );
+          }
+        }
+
+        // Book depth check (only if we have a Python API URL and trade isn't already failed)
+        if (copy.status !== "failed" && pythonApiUrl) {
+          try {
+            const bookResp = await fetch(
+              `${pythonApiUrl}/api/book-check?asset_id=${encodeURIComponent(copy.asset_id)}&side=${copy.side}&size=${copy.size}`,
+            );
+            if (bookResp.ok) {
+              const book = (await bookResp.json()) as {
+                available_size: number;
+                would_fill: boolean;
+              };
+              if (!book.would_fill) {
+                if (book.available_size > 0.01) {
+                  // Partial fill
+                  copy.size = book.available_size;
+                  console.log(
+                    `[PAPER] Partial fill: ${book.available_size.toFixed(2)} of ${copy.size.toFixed(2)} shares for ${target.wallet.slice(0, 10)}`,
+                  );
+                } else {
+                  copy.status = "failed";
+                  console.log(
+                    `[PAPER] No liquidity for ${copy.side} ${copy.asset_id.slice(0, 10)} — ${target.wallet.slice(0, 10)}`,
+                  );
+                }
+              }
+            }
+          } catch {
+            // Book check failed — still allow paper trade (graceful degradation)
+          }
+        }
+
+        // Update virtual balance for filled paper trades
+        if (copy.status === "filled") {
+          const filledNotional = copy.price * copy.size;
+          if (copy.side === "BUY") {
+            await db
+              .prepare(
+                "UPDATE copy_targets SET virtual_balance = virtual_balance - ? WHERE wallet = ?",
+              )
+              .bind(filledNotional, target.wallet)
+              .run();
+            target.virtual_balance =
+              (target.virtual_balance ?? 1000) - filledNotional;
+          } else {
+            await db
+              .prepare(
+                "UPDATE copy_targets SET virtual_balance = virtual_balance + ? WHERE wallet = ?",
+              )
+              .bind(filledNotional, target.wallet)
+              .run();
+            target.virtual_balance =
+              (target.virtual_balance ?? 1000) + filledNotional;
+          }
+        }
+
         // Track pending sells for paper mode to prevent overselling within a poll cycle
-        if (copy.side === "SELL") {
+        if (copy.side === "SELL" && copy.status === "filled") {
           const prev = pendingSells.get(copy.asset_id) ?? 0;
           pendingSells.set(copy.asset_id, prev + copy.size);
         }

@@ -1,8 +1,76 @@
-import { pollCycle } from "./listener";
+import {
+  pollCycle,
+  getOpenPositionCount,
+  checkCircuitBreaker,
+  getMaxBalanceFailures,
+} from "./listener";
 import type { CopyTarget, CopyTrade, Env } from "./types";
+
+type ListenerState = "running" | "winding_down" | "stopped";
 
 export { FirehoseDO } from "./firehose-do";
 export { WatchlistDO } from "./watchlist-do";
+
+// ── Auto-start DOs on first request ────────────────────────────────
+
+let autoStarted = false;
+
+async function autoStartDOs(env: Env) {
+  // Start copy listener unless user explicitly stopped it
+  try {
+    const id = env.LISTENER.idFromName("singleton");
+    const obj = env.LISTENER.get(id);
+    const resp = await obj.fetch(new Request("https://dummy/status"));
+    const status = (await resp.json()) as {
+      running: boolean;
+      userStopped?: boolean;
+    };
+    if (!status.running && !status.userStopped) {
+      await obj.fetch(new Request("https://dummy/start", { method: "POST" }));
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // Start firehose
+  try {
+    const id = env.FIREHOSE.idFromName("singleton");
+    const obj = env.FIREHOSE.get(id);
+    const resp = await obj.fetch(new Request("https://dummy/firehose/status"));
+    const status = (await resp.json()) as {
+      running: boolean;
+      userStopped?: boolean;
+    };
+    if (!status.running && !status.userStopped) {
+      await obj.fetch(
+        new Request("https://dummy/firehose/start", { method: "POST" }),
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // Start watchlist if entries exist
+  try {
+    const cnt = await env.DB.prepare(
+      "SELECT COUNT(*) as cnt FROM watchlist",
+    ).first<{ cnt: number }>();
+    if (cnt && cnt.cnt > 0) {
+      const id = env.WATCHLIST.idFromName("singleton");
+      const obj = env.WATCHLIST.get(id);
+      const resp = await obj.fetch(new Request("https://dummy/status"));
+      const status = (await resp.json()) as {
+        running: boolean;
+        userStopped?: boolean;
+      };
+      if (!status.running && !status.userStopped) {
+        await obj.fetch(new Request("https://dummy/start", { method: "POST" }));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
 
 // ── CORS ───────────────────────────────────────────────────────────
 
@@ -346,39 +414,78 @@ function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
 
 export class CopyListenerDO implements DurableObject {
   private seenIds = new Set<string>();
-  private state: DurableObjectState;
+  private doState: DurableObjectState;
   private env: Env;
   private pollCount = 0;
 
   constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
+    this.doState = state;
     this.env = env;
+  }
+
+  private async getListenerState(): Promise<ListenerState> {
+    return (
+      (await this.doState.storage.get<ListenerState>("listenerState")) ??
+      "stopped"
+    );
+  }
+
+  private async setListenerState(state: ListenerState): Promise<void> {
+    await this.doState.storage.put("listenerState", state);
+    // Keep userStopped in sync for backward compat (autoStartDOs checks it)
+    await this.doState.storage.put("userStopped", state === "stopped");
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/start") {
-      await this.state.storage.put("userStopped", false);
-      await this.state.storage.setAlarm(Date.now() + 1000);
+      await this.setListenerState("running");
+      await this.doState.storage.setAlarm(Date.now() + 1000);
       return json({ status: "started" });
     }
 
     if (url.pathname === "/stop") {
-      await this.state.storage.put("userStopped", true);
-      await this.state.storage.deleteAlarm();
+      // Graceful wind-down: stop new BUYs but continue SELLs until flat
+      const current = await this.getListenerState();
+      if (current === "running") {
+        await this.setListenerState("winding_down");
+        // Keep alarm running so SELLs continue processing
+        return json({ status: "winding_down" });
+      }
+      // If already winding down or stopped, do a full stop
+      await this.setListenerState("stopped");
+      await this.doState.storage.deleteAlarm();
+      this.pollCount = 0;
+      return json({ status: "stopped" });
+    }
+
+    if (url.pathname === "/force-stop") {
+      // Emergency stop: immediately halt everything
+      await this.setListenerState("stopped");
+      await this.doState.storage.deleteAlarm();
       this.pollCount = 0;
       return json({ status: "stopped" });
     }
 
     if (url.pathname === "/status") {
-      const alarm = await this.state.storage.getAlarm();
-      const userStopped =
-        (await this.state.storage.get("userStopped")) ?? false;
+      const alarm = await this.doState.storage.getAlarm();
+      const listenerState = await this.getListenerState();
+      const userStopped = listenerState === "stopped";
+      let openPositions = 0;
+      if (listenerState === "winding_down") {
+        try {
+          openPositions = await getOpenPositionCount(this.env.DB);
+        } catch {
+          /* ignore */
+        }
+      }
       return json({
         running: alarm !== null,
         polls: this.pollCount,
         userStopped,
+        state: listenerState,
+        open_positions: openPositions,
       });
     }
 
@@ -386,18 +493,49 @@ export class CopyListenerDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
-    // Check if user stopped before doing any work
-    const userStopped = (await this.state.storage.get("userStopped")) ?? false;
-    if (userStopped) return; // Do NOT re-schedule — stop means stop
+    const listenerState = await this.getListenerState();
+    if (listenerState === "stopped") return;
+
+    const buysDisabled = listenerState === "winding_down";
 
     try {
-      await pollCycle(this.env.DB, this.seenIds, this.env.PYTHON_API_URL);
+      await pollCycle(
+        this.env.DB,
+        this.seenIds,
+        this.env.PYTHON_API_URL,
+        buysDisabled,
+      );
       this.pollCount++;
+
+      // Circuit breaker: check if losses exceeded threshold → trigger wind-down
+      if (listenerState === "running") {
+        const tripped = await checkCircuitBreaker(this.env.DB);
+        if (tripped) {
+          await this.setListenerState("winding_down");
+        }
+      }
+
+      // Balance failure check: 5+ consecutive failures → trigger wind-down
+      if (listenerState === "running" && getMaxBalanceFailures() >= 5) {
+        console.log("[BALANCE] 5+ consecutive balance failures — winding down");
+        await this.setListenerState("winding_down");
+      }
+
+      // If winding down, check if we're flat (no open positions)
+      const currentState = await this.getListenerState();
+      if (currentState === "winding_down") {
+        const openCount = await getOpenPositionCount(this.env.DB);
+        if (openCount === 0) {
+          console.log("[WIND-DOWN] All positions closed — stopping listener");
+          await this.setListenerState("stopped");
+          return; // Don't re-schedule
+        }
+      }
     } catch (e) {
       console.error("Poll cycle error:", e);
     }
     // Re-schedule next poll in 2 seconds
-    await this.state.storage.setAlarm(Date.now() + 2000);
+    await this.doState.storage.setAlarm(Date.now() + 2000);
   }
 }
 
@@ -408,12 +546,82 @@ export default {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
 
+    // Auto-start DOs on first request (cron doesn't fire in local dev)
+    if (!autoStarted) {
+      autoStarted = true;
+      autoStartDOs(env).catch(() => {});
+    }
+
     // Handle CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: corsHeaders(origin),
       });
+    }
+
+    // ── Firehose cleanup & stats ───────────────────────────────────
+
+    if (url.pathname === "/api/firehose/stats") {
+      const fdb = env.FIREHOSE_DB ?? env.DB;
+      const [tradeRow, walletRow, botRow, targetRow, watchRow] =
+        await Promise.all([
+          fdb
+            .prepare("SELECT COUNT(*) as cnt FROM firehose_trades")
+            .first<{ cnt: number }>(),
+          fdb
+            .prepare("SELECT COUNT(*) as cnt FROM firehose_wallets")
+            .first<{ cnt: number }>(),
+          env.DB.prepare("SELECT COUNT(*) as cnt FROM suspect_bots").first<{
+            cnt: number;
+          }>(),
+          env.DB.prepare("SELECT COUNT(*) as cnt FROM copy_targets").first<{
+            cnt: number;
+          }>(),
+          env.DB.prepare("SELECT COUNT(*) as cnt FROM watchlist").first<{
+            cnt: number;
+          }>(),
+        ]);
+      return jsonCors(
+        {
+          firehose_trades: tradeRow?.cnt ?? 0,
+          firehose_wallets: walletRow?.cnt ?? 0,
+          suspect_bots: botRow?.cnt ?? 0,
+          copy_targets: targetRow?.cnt ?? 0,
+          watchlist: watchRow?.cnt ?? 0,
+        },
+        request,
+      );
+    }
+
+    if (url.pathname === "/api/firehose/cleanup" && request.method === "POST") {
+      const fdb = env.FIREHOSE_DB ?? env.DB;
+      const tradeResult = await fdb
+        .prepare(
+          `DELETE FROM firehose_trades WHERE taker NOT IN (
+             SELECT wallet FROM suspect_bots
+             UNION SELECT wallet FROM copy_targets
+             UNION SELECT wallet FROM watchlist
+           )`,
+        )
+        .run();
+      const walletResult = await fdb
+        .prepare(
+          `DELETE FROM firehose_wallets WHERE wallet NOT IN (
+             SELECT wallet FROM suspect_bots
+             UNION SELECT wallet FROM copy_targets
+             UNION SELECT wallet FROM watchlist
+           )`,
+        )
+        .run();
+      return jsonCors(
+        {
+          status: "cleaned",
+          trades_deleted: tradeResult.meta?.changes ?? 0,
+          wallets_deleted: walletResult.meta?.changes ?? 0,
+        },
+        request,
+      );
     }
 
     // ── Firehose routes → FirehoseDO ───────────────────────────────
@@ -682,7 +890,26 @@ export default {
       const w = body.wallet?.toLowerCase();
       if (!w) return jsonCors({ error: "wallet required" }, request, 400);
 
-      const category = body.category || "unknown";
+      // Auto-infer category from suspect_bots tags if not provided
+      let category = body.category || "unknown";
+      if (category === "unknown") {
+        try {
+          const bot = await env.DB.prepare(
+            "SELECT tags FROM suspect_bots WHERE wallet = ?",
+          )
+            .bind(w)
+            .first<{ tags: string }>();
+          if (bot?.tags) {
+            const tags: string[] = JSON.parse(bot.tags);
+            const marketCats = ["crypto", "politics", "sports", "finance"];
+            const found = marketCats.find((c) => tags.includes(c));
+            if (found) category = found;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+
       const interval =
         CATEGORY_INTERVALS[category] ?? CATEGORY_INTERVALS["unknown"];
 
@@ -716,10 +943,18 @@ export default {
         )
         .run();
 
-      // Ensure WatchlistDO is running
+      // Ensure WatchlistDO is running + take immediate snapshot
       const wlId = env.WATCHLIST.idFromName("singleton");
       const wlObj = env.WATCHLIST.get(wlId);
       await wlObj.fetch(new Request("https://dummy/start", { method: "POST" }));
+      wlObj
+        .fetch(
+          new Request("https://dummy/snapshot", {
+            method: "POST",
+            body: JSON.stringify({ wallet: w }),
+          }),
+        )
+        .catch(() => {});
 
       return jsonCors(
         {
@@ -1211,6 +1446,10 @@ export default {
           open_positions_count: openCount,
           roi_pct:
             peakCap > 0 ? Math.round((realizedPnl / peakCap) * 1000) / 10 : 0,
+          circuit_breaker_usd: r.circuit_breaker_usd ?? 50,
+          circuit_triggered_at: r.circuit_triggered_at ?? null,
+          virtual_balance: r.virtual_balance ?? 1000,
+          virtual_balance_initial: r.virtual_balance_initial ?? 1000,
         };
       });
       return jsonCors(enriched, request);
@@ -1232,6 +1471,114 @@ export default {
           ).bind(limit);
       const { results } = await stmt.all<CopyTrade>();
       return jsonCors(results ?? [], request);
+    }
+
+    // Copy target comparison — source bot vs our copies
+    const comparisonMatch = url.pathname.match(
+      /^\/api\/copy\/comparison\/(0x[a-fA-F0-9]+)$/,
+    );
+    if (comparisonMatch) {
+      const wallet = comparisonMatch[1].toLowerCase();
+
+      // Our copy trades
+      const { results: copyTrades } = await env.DB.prepare(
+        `SELECT side, status, price, size, fee_amount, timestamp, source_price
+         FROM copy_trades WHERE source_wallet = ?`,
+      )
+        .bind(wallet)
+        .all<{
+          side: string;
+          status: string;
+          price: number;
+          size: number;
+          fee_amount: number;
+          timestamp: string;
+          source_price: number;
+        }>();
+
+      const trades = copyTrades ?? [];
+      const total = trades.length;
+      const filled = trades.filter((t) => t.status === "filled");
+      const buys = filled.filter((t) => t.side === "BUY");
+      const sells = filled.filter((t) => t.side === "SELL");
+
+      const buyAttempts = trades.filter((t) => t.side === "BUY").length;
+      const sellAttempts = trades.filter((t) => t.side === "SELL").length;
+      const buyFillRate =
+        buyAttempts > 0
+          ? Math.round((buys.length / buyAttempts) * 1000) / 10
+          : 0;
+      const sellFillRate =
+        sellAttempts > 0
+          ? Math.round((sells.length / sellAttempts) * 1000) / 10
+          : 0;
+      const overallFillRate =
+        total > 0 ? Math.round((filled.length / total) * 1000) / 10 : 0;
+
+      // Compute realized P&L from filled trades
+      const buyNotional = buys.reduce((s, t) => s + t.price * t.size, 0);
+      const sellNotional = sells.reduce((s, t) => s + t.price * t.size, 0);
+      const totalFees = filled.reduce((s, t) => s + (t.fee_amount || 0), 0);
+      const realizedPnl =
+        Math.round((sellNotional - buyNotional - totalFees) * 100) / 100;
+
+      // Average slippage (source_price vs exec_price)
+      let slippageSum = 0;
+      let slippageCount = 0;
+      for (const t of filled) {
+        if (t.source_price > 0 && t.price > 0) {
+          slippageSum += Math.abs(t.price - t.source_price) / t.source_price;
+          slippageCount++;
+        }
+      }
+      const avgSlippageBps =
+        slippageCount > 0
+          ? Math.round((slippageSum / slippageCount) * 10000)
+          : 0;
+
+      // Source bot stats from leaderboard
+      let sourceProfit = 0;
+      try {
+        const lbResp = await fetch(
+          `https://lb-api.polymarket.com/profit?window=all&address=${wallet}`,
+        );
+        if (lbResp.ok) {
+          const lbData = (await lbResp.json()) as
+            | { amount?: number }
+            | Array<{ amount?: number }>;
+          if (Array.isArray(lbData) && lbData.length > 0) {
+            sourceProfit = lbData[0].amount ?? 0;
+          } else if (!Array.isArray(lbData)) {
+            sourceProfit = (lbData as { amount?: number }).amount ?? 0;
+          }
+        }
+      } catch {
+        /* optional */
+      }
+
+      return jsonCors(
+        {
+          source: {
+            wallet,
+            pnl_all: Math.round(sourceProfit * 100) / 100,
+          },
+          ours: {
+            trades_attempted: total,
+            trades_filled: filled.length,
+            fill_rate: overallFillRate,
+            buy_fill_rate: buyFillRate,
+            sell_fill_rate: sellFillRate,
+            pnl_realized: realizedPnl,
+            total_fees: Math.round(totalFees * 100) / 100,
+            avg_slippage_bps: avgSlippageBps,
+          },
+          divergence: {
+            missed_trades: total - filled.length,
+            fill_rate_gap: Math.round((100 - overallFillRate) * 10) / 10,
+          },
+        },
+        request,
+      );
     }
 
     // Copy target detail — FIFO P&L breakdown
@@ -1426,6 +1773,28 @@ export default {
       return jsonCors({ status: "reactivated", wallet: w }, request);
     }
 
+    if (url.pathname === "/api/copy/reset-paper" && request.method === "POST") {
+      const body = (await request.json()) as { wallet: string };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+
+      // Delete all paper copy trades for this wallet
+      await env.DB.prepare(
+        "DELETE FROM copy_trades WHERE source_wallet = ? AND mode = 'paper'",
+      )
+        .bind(w)
+        .run();
+
+      // Reset virtual balance to initial
+      await env.DB.prepare(
+        "UPDATE copy_targets SET virtual_balance = virtual_balance_initial, circuit_triggered_at = NULL WHERE wallet = ?",
+      )
+        .bind(w)
+        .run();
+
+      return jsonCors({ status: "reset", wallet: w }, request);
+    }
+
     if (url.pathname === "/api/copy/set-mode" && request.method === "POST") {
       const body = (await request.json()) as {
         wallet: string;
@@ -1447,6 +1816,7 @@ export default {
         trade_pct?: number;
         max_position_usd?: number;
         full_copy_below_usd?: number;
+        circuit_breaker_usd?: number;
       };
       const w = body.wallet?.toLowerCase();
       if (!w) return jsonCors({ error: "wallet required" }, request, 400);
@@ -1463,6 +1833,10 @@ export default {
       if (body.full_copy_below_usd !== undefined) {
         updates.push("full_copy_below_usd = ?");
         values.push(body.full_copy_below_usd);
+      }
+      if (body.circuit_breaker_usd !== undefined) {
+        updates.push("circuit_breaker_usd = ?");
+        values.push(body.circuit_breaker_usd);
       }
       if (updates.length === 0)
         return jsonCors({ error: "nothing to update" }, request, 400);

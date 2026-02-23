@@ -28,7 +28,7 @@ test.describe("Copy trading page", () => {
     const row = page.locator("table").first().locator("tbody tr").first();
     await row.waitFor({ timeout: 15_000 });
     // Cat column should exist in header
-    const catHeader = page.locator("th").filter({ hasText: "Cat" });
+    const catHeader = page.locator("th").filter({ hasText: "Category" });
     await expect(catHeader).toBeVisible();
   });
 
@@ -39,7 +39,12 @@ test.describe("Copy trading page", () => {
     // Click the row to expand
     await firstRow.click();
     // Detail panel should appear (CopyTargetDetail component)
-    const detailPanel = page.locator("table").first().locator("tbody tr").nth(1).locator("td");
+    const detailPanel = page
+      .locator("table")
+      .first()
+      .locator("tbody tr")
+      .nth(1)
+      .locator("td");
     await expect(detailPanel.first()).toBeVisible({ timeout: 10_000 });
   });
 

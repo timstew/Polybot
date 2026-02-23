@@ -140,6 +140,10 @@ export interface CopyTarget {
   win_rate: number;
   open_positions_count: number;
   roi_pct: number;
+  circuit_breaker_usd: number;
+  circuit_triggered_at: string | null;
+  virtual_balance: number;
+  virtual_balance_initial: number;
 }
 
 export interface CopyTradeRow {
@@ -422,6 +426,21 @@ export const api = {
   tradesClear: () => postJSON<{ status: string }>("/api/trades/clear"),
   copyDetail: (wallet: string, source: "local" | "cloud" = "local") =>
     fetchJSON<CopyDetailData>(`/api/copy/detail/${wallet}?source=${source}`),
+  copyComparison: (wallet: string) =>
+    fetchJSON<{
+      source: { wallet: string; pnl_all: number };
+      ours: {
+        trades_attempted: number;
+        trades_filled: number;
+        fill_rate: number;
+        buy_fill_rate: number;
+        sell_fill_rate: number;
+        pnl_realized: number;
+        total_fees: number;
+        avg_slippage_bps: number;
+      };
+      divergence: { missed_trades: number; fill_rate_gap: number };
+    }>(`/api/copy/comparison/${wallet}`),
   wallet: (address: string) =>
     fetchJSON<WalletDetail>(`/api/wallet/${address}`),
   walletTrades: (address: string, limit = 100) =>
@@ -438,6 +457,10 @@ export const api = {
     }),
   copyReactivate: (wallet: string) =>
     postJSON<{ status: string; wallet: string }>("/api/copy/reactivate", {
+      wallet,
+    }),
+  copyResetPaper: (wallet: string) =>
+    postJSON<{ status: string; wallet: string }>("/api/copy/reset-paper", {
       wallet,
     }),
   copySetMode: (wallet: string, mode: "paper" | "real") =>
@@ -470,12 +493,16 @@ export const api = {
     postJSON<{ status: string }>("/api/copy/listener/cloud-start", {}),
   cloudListenerStop: () =>
     postJSON<{ status: string }>("/api/copy/listener/cloud-stop", {}),
+  cloudListenerForceStop: () =>
+    postJSON<{ status: string }>("/api/copy/listener/cloud-force-stop", {}),
   cloudListenerStatus: () =>
     fetchJSON<{
       running: boolean;
       polls?: number;
       trade_count?: number;
       error?: string;
+      state?: "running" | "winding_down" | "stopped";
+      open_positions?: number;
     }>("/api/copy/listener/cloud-status"),
   cloudTrades: (limit = 20) =>
     fetchJSON<CopyTradeRow[]>(`/api/copy/trades/cloud?limit=${limit}`),

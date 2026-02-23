@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Table,
@@ -32,7 +32,7 @@ import {
   ArrowUpRight,
   ChevronDown,
   ChevronRight,
-  Eye,
+  ClipboardList,
   Plus,
   Trash2,
   TrendingDown,
@@ -58,7 +58,8 @@ function timeAgo(iso: string | null): string {
 }
 
 function TrendBadge({ value }: { value: number | null }) {
-  if (value === null || value === undefined) return <span className="text-xs text-muted-foreground">--</span>;
+  if (value === null || value === undefined)
+    return <span className="text-xs text-muted-foreground">--</span>;
   const positive = value >= 0;
   return (
     <span
@@ -79,7 +80,8 @@ function TrendBadge({ value }: { value: number | null }) {
 
 // Tiny sparkline using SVG (last N snapshots of profit_all)
 function Sparkline({ data }: { data: number[] }) {
-  if (data.length < 2) return <span className="text-xs text-muted-foreground">--</span>;
+  if (data.length < 2)
+    return <span className="text-xs text-muted-foreground">--</span>;
   const min = Math.min(...data);
   const max = Math.max(...data);
   const range = max - min || 1;
@@ -172,7 +174,11 @@ function AddWalletForm({ onAdd }: { onAdd: () => void }) {
           className="h-8 text-sm"
         />
       </div>
-      <Button size="sm" onClick={handleSubmit} disabled={loading || !wallet.startsWith("0x")}>
+      <Button
+        size="sm"
+        onClick={handleSubmit}
+        disabled={loading || !wallet.startsWith("0x")}
+      >
         {loading ? "Adding..." : "Add"}
       </Button>
       <Button size="sm" variant="ghost" onClick={() => setOpen(false)}>
@@ -227,9 +233,16 @@ function WatchlistDetail({
         <div className="grid grid-cols-3 gap-4">
           {/* Snapshot history chart */}
           <div>
-            <h4 className="mb-2 text-sm font-medium">P&L Trend ({history.length} snapshots)</h4>
+            <h4 className="mb-2 text-sm font-medium">
+              P&L Trend ({history.length} snapshots)
+            </h4>
             {sparkData.length >= 2 ? (
-              <svg width="100%" height="80" viewBox="0 0 200 80" preserveAspectRatio="none">
+              <svg
+                width="100%"
+                height="80"
+                viewBox="0 0 200 80"
+                preserveAspectRatio="none"
+              >
                 {(() => {
                   const min = Math.min(...sparkData);
                   const max = Math.max(...sparkData);
@@ -241,7 +254,8 @@ function WatchlistDetail({
                       return `${x},${y}`;
                     })
                     .join(" ");
-                  const trending = sparkData[sparkData.length - 1] >= sparkData[0];
+                  const trending =
+                    sparkData[sparkData.length - 1] >= sparkData[0];
                   return (
                     <polyline
                       points={points}
@@ -253,7 +267,9 @@ function WatchlistDetail({
                 })()}
               </svg>
             ) : (
-              <p className="text-xs text-muted-foreground">Waiting for snapshots...</p>
+              <p className="text-xs text-muted-foreground">
+                Waiting for snapshots...
+              </p>
             )}
           </div>
 
@@ -261,11 +277,16 @@ function WatchlistDetail({
           <div>
             <h4 className="mb-2 text-sm font-medium">Top Positions</h4>
             {positions.length === 0 ? (
-              <p className="text-xs text-muted-foreground">No position data yet</p>
+              <p className="text-xs text-muted-foreground">
+                No position data yet
+              </p>
             ) : (
               <div className="space-y-1">
                 {positions.slice(0, 5).map((p, i) => (
-                  <div key={i} className="flex items-center justify-between text-xs">
+                  <div
+                    key={i}
+                    className="flex items-center justify-between text-xs"
+                  >
                     <span className="max-w-[180px] truncate" title={p.title}>
                       {p.title}
                     </span>
@@ -285,7 +306,8 @@ function WatchlistDetail({
                 className="w-full"
                 onClick={() => onPromote(entry.wallet, "paper")}
               >
-                <ArrowUpRight className="mr-1 h-3 w-3" /> Promote to Paper Trading
+                <ArrowUpRight className="mr-1 h-3 w-3" /> Promote to Paper
+                Trading
               </Button>
               <Button
                 size="sm"
@@ -293,7 +315,8 @@ function WatchlistDetail({
                 className="w-full"
                 onClick={() => onPromote(entry.wallet, "real")}
               >
-                <ArrowUpRight className="mr-1 h-3 w-3" /> Promote to Real Trading
+                <ArrowUpRight className="mr-1 h-3 w-3" /> Promote to Real
+                Trading
               </Button>
               <Button
                 size="sm"
@@ -366,15 +389,13 @@ export default function WatchlistPage() {
   ).length;
   const avgWinRate =
     entries.length > 0
-      ? entries.reduce((sum, e) => sum + (e.latest?.win_rate ?? 0), 0) / entries.length
+      ? entries.reduce((sum, e) => sum + (e.latest?.win_rate ?? 0), 0) /
+        entries.length
       : 0;
-  const bestToday = entries.reduce(
-    (best, e) => {
-      const p1d = e.latest?.profit_1d ?? 0;
-      return p1d > (best?.latest?.profit_1d ?? -Infinity) ? e : best;
-    },
-    entries[0],
-  );
+  const bestToday = entries.reduce((best, e) => {
+    const p1d = e.latest?.profit_1d ?? 0;
+    return p1d > (best?.latest?.profit_1d ?? -Infinity) ? e : best;
+  }, entries[0]);
 
   return (
     <div className="space-y-6">
@@ -390,7 +411,7 @@ export default function WatchlistPage() {
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -426,7 +447,7 @@ export default function WatchlistPage() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-bold">
-              {(avgWinRate * 100).toFixed(1)}%
+              {entries.length > 0 ? `${(avgWinRate * 100).toFixed(1)}%` : "--"}
             </p>
           </CardContent>
         </Card>
@@ -437,12 +458,14 @@ export default function WatchlistPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {bestToday ? (
+            {bestToday && (bestToday.latest?.profit_1d ?? 0) !== 0 ? (
               <div>
                 <p className="text-lg font-bold">
                   {bestToday.username || bestToday.wallet.slice(0, 8)}
                 </p>
-                <p className="text-sm text-emerald-600">
+                <p
+                  className={`text-sm ${(bestToday.latest?.profit_1d ?? 0) > 0 ? "text-emerald-600" : "text-red-500"}`}
+                >
                   {fmt(bestToday.latest?.profit_1d ?? 0)}
                 </p>
               </div>
@@ -464,7 +487,7 @@ export default function WatchlistPage() {
             </div>
           ) : entries.length === 0 ? (
             <div className="p-12 text-center">
-              <Eye className="mx-auto mb-3 h-10 w-10 text-muted-foreground" />
+              <ClipboardList className="mx-auto mb-3 h-10 w-10 text-muted-foreground/50" />
               <h3 className="text-lg font-medium">No wallets on watchlist</h3>
               <p className="text-sm text-muted-foreground">
                 Add bots from the Dashboard or enter a wallet address above
@@ -489,9 +512,8 @@ export default function WatchlistPage() {
               </TableHeader>
               <TableBody>
                 {entries.map((entry) => (
-                  <>
+                  <React.Fragment key={entry.wallet}>
                     <TableRow
-                      key={entry.wallet}
                       className="cursor-pointer hover:bg-muted/50"
                       onClick={() =>
                         setExpandedWallet(
@@ -560,7 +582,7 @@ export default function WatchlistPage() {
                         onRemove={handleRemove}
                       />
                     )}
-                  </>
+                  </React.Fragment>
                 ))}
               </TableBody>
             </Table>

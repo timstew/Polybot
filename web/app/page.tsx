@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Table,
@@ -176,7 +176,7 @@ const COLUMNS: ColumnDef[] = [
     key: "avg_hold_time_hours",
     label: "Hold",
     sortKey: "avg_hold_time_hours",
-    defaultVisible: true,
+    defaultVisible: false,
     className: "text-right",
   },
   { key: "info", label: "", defaultVisible: true },
@@ -269,14 +269,22 @@ function SortableHead({
   className?: string;
 }) {
   const active = currentKey === sortKey;
-  const arrow = active ? (currentDir === "desc" ? " \u25BC" : " \u25B2") : "";
+  const arrow = active
+    ? currentDir === "desc"
+      ? " \u25BC"
+      : " \u25B2"
+    : " \u25BD";
   return (
     <TableHead
       className={`cursor-pointer select-none hover:text-foreground ${className}`}
       onClick={() => onSort(sortKey)}
     >
       {label}
-      {arrow && <span className="ml-0.5 text-xs">{arrow}</span>}
+      <span
+        className={`ml-0.5 text-xs ${active ? "" : "text-muted-foreground/40"}`}
+      >
+        {arrow}
+      </span>
     </TableHead>
   );
 }
@@ -345,6 +353,36 @@ export default function DashboardPage() {
       ),
   );
   const [showColPicker, setShowColPicker] = useState(false);
+  const colPickerRef = useRef<HTMLDivElement>(null);
+
+  // Watchlist tracking
+  const [watchlistedWallets, setWatchlistedWallets] = useState<Set<string>>(
+    new Set(),
+  );
+
+  useEffect(() => {
+    api
+      .watchlist()
+      .then((entries) => {
+        setWatchlistedWallets(new Set(entries.map((e) => e.wallet)));
+      })
+      .catch(() => {});
+  }, []);
+
+  // Close column picker on click outside
+  useEffect(() => {
+    if (!showColPicker) return;
+    function handleClick(e: MouseEvent) {
+      if (
+        colPickerRef.current &&
+        !colPickerRef.current.contains(e.target as Node)
+      ) {
+        setShowColPicker(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showColPicker]);
 
   // Save column visibility to localStorage
   useEffect(() => {
@@ -405,6 +443,15 @@ export default function DashboardPage() {
     try {
       await api.copyAdd(wallet);
       refreshStats();
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleWatchlist(wallet: string) {
+    try {
+      await api.watchlistAdd(wallet);
+      setWatchlistedWallets((prev) => new Set([...prev, wallet]));
     } catch {
       // ignore
     }
@@ -518,8 +565,10 @@ export default function DashboardPage() {
                     </span>
                     Live
                   </Badge>
+                ) : stats ? (
+                  <Badge variant="outline">Idle</Badge>
                 ) : (
-                  <Badge variant="secondary">Offline</Badge>
+                  <Badge variant="destructive">Offline</Badge>
                 )}
               </div>
 
@@ -664,7 +713,7 @@ export default function DashboardPage() {
                   )}
                 </Button>
                 {/* Column picker toggle */}
-                <div className="relative">
+                <div className="relative" ref={colPickerRef}>
                   <Button
                     variant="outline"
                     size="sm"
@@ -910,6 +959,8 @@ export default function DashboardPage() {
                                 address={r.wallet}
                                 username={r.username}
                                 onCopyTrade={handleCopyTrade}
+                                onWatchlist={handleWatchlist}
+                                isWatchlisted={watchlistedWallets.has(r.wallet)}
                               />
                             </TableCell>
                           )}
@@ -943,9 +994,11 @@ export default function DashboardPage() {
                             <TableCell className="text-right">
                               <span
                                 className={`font-mono text-sm font-semibold tabular-nums ${
-                                  r.pnl_pct >= 0
+                                  r.pnl_pct > 0
                                     ? "text-green-600"
-                                    : "text-red-600"
+                                    : r.pnl_pct < 0
+                                      ? "text-red-600"
+                                      : "text-muted-foreground"
                                 }`}
                               >
                                 {r.pnl_pct >= 0 ? "+" : ""}
@@ -1104,7 +1157,7 @@ export default function DashboardPage() {
                 <div className="mt-4 flex items-center justify-between text-sm text-muted-foreground">
                   <div className="flex items-center gap-2">
                     <span>
-                      Showing {page * pageSize + 1}\u2013
+                      Showing {page * pageSize + 1} &ndash;{" "}
                       {Math.min((page + 1) * pageSize, sorted.length)} of{" "}
                       {sorted.length}
                     </span>
