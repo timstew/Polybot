@@ -1806,6 +1806,35 @@ export default {
       return jsonCors({ status: "removed", wallet: w }, request);
     }
 
+    if (url.pathname === "/api/copy/purge" && request.method === "POST") {
+      const body = (await request.json()) as { wallet: string };
+      const w = body.wallet?.toLowerCase();
+      if (!w) return jsonCors({ error: "wallet required" }, request, 400);
+
+      // Only allow purging inactive targets
+      const target = await env.DB.prepare(
+        "SELECT active FROM copy_targets WHERE wallet = ?",
+      )
+        .bind(w)
+        .first<{ active: number }>();
+      if (target?.active) {
+        return jsonCors(
+          { error: "Cannot purge active target. Remove it first." },
+          request,
+          400,
+        );
+      }
+
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM copy_targets WHERE wallet = ?").bind(w),
+        env.DB.prepare("DELETE FROM copy_trades WHERE source_wallet = ?").bind(
+          w,
+        ),
+      ]);
+      // firehose_trades for this wallet will be cleaned up by periodic maintenance
+      return jsonCors({ status: "purged", wallet: w }, request);
+    }
+
     if (url.pathname === "/api/copy/reactivate" && request.method === "POST") {
       const body = (await request.json()) as { wallet: string };
       const w = body.wallet?.toLowerCase();

@@ -459,6 +459,10 @@ export const api = {
     postJSON<{ status: string; wallet: string }>("/api/copy/reactivate", {
       wallet,
     }),
+  copyPurge: (wallet: string) =>
+    postJSON<{ status: string; wallet: string }>("/api/copy/purge", {
+      wallet,
+    }),
   copyResetPaper: (wallet: string) =>
     postJSON<{ status: string; wallet: string }>("/api/copy/reset-paper", {
       wallet,

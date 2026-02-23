@@ -23,7 +23,7 @@ import {
 import { WalletLink } from "@/components/wallet-link";
 import { CopyTargetDetail } from "@/components/copy-target-detail";
 import { Legend } from "@/components/legend";
-import { ChevronDown, ChevronRight, RotateCcw } from "lucide-react";
+import { ChevronDown, ChevronRight, RotateCcw, Trash2 } from "lucide-react";
 import { api, type CopyTarget, type CopyTradeRow, type Stats } from "@/lib/api";
 
 function fmt(n: number) {
@@ -138,9 +138,11 @@ const COLLAPSE_THRESHOLD = 8;
 function InactiveTargets({
   targets,
   onReactivate,
+  onPurge,
 }: {
   targets: CopyTarget[];
   onReactivate: (addr: string) => void;
+  onPurge: (addr: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const shouldCollapse = targets.length > COLLAPSE_THRESHOLD;
@@ -178,6 +180,20 @@ function InactiveTargets({
               title="Reactivate"
             >
               <RotateCcw className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => {
+                if (
+                  confirm(
+                    `Permanently delete ${t.username || t.wallet.slice(0, 10)} and all its trade data?`,
+                  )
+                )
+                  onPurge(t.wallet);
+              }}
+              className="p-0.5 rounded hover:bg-destructive/20 hover:text-destructive text-muted-foreground transition-colors"
+              title="Purge (permanent delete)"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
             </button>
           </Badge>
         ))}
@@ -378,6 +394,15 @@ export default function CopyTradingPage() {
   async function handleReactivate(addr: string) {
     try {
       await api.copyReactivate(addr);
+      refresh();
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handlePurge(addr: string) {
+    try {
+      await api.copyPurge(addr);
       refresh();
     } catch {
       // ignore
@@ -836,6 +861,7 @@ export default function CopyTradingPage() {
             <InactiveTargets
               targets={inactiveTargets}
               onReactivate={handleReactivate}
+              onPurge={handlePurge}
             />
           )}
         </CardContent>
