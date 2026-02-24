@@ -80,6 +80,60 @@ export class FirehoseDO implements DurableObject {
     return this.env.FIREHOSE_DB ?? this.env.DB;
   }
 
+  /** Fetch wallets to keep: from ops DB (copy_targets, watchlist) + firehose DB (suspect_bots). */
+  private async getKeptWallets(): Promise<Set<string>> {
+    const [targets, watchlist, bots] = await Promise.all([
+      this.env.DB.prepare("SELECT wallet FROM copy_targets").all<{
+        wallet: string;
+      }>(),
+      this.env.DB.prepare("SELECT wallet FROM watchlist").all<{
+        wallet: string;
+      }>(),
+      this.fdb.prepare("SELECT wallet FROM suspect_bots").all<{
+        wallet: string;
+      }>(),
+    ]);
+    const kept = new Set<string>();
+    for (const r of targets.results ?? []) kept.add(r.wallet);
+    for (const r of watchlist.results ?? []) kept.add(r.wallet);
+    for (const r of bots.results ?? []) kept.add(r.wallet);
+    return kept;
+  }
+
+  /** Prune rows from a firehose table where wallet is not in the kept set. */
+  private async pruneTable(
+    table: string,
+    walletCol: string,
+    kept: Set<string>,
+    batch = 50_000,
+  ): Promise<number> {
+    let total = 0;
+    for (;;) {
+      const { results: candidates } = await this.fdb
+        .prepare(`SELECT rowid, ${walletCol} as w FROM ${table} LIMIT ?`)
+        .bind(batch)
+        .all<{ rowid: number; w: string }>();
+      if (!candidates || candidates.length === 0) break;
+
+      const toDelete = candidates
+        .filter((c) => !kept.has(c.w))
+        .map((c) => c.rowid);
+      if (toDelete.length === 0) break;
+
+      for (let i = 0; i < toDelete.length; i += 500) {
+        const chunk = toDelete.slice(i, i + 500);
+        const placeholders = chunk.map(() => "?").join(",");
+        await this.fdb
+          .prepare(`DELETE FROM ${table} WHERE rowid IN (${placeholders})`)
+          .bind(...chunk)
+          .run();
+      }
+      total += toDelete.length;
+      if (candidates.length < batch) break;
+    }
+    return total;
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -245,49 +299,19 @@ export class FirehoseDO implements DurableObject {
         `Detection complete: ${this.detectBotsFound} bots from ${this.detectWalletsScanned} wallets`,
       );
 
-      // Post-detection cleanup: prune trades/wallets for non-bot, non-tracked wallets (batched)
+      // Post-detection cleanup: prune trades/wallets for non-bot, non-tracked wallets
       try {
-        const BATCH = 50_000;
-        let totalTrades = 0;
-        let totalWallets = 0;
-        for (;;) {
-          const r = await this.fdb
-            .prepare(
-              `DELETE FROM firehose_trades WHERE rowid IN (
-                 SELECT rowid FROM firehose_trades
-                 WHERE taker NOT IN (
-                   SELECT wallet FROM suspect_bots
-                   UNION SELECT wallet FROM copy_targets
-                   UNION SELECT wallet FROM watchlist
-                 )
-                 LIMIT ?
-               )`,
-            )
-            .bind(BATCH)
-            .run();
-          const changed = r.meta?.changes ?? 0;
-          totalTrades += changed;
-          if (changed < BATCH) break;
-        }
-        for (;;) {
-          const r = await this.fdb
-            .prepare(
-              `DELETE FROM firehose_wallets WHERE rowid IN (
-                 SELECT rowid FROM firehose_wallets
-                 WHERE wallet NOT IN (
-                   SELECT wallet FROM suspect_bots
-                   UNION SELECT wallet FROM copy_targets
-                   UNION SELECT wallet FROM watchlist
-                 )
-                 LIMIT ?
-               )`,
-            )
-            .bind(BATCH)
-            .run();
-          const changed = r.meta?.changes ?? 0;
-          totalWallets += changed;
-          if (changed < BATCH) break;
-        }
+        const kept = await this.getKeptWallets();
+        const totalTrades = await this.pruneTable(
+          "firehose_trades",
+          "taker",
+          kept,
+        );
+        const totalWallets = await this.pruneTable(
+          "firehose_wallets",
+          "wallet",
+          kept,
+        );
         console.log(
           `[CLEANUP] Pruned ${totalTrades} non-bot trades, ${totalWallets} non-bot wallets`,
         );
@@ -354,9 +378,9 @@ export class FirehoseDO implements DurableObject {
         this.detectBotsFound += data.bots.length;
       }
 
-      // Store detected bots in D1
+      // Store detected bots in firehose DB
       if (data.bots && data.bots.length > 0) {
-        const stmt = this.env.DB.prepare(
+        const stmt = this.fdb.prepare(
           `INSERT OR REPLACE INTO suspect_bots
            (wallet, confidence, category, trade_count, tags, detected_at,
             pnl_pct, realized_pnl, win_rate, total_volume_usd,
@@ -383,7 +407,7 @@ export class FirehoseDO implements DurableObject {
           ),
         );
         for (let i = 0; i < batch.length; i += 100) {
-          await this.env.DB.batch(batch.slice(i, i + 100));
+          await this.fdb.batch(batch.slice(i, i + 100));
         }
       }
     } catch (e) {
@@ -518,11 +542,9 @@ export class FirehoseDO implements DurableObject {
 
   private async periodicCleanup(): Promise<void> {
     try {
-      const BATCH = 50_000;
-      let totalTrades = 0;
-      let totalWallets = 0;
-
       // Retention: delete trades older than 3 days
+      const BATCH = 50_000;
+      let retentionDeleted = 0;
       for (;;) {
         const r = await this.fdb
           .prepare(
@@ -535,51 +557,20 @@ export class FirehoseDO implements DurableObject {
           .bind(BATCH)
           .run();
         const changed = r.meta?.changes ?? 0;
-        totalTrades += changed;
+        retentionDeleted += changed;
         if (changed < BATCH) break;
       }
 
-      // Prune non-bot trades
-      for (;;) {
-        const r = await this.fdb
-          .prepare(
-            `DELETE FROM firehose_trades WHERE rowid IN (
-               SELECT rowid FROM firehose_trades
-               WHERE taker NOT IN (
-                 SELECT wallet FROM suspect_bots
-                 UNION SELECT wallet FROM copy_targets
-                 UNION SELECT wallet FROM watchlist
-               )
-               LIMIT ?
-             )`,
-          )
-          .bind(BATCH)
-          .run();
-        const changed = r.meta?.changes ?? 0;
-        totalTrades += changed;
-        if (changed < BATCH) break;
-      }
-
-      // Prune non-bot wallets
-      for (;;) {
-        const r = await this.fdb
-          .prepare(
-            `DELETE FROM firehose_wallets WHERE rowid IN (
-               SELECT rowid FROM firehose_wallets
-               WHERE wallet NOT IN (
-                 SELECT wallet FROM suspect_bots
-                 UNION SELECT wallet FROM copy_targets
-                 UNION SELECT wallet FROM watchlist
-               )
-               LIMIT ?
-             )`,
-          )
-          .bind(BATCH)
-          .run();
-        const changed = r.meta?.changes ?? 0;
-        totalWallets += changed;
-        if (changed < BATCH) break;
-      }
+      // Prune non-bot trades and wallets (cross-DB safe)
+      const kept = await this.getKeptWallets();
+      const totalTrades =
+        retentionDeleted +
+        (await this.pruneTable("firehose_trades", "taker", kept));
+      const totalWallets = await this.pruneTable(
+        "firehose_wallets",
+        "wallet",
+        kept,
+      );
 
       if (totalTrades > 0 || totalWallets > 0) {
         console.log(

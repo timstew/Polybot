@@ -33,22 +33,4 @@ CREATE TABLE IF NOT EXISTS copy_trades (
 
 CREATE INDEX IF NOT EXISTS idx_copy_trades_wallet ON copy_trades(source_wallet);
 
--- Detected bots from cloud scanning
-CREATE TABLE IF NOT EXISTS suspect_bots (
-    wallet TEXT PRIMARY KEY,
-    confidence REAL NOT NULL DEFAULT 0,
-    category TEXT NOT NULL DEFAULT 'unknown',
-    trade_count INTEGER NOT NULL DEFAULT 0,
-    tags TEXT NOT NULL DEFAULT '[]',
-    detected_at TEXT NOT NULL DEFAULT (datetime('now')),
-    pnl_pct REAL NOT NULL DEFAULT 0,
-    realized_pnl REAL NOT NULL DEFAULT 0,
-    win_rate REAL NOT NULL DEFAULT 0,
-    total_volume_usd REAL NOT NULL DEFAULT 0,
-    profit_1d REAL NOT NULL DEFAULT 0,
-    profit_7d REAL NOT NULL DEFAULT 0,
-    profit_30d REAL NOT NULL DEFAULT 0,
-    profit_all REAL NOT NULL DEFAULT 0,
-    username TEXT NOT NULL DEFAULT '',
-    copy_score REAL NOT NULL DEFAULT 0
-);
+-- suspect_bots now lives in FIREHOSE_DB (schema-firehose.sql)

@@ -240,6 +240,67 @@ interface TradeRowWithMarket extends TradeRow {
   market?: string;
 }
 
+/**
+ * Fetch wallets to keep during cleanup. When DBs are split, copy_targets
+ * and watchlist are in the ops DB while suspect_bots is in the firehose DB.
+ */
+async function getKeptWallets(
+  opsDb: D1Database,
+  firehoseDb: D1Database,
+): Promise<Set<string>> {
+  const [targets, watchlist, bots] = await Promise.all([
+    opsDb.prepare("SELECT wallet FROM copy_targets").all<{ wallet: string }>(),
+    opsDb.prepare("SELECT wallet FROM watchlist").all<{ wallet: string }>(),
+    firehoseDb
+      .prepare("SELECT wallet FROM suspect_bots")
+      .all<{ wallet: string }>(),
+  ]);
+  const kept = new Set<string>();
+  for (const r of targets.results ?? []) kept.add(r.wallet);
+  for (const r of watchlist.results ?? []) kept.add(r.wallet);
+  for (const r of bots.results ?? []) kept.add(r.wallet);
+  return kept;
+}
+
+/**
+ * Batched delete from a firehose table, keeping only rows matching a wallet set.
+ */
+async function pruneFirehoseTable(
+  db: D1Database,
+  table: string,
+  walletColumn: string,
+  keptWallets: Set<string>,
+  batch = 50_000,
+): Promise<number> {
+  let total = 0;
+  for (;;) {
+    // Fetch a batch of candidate rowids
+    const { results: candidates } = await db
+      .prepare(`SELECT rowid, ${walletColumn} as w FROM ${table} LIMIT ?`)
+      .bind(batch)
+      .all<{ rowid: number; w: string }>();
+    if (!candidates || candidates.length === 0) break;
+
+    const toDelete = candidates
+      .filter((c) => !keptWallets.has(c.w))
+      .map((c) => c.rowid);
+    if (toDelete.length === 0) break;
+
+    // Delete in sub-batches of 500 (D1 parameter limit)
+    for (let i = 0; i < toDelete.length; i += 500) {
+      const chunk = toDelete.slice(i, i + 500);
+      const placeholders = chunk.map(() => "?").join(",");
+      await db
+        .prepare(`DELETE FROM ${table} WHERE rowid IN (${placeholders})`)
+        .bind(...chunk)
+        .run();
+    }
+    total += toDelete.length;
+    if (candidates.length < batch) break;
+  }
+  return total;
+}
+
 function computeFifoPnl(trades: TradeRowWithMarket[]): PnlResult {
   const byAsset = new Map<string, TradeRowWithMarket[]>();
   for (const t of trades) {
@@ -545,6 +606,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
+    const fdb = env.FIREHOSE_DB ?? env.DB; // firehose DB (suspect_bots, firehose_trades, firehose_wallets)
 
     // Auto-start DOs on first request (cron doesn't fire in local dev)
     if (!autoStarted) {
@@ -563,7 +625,6 @@ export default {
     // ── Firehose cleanup & stats ───────────────────────────────────
 
     if (url.pathname === "/api/firehose/stats") {
-      const fdb = env.FIREHOSE_DB ?? env.DB;
       const [tradeRow, walletRow, botRow, targetRow, watchRow] =
         await Promise.all([
           fdb
@@ -572,7 +633,7 @@ export default {
           fdb
             .prepare("SELECT COUNT(*) as cnt FROM firehose_wallets")
             .first<{ cnt: number }>(),
-          env.DB.prepare("SELECT COUNT(*) as cnt FROM suspect_bots").first<{
+          fdb.prepare("SELECT COUNT(*) as cnt FROM suspect_bots").first<{
             cnt: number;
           }>(),
           env.DB.prepare("SELECT COUNT(*) as cnt FROM copy_targets").first<{
@@ -595,12 +656,10 @@ export default {
     }
 
     if (url.pathname === "/api/firehose/cleanup" && request.method === "POST") {
-      const fdb = env.FIREHOSE_DB ?? env.DB;
-      const BATCH = 50_000;
       let tradesDeleted = 0;
-      let walletsDeleted = 0;
 
-      // Step 1: Delete old trades (> 3 days) in batches — fastest path
+      // Step 1: Delete old trades (> 3 days) in batches
+      const BATCH = 50_000;
       for (;;) {
         const r = await fdb
           .prepare(
@@ -617,47 +676,20 @@ export default {
         if (changed < BATCH) break;
       }
 
-      // Step 2: Delete non-bot trades in batches
-      for (;;) {
-        const r = await fdb
-          .prepare(
-            `DELETE FROM firehose_trades WHERE rowid IN (
-               SELECT rowid FROM firehose_trades
-               WHERE taker NOT IN (
-                 SELECT wallet FROM suspect_bots
-                 UNION SELECT wallet FROM copy_targets
-                 UNION SELECT wallet FROM watchlist
-               )
-               LIMIT ?
-             )`,
-          )
-          .bind(BATCH)
-          .run();
-        const changed = r.meta?.changes ?? 0;
-        tradesDeleted += changed;
-        if (changed < BATCH) break;
-      }
-
-      // Step 3: Delete non-bot wallets in batches
-      for (;;) {
-        const r = await fdb
-          .prepare(
-            `DELETE FROM firehose_wallets WHERE rowid IN (
-               SELECT rowid FROM firehose_wallets
-               WHERE wallet NOT IN (
-                 SELECT wallet FROM suspect_bots
-                 UNION SELECT wallet FROM copy_targets
-                 UNION SELECT wallet FROM watchlist
-               )
-               LIMIT ?
-             )`,
-          )
-          .bind(BATCH)
-          .run();
-        const changed = r.meta?.changes ?? 0;
-        walletsDeleted += changed;
-        if (changed < BATCH) break;
-      }
+      // Step 2: Prune non-bot trades and wallets (cross-DB safe)
+      const kept = await getKeptWallets(env.DB, fdb);
+      tradesDeleted += await pruneFirehoseTable(
+        fdb,
+        "firehose_trades",
+        "taker",
+        kept,
+      );
+      const walletsDeleted = await pruneFirehoseTable(
+        fdb,
+        "firehose_wallets",
+        "wallet",
+        kept,
+      );
 
       return jsonCors(
         {
@@ -725,9 +757,10 @@ export default {
       const minConfidence = Number(
         url.searchParams.get("min_confidence") ?? "0",
       );
-      const { results } = await env.DB.prepare(
-        "SELECT * FROM suspect_bots WHERE confidence >= ? ORDER BY confidence DESC",
-      )
+      const { results } = await fdb
+        .prepare(
+          "SELECT * FROM suspect_bots WHERE confidence >= ? ORDER BY confidence DESC",
+        )
         .bind(minConfidence)
         .all<{
           wallet: string;
@@ -747,7 +780,7 @@ export default {
     }
 
     if (url.pathname === "/api/bots/clear") {
-      await env.DB.prepare("DELETE FROM suspect_bots").run();
+      await fdb.prepare("DELETE FROM suspect_bots").run();
       return jsonCors({ status: "cleared" }, request);
     }
 
@@ -779,14 +812,15 @@ export default {
       };
 
       // Get total count for pagination
-      const countResult = await env.DB.prepare(
-        "SELECT COUNT(*) as total FROM suspect_bots",
-      ).first<{ total: number }>();
+      const countResult = await fdb
+        .prepare("SELECT COUNT(*) as total FROM suspect_bots")
+        .first<{ total: number }>();
       const total = countResult?.total ?? 0;
 
-      const { results } = await env.DB.prepare(
-        "SELECT * FROM suspect_bots ORDER BY copy_score DESC, confidence DESC LIMIT ? OFFSET ?",
-      )
+      const { results } = await fdb
+        .prepare(
+          "SELECT * FROM suspect_bots ORDER BY copy_score DESC, confidence DESC LIMIT ? OFFSET ?",
+        )
         .bind(limit, offset)
         .all<SuspectBotRow>();
 
@@ -939,9 +973,8 @@ export default {
       let category = body.category || "unknown";
       if (category === "unknown") {
         try {
-          const bot = await env.DB.prepare(
-            "SELECT tags FROM suspect_bots WHERE wallet = ?",
-          )
+          const bot = await fdb
+            .prepare("SELECT tags FROM suspect_bots WHERE wallet = ?")
             .bind(w)
             .first<{ tags: string }>();
           if (bot?.tags) {
@@ -1118,10 +1151,9 @@ export default {
     if (walletMatch) {
       const w = walletMatch[1].toLowerCase();
 
-      // 1. Bot info from D1
-      const botRow = await env.DB.prepare(
-        "SELECT * FROM suspect_bots WHERE wallet = ?",
-      )
+      // 1. Bot info from firehose DB
+      const botRow = await fdb
+        .prepare("SELECT * FROM suspect_bots WHERE wallet = ?")
         .bind(w)
         .first<{
           wallet: string;
@@ -1312,8 +1344,6 @@ export default {
       const listener = (await listenerResp.json()) as Record<string, unknown>;
 
       // Count copy trades and targets + DB sizes
-      const fdb = env.FIREHOSE_DB ?? env.DB;
-
       const [
         copyTradeRow,
         targetRow,
@@ -1331,7 +1361,7 @@ export default {
         fdb
           .prepare("SELECT COUNT(DISTINCT taker) as cnt FROM firehose_trades")
           .first<{ cnt: number }>(),
-        env.DB.prepare("SELECT COUNT(*) as cnt FROM suspect_bots").first<{
+        fdb.prepare("SELECT COUNT(*) as cnt FROM suspect_bots").first<{
           cnt: number;
         }>(),
         fdb
@@ -1372,12 +1402,12 @@ export default {
           db_ops: {
             copy_trades: copyTradeRow?.cnt ?? 0,
             copy_targets: targetRow?.cnt ?? 0,
-            suspect_bots: suspectRow?.cnt ?? 0,
             size_mb: Math.round((opsSizeBytes / 1048576) * 100) / 100,
           },
           db_firehose: {
             firehose_trades: firehoseTradeRow?.cnt ?? 0,
             firehose_wallets: firehoseWalletRow?.cnt ?? 0,
+            suspect_bots: suspectRow?.cnt ?? 0,
             size_mb: Math.round((firehoseSizeBytes / 1048576) * 100) / 100,
           },
         },
@@ -1414,13 +1444,23 @@ export default {
       url.pathname === "/api/copy/targets/cloud"
     ) {
       // Fetch targets (username now stored directly on copy_targets)
-      const { results: targets } = await env.DB.prepare(
-        `SELECT ct.*,
-                CASE WHEN ct.username != '' THEN ct.username
-                     ELSE COALESCE(sb.username, '') END as display_username
-         FROM copy_targets ct
-         LEFT JOIN suspect_bots sb ON ct.wallet = sb.wallet`,
-      ).all<CopyTarget & { username: string; display_username: string }>();
+      const [{ results: targets }, { results: botUsernames }] =
+        await Promise.all([
+          env.DB.prepare("SELECT * FROM copy_targets").all<
+            CopyTarget & { username: string }
+          >(),
+          fdb
+            .prepare("SELECT wallet, username FROM suspect_bots")
+            .all<{ wallet: string; username: string }>(),
+        ]);
+      const botUsernameMap = new Map(
+        (botUsernames ?? []).map((b) => [b.wallet, b.username]),
+      );
+      // Enrich targets with display_username from suspect_bots fallback
+      const targetsWithUsername = (targets ?? []).map((t) => ({
+        ...t,
+        display_username: t.username || botUsernameMap.get(t.wallet) || "",
+      }));
 
       // Fetch all filled trades for FIFO P&L computation
       const { results: allTrades } = await env.DB.prepare(
@@ -1440,7 +1480,7 @@ export default {
         else tradesByWallet.set(t.source_wallet, [t]);
       }
 
-      const enriched = (targets ?? []).map((r) => {
+      const enriched = targetsWithUsername.map((r) => {
         const walletTrades = tradesByWallet.get(r.wallet) ?? [];
         const tradeCount = walletTrades.length;
         const pnl = tradeCount > 0 ? computeFifoPnl(walletTrades) : null;

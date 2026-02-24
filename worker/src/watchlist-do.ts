@@ -231,10 +231,10 @@ export class WatchlistDO implements DurableObject {
       positions.map((p) => p.conditionId).filter(Boolean),
     ).size;
 
-    // Win rate from suspect_bots if available
-    const botRow = await this.env.DB.prepare(
-      "SELECT win_rate, copy_score FROM suspect_bots WHERE wallet = ?",
-    )
+    // Win rate from suspect_bots if available (lives in FIREHOSE_DB when split)
+    const fdb = this.env.FIREHOSE_DB ?? this.env.DB;
+    const botRow = await fdb
+      .prepare("SELECT win_rate, copy_score FROM suspect_bots WHERE wallet = ?")
       .bind(w)
       .first<{ win_rate: number; copy_score: number }>();
 
