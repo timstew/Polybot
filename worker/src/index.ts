@@ -4,12 +4,18 @@ import {
   checkCircuitBreaker,
   getMaxBalanceFailures,
 } from "./listener";
+import { calcFeePerShare, getMarketFeeParams, CRYPTO_FEES } from "./categories";
 import type { CopyTarget, CopyTrade, Env } from "./types";
 
 type ListenerState = "running" | "winding_down" | "stopped";
 
 export { FirehoseDO } from "./firehose-do";
 export { WatchlistDO } from "./watchlist-do";
+export { StrategyDO } from "./strategy";
+
+// Register strategy implementations (side-effect imports)
+import "./strategies/split-arb";
+import "./strategies/passive-mm";
 
 // ── Auto-start DOs on first request ────────────────────────────────
 
@@ -2004,8 +2010,6 @@ export default {
       url.pathname === "/api/copy/backfill-fees" &&
       request.method === "POST"
     ) {
-      const FEE_RATE = 0.0625;
-
       // Find wallets that have titled non-crypto trades (sports, politics, etc.)
       const nonCryptoWallets = await env.DB.prepare(
         `
@@ -2045,7 +2049,7 @@ export default {
           skipped++;
           continue;
         }
-        const feePerShare = t.exec_price * (1 - t.exec_price) * FEE_RATE;
+        const feePerShare = calcFeePerShare(t.exec_price, CRYPTO_FEES);
         const feeAmount = feePerShare * t.size;
         stmts.push(
           env.DB.prepare(
@@ -2073,7 +2077,7 @@ export default {
 
       const cryptoStmts: Array<ReturnType<typeof env.DB.prepare>> = [];
       for (const t of cryptoFix.results) {
-        const feePerShare = t.exec_price * (1 - t.exec_price) * FEE_RATE;
+        const feePerShare = calcFeePerShare(t.exec_price, CRYPTO_FEES);
         const feeAmount = feePerShare * t.size;
         cryptoStmts.push(
           env.DB.prepare(
@@ -2123,6 +2127,159 @@ export default {
       );
       if (batch.length > 0) await env.DB.batch(batch);
       return jsonCors({ status: "synced", count: targets.length }, request);
+    }
+
+    // ── Strategy execution routes ──────────────────────────────────────
+
+    if (url.pathname === "/api/strategy/configs" && request.method === "GET") {
+      const rows = await env.DB.prepare(
+        "SELECT * FROM strategy_configs ORDER BY created_at DESC"
+      ).all();
+      return jsonCors(rows.results || [], request);
+    }
+
+    if (url.pathname === "/api/strategy/configs" && request.method === "POST") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const id = body.id || `strat-${Date.now()}`;
+      await env.DB.prepare(
+        `INSERT INTO strategy_configs (id, name, strategy_type, mode, params, tick_interval_ms, max_capital_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          id,
+          body.name || "unnamed",
+          body.strategy_type || "split-arb",
+          body.mode || "paper",
+          JSON.stringify(body.params || {}),
+          body.tick_interval_ms || 5000,
+          body.max_capital_usd || 200
+        )
+        .run();
+      return jsonCors({ status: "created", id }, request);
+    }
+
+    if (
+      url.pathname.startsWith("/api/strategy/configs/") &&
+      request.method === "PUT"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const body = (await request.json()) as Record<string, unknown>;
+      const sets: string[] = [];
+      const vals: unknown[] = [];
+      for (const key of [
+        "name",
+        "strategy_type",
+        "mode",
+        "tick_interval_ms",
+        "max_capital_usd",
+      ]) {
+        if (body[key] !== undefined) {
+          sets.push(`${key} = ?`);
+          vals.push(body[key]);
+        }
+      }
+      if (body.params !== undefined) {
+        sets.push("params = ?");
+        vals.push(JSON.stringify(body.params));
+      }
+      if (sets.length > 0) {
+        sets.push("updated_at = datetime('now')");
+        vals.push(configId);
+        await env.DB.prepare(
+          `UPDATE strategy_configs SET ${sets.join(", ")} WHERE id = ?`
+        )
+          .bind(...vals)
+          .run();
+      }
+      return jsonCors({ status: "updated", id: configId }, request);
+    }
+
+    if (
+      url.pathname.startsWith("/api/strategy/start/") &&
+      request.method === "POST"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const stratId = env.STRATEGY.idFromName(configId);
+      const stratObj = env.STRATEGY.get(stratId);
+      const resp = await stratObj.fetch(
+        new Request(`https://dummy/start?config_id=${configId}`, {
+          method: "POST",
+        })
+      );
+      const data = await resp.json();
+      return jsonCors(data, request);
+    }
+
+    if (
+      url.pathname.startsWith("/api/strategy/stop/") &&
+      request.method === "POST"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const stratId = env.STRATEGY.idFromName(configId);
+      const stratObj = env.STRATEGY.get(stratId);
+      const resp = await stratObj.fetch(
+        new Request("https://dummy/stop", { method: "POST" })
+      );
+      const data = await resp.json();
+      return jsonCors(data, request);
+    }
+
+    // Status for all strategies — query each active config's DO
+    if (
+      url.pathname === "/api/strategy/statuses" &&
+      request.method === "GET"
+    ) {
+      const cfgRows = await env.DB.prepare(
+        "SELECT id FROM strategy_configs"
+      ).all();
+      const configs = (cfgRows.results || []) as Array<{ id: string }>;
+      const statuses: Record<string, unknown> = {};
+      for (const cfg of configs) {
+        try {
+          const doId = env.STRATEGY.idFromName(cfg.id);
+          const doObj = env.STRATEGY.get(doId);
+          const resp = await doObj.fetch(new Request("https://dummy/status"));
+          statuses[cfg.id] = await resp.json();
+        } catch {
+          statuses[cfg.id] = { running: false, config: null, state: null };
+        }
+      }
+      return jsonCors(statuses, request);
+    }
+
+    // Single strategy status (legacy / convenience)
+    if (
+      url.pathname.startsWith("/api/strategy/status/") &&
+      request.method === "GET"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const stratId = env.STRATEGY.idFromName(configId);
+      const stratObj = env.STRATEGY.get(stratId);
+      const resp = await stratObj.fetch(
+        new Request("https://dummy/status")
+      );
+      const data = await resp.json();
+      return jsonCors(data, request);
+    }
+
+    if (
+      url.pathname.startsWith("/api/strategy/trades/") &&
+      request.method === "GET"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const rows = await env.DB.prepare(
+        "SELECT * FROM strategy_trades WHERE strategy_id = ? ORDER BY timestamp DESC LIMIT 100"
+      )
+        .bind(configId)
+        .all();
+      return jsonCors(rows.results || [], request);
+    }
+
+    if (url.pathname === "/api/strategy/trades" && request.method === "GET") {
+      const rows = await env.DB.prepare(
+        "SELECT * FROM strategy_trades ORDER BY timestamp DESC LIMIT 100"
+      ).all();
+      return jsonCors(rows.results || [], request);
     }
 
     // ── Python API proxy (Cloud Run) ──────────────────────────────────
@@ -2217,6 +2374,28 @@ export default {
       }
     } catch {
       // watchlist table might not exist yet
+    }
+
+    // Auto-start strategy DOs for each active config
+    try {
+      const activeConfigs = await env.DB.prepare(
+        "SELECT id FROM strategy_configs WHERE active = 1"
+      ).all();
+      for (const row of (activeConfigs.results || []) as Array<{ id: string }>) {
+        try {
+          const doId = env.STRATEGY.idFromName(row.id);
+          const doObj = env.STRATEGY.get(doId);
+          const resp = await doObj.fetch(new Request("https://dummy/status"));
+          const st = (await resp.json()) as { running: boolean };
+          if (!st.running) {
+            await doObj.fetch(
+              new Request(`https://dummy/start?config_id=${row.id}`, { method: "POST" })
+            );
+          }
+        } catch {}
+      }
+    } catch {
+      // strategy tables might not exist yet
     }
   },
 };

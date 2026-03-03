@@ -1,4 +1,9 @@
-import { DEFAULT_FEE_RATE, marketHasFees } from "./categories";
+import {
+  calcFeePerShare,
+  getMarketFeeParams,
+  CRYPTO_FEES,
+  type FeeParams,
+} from "./categories";
 import type { CopyTarget, CopyTrade, DataApiTrade } from "./types";
 
 const DATA_API = "https://data-api.polymarket.com";
@@ -169,12 +174,12 @@ export function calculateCopyTrade(
     execPrice = Math.max(trade.price * (1 - slipMult), 0.01);
   }
 
-  // Fee rate
-  let feeRate = target.fee_rate;
-  if (feeRate === 0 && marketHasFees(trade.title)) {
-    feeRate = DEFAULT_FEE_RATE;
+  // Fee params — use market category detection, or target override
+  const feeParams = getMarketFeeParams(trade.title);
+  let feePerShare = 0;
+  if (feeParams) {
+    feePerShare = calcFeePerShare(execPrice, feeParams);
   }
-  const feePerShare = execPrice * (1 - execPrice) * feeRate;
 
   // Copy size — both paper and real use same sizing rules
   // If full_copy_below_usd is set and source trade is below that threshold,
@@ -335,6 +340,7 @@ async function handlePositionExit(
       const remainingSize = pos.buy_total - pos.sell_total - alreadyPending;
       if (remainingSize < 0.001) continue;
 
+      // Sell fee: at price 0, fee is 0 (losing outcome)
       const copy: CopyTrade = {
         id: crypto.randomUUID(),
         source_trade_id: event.id,
@@ -350,7 +356,7 @@ async function handlePositionExit(
         pnl: 0,
         source_price: 0,
         exec_price: 0,
-        fee_amount: 0,
+        fee_amount: 0, // price=0 → fee=0
         title: event.title || "",
       };
       await insertCopyTrade(db, copy);
@@ -385,6 +391,13 @@ async function handlePositionExit(
     const openSize = pos.buy_total - pos.sell_total - alreadyPending;
     if (openSize < 0.001) continue;
 
+    // Sell fees apply at exit price
+    const exitFeeParams = getMarketFeeParams(event.title || "");
+    const sellFeePerShare = exitFeeParams
+      ? calcFeePerShare(exitPrice, exitFeeParams)
+      : 0;
+    const sellFeeAmount = sellFeePerShare * openSize;
+
     const copy: CopyTrade = {
       id: crypto.randomUUID(),
       source_trade_id: event.id,
@@ -400,7 +413,7 @@ async function handlePositionExit(
       pnl: 0,
       source_price: exitPrice,
       exec_price: exitPrice,
-      fee_amount: 0,
+      fee_amount: sellFeeAmount,
       title: event.title || "",
     };
     await insertCopyTrade(db, copy);

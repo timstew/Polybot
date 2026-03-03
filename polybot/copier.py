@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from polybot.categories import get_fee_rate
+from polybot.categories import calc_fee_per_share, get_fee_params, get_fee_rate
 from polybot.config import Config
 from polybot.db import Database
 from polybot.models import (
@@ -155,15 +155,18 @@ class CopyTrader:
         else:
             exec_price = max(trade.price * (1 - slip_mult), 0.01)
 
-        # Fee rate by market category (e.g. crypto-updown = 10%, all others = 0%).
+        # Fee params by market category (e.g. crypto = rate=0.25, exponent=2).
         # Use target override if explicitly set > 0, otherwise infer from title.
+        fee_per_share = 0.0
         if target.fee_rate > 0:
-            fee_rate = target.fee_rate
+            # Legacy: target has a flat fee_rate override — use old formula for compat
+            fee_per_share = exec_price * (1 - exec_price) * target.fee_rate
         else:
-            fee_rate = get_fee_rate(trade.title)
-
-        # Fee formula: fee_per_share = exec_price * (1 - exec_price) * fee_rate
-        fee_per_share = exec_price * (1 - exec_price) * fee_rate
+            params = get_fee_params(trade.title)
+            if params is not None:
+                fee_per_share = calc_fee_per_share(
+                    exec_price, params.rate, params.exponent
+                )
 
         # Calculate our copy size based on exec_price (what we'd actually pay)
         # Paper mode: 100% of bot's trade to measure true P&L

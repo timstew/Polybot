@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "crypto": [
@@ -123,6 +123,39 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
         "updown",
     ],
 }
+
+
+# ── Fee params by market type (from docs.polymarket.com/trading/fees) ──
+
+class FeeParams(NamedTuple):
+    rate: float
+    exponent: int
+
+
+CRYPTO_FEES = FeeParams(rate=0.25, exponent=2)
+SPORTS_FEES = FeeParams(rate=0.0175, exponent=1)
+
+# Categories that map to specific fee params
+_CATEGORY_FEE_PARAMS: dict[str, FeeParams] = {
+    "crypto": CRYPTO_FEES,
+    "crypto markets": CRYPTO_FEES,
+    "sports": SPORTS_FEES,
+}
+
+
+def calc_fee_per_share(price: float, rate: float, exponent: int) -> float:
+    """New fee formula: price × rate × (price × (1 - price))^exponent"""
+    return price * rate * (price * (1 - price)) ** exponent
+
+
+def get_fee_params(title: str) -> FeeParams | None:
+    """Return fee params for a market based on its title, or None if no fees."""
+    categories = infer_categories([title])
+    for cat in categories:
+        params = _CATEGORY_FEE_PARAMS.get(cat)
+        if params is not None:
+            return params
+    return None
 
 
 # Cache: category → (fee_rate, timestamp)
