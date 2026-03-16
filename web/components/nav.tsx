@@ -8,6 +8,7 @@ const links = [
   { href: "/", label: "Dashboard" },
   { href: "/watchlist", label: "Watchlist" },
   { href: "/copy", label: "Copy Trading" },
+  { href: "/strategy", label: "Strategies" },
 ];
 
 export function Nav() {

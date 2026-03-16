@@ -391,6 +391,16 @@ export interface WatchlistPosition {
   pnl: number;
 }
 
+export interface WalletOverview {
+  usdc_balance: number;
+  pol_balance: number;
+  unredeemed_count: number;
+  unredeemed_value: number;
+  pending_wins_count: number;
+  pending_wins_value: number;
+  wallet_address: string;
+}
+
 export const api = {
   stats: () => fetchJSON<Stats>("/api/stats"),
   bots: (minConfidence = 0) =>
@@ -568,4 +578,102 @@ export const api = {
       lastRun: string | null;
       walletsChecked: number;
     }>("/api/watchlist/status"),
+
+  // Strategy execution
+  strategyWalletOverview: () =>
+    fetchJSON<WalletOverview>("/api/strategy/wallet-overview"),
+  strategyConfigs: () => fetchJSON<StrategyConfig[]>("/api/strategy/configs"),
+  strategyCreateConfig: (config: Partial<StrategyConfig>) =>
+    postJSON<{ status: string; id: string }>("/api/strategy/configs", config),
+  strategyUpdateConfig: (id: string, updates: Partial<StrategyConfig>) =>
+    fetch(`${API_BASE}/api/strategy/configs/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    }).then((r) => r.json()) as Promise<{ status: string }>,
+  strategyStart: (configId: string) =>
+    postJSON<{ status: string; config?: StrategyConfig }>(
+      `/api/strategy/start/${configId}`
+    ),
+  strategyStop: (configId: string) =>
+    postJSON<{ status: string }>(`/api/strategy/stop/${configId}`),
+  strategyForceStop: (configId: string) =>
+    postJSON<{ status: string }>(`/api/strategy/force-stop/${configId}`),
+  strategyReset: (configId: string) =>
+    postJSON<{ status: string }>(`/api/strategy/reset/${configId}`),
+  strategyDelete: (configId: string) =>
+    fetch(`${API_BASE}/api/strategy/configs/${configId}`, {
+      method: "DELETE",
+    }).then((r) => r.json()) as Promise<{ status: string }>,
+  strategyStatuses: () =>
+    fetchJSON<
+      Record<
+        string,
+        { running: boolean; winding_down?: boolean; config: StrategyConfig | null; state: StrategyState | null; balance_protection?: BalanceProtection | null }
+      >
+    >("/api/strategy/statuses"),
+  strategyTrades: (configId?: string) =>
+    fetchJSON<StrategyTrade[]>(
+      configId
+        ? `/api/strategy/trades/${configId}`
+        : "/api/strategy/trades"
+    ),
 };
+
+// ── Strategy types ──────────────────────────────────────────────────
+
+export interface StrategyConfig {
+  id: string;
+  name: string;
+  strategy_type: string;
+  mode: "paper" | "real";
+  active: number;
+  params: string; // JSON string
+  tick_interval_ms: number;
+  max_capital_usd: number;
+  balance_usd: number | null;
+  lock_increment_usd: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StrategyLogEntry {
+  ts: string;
+  msg: string;
+}
+
+export interface StrategyState {
+  open_orders: unknown[];
+  positions: unknown[];
+  total_pnl: number;
+  capital_deployed: number;
+  last_tick_at: string;
+  started_at: string;
+  ticks: number;
+  errors: number;
+  custom: Record<string, unknown>;
+  logs: StrategyLogEntry[];
+  high_water_balance: number;
+}
+
+export interface BalanceProtection {
+  current_balance: number;
+  locked_amount: number;
+  working_capital: number;
+  high_water_balance: number;
+  drawdown_scale?: number;
+}
+
+export interface StrategyTrade {
+  id: string;
+  strategy_id: string;
+  token_id: string;
+  market: string;
+  title: string;
+  side: string;
+  price: number;
+  size: number;
+  fee_amount: number;
+  timestamp: string;
+  pnl: number;
+}
