@@ -16,7 +16,8 @@ database_id = "2fbb7e24-7924-4563-8726-e2d8e0d94b2e"
 bindings = [
   { name = "LISTENER", class_name = "CopyListenerDO" },
   { name = "FIREHOSE", class_name = "FirehoseDO" },
-  { name = "WATCHLIST", class_name = "WatchlistDO" }
+  { name = "WATCHLIST", class_name = "WatchlistDO" },
+  { name = "STRATEGY", class_name = "StrategyDO" }
 ]
 
 [[migrations]]
@@ -30,6 +31,10 @@ new_classes = ["FirehoseDO"]
 [[migrations]]
 tag = "v3"
 new_classes = ["WatchlistDO"]
+
+[[migrations]]
+tag = "v4"
+new_classes = ["StrategyDO"]
 
 # Python API (Cloud Run) — set after deploying Cloud Run
 [vars]
