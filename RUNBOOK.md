@@ -1,13 +1,14 @@
 # Polybot Operations Runbook
 
-Quick reference for monitoring, debugging, and deploying the copy trading system.
+Quick reference for monitoring, debugging, and deploying the copy trading and strategy execution systems.
 
 ## Architecture
 
 - **Cloud Run** (Python/FastAPI): `https://polybot-api-182262919086.europe-west4.run.app` — order execution, bot detection
-- **Cloudflare Worker**: `https://polybot-copy-listener.timstew.workers.dev` — polls bot activity, decides what to copy, records trades in D1
+- **Cloudflare Worker**: `https://polybot-copy-listener.timstew.workers.dev` — copy trading, strategy execution, D1 storage
 - **Cloudflare Pages** (Next.js): dashboard UI
-- **D1 Database**: `polybot` (main), `polybot-firehose` (market data)
+- **D1 Database**: `polybot` (copy trades + strategy data), `polybot-firehose` (market data + bot detection)
+- **Durable Objects**: CopyListenerDO, FirehoseDO, WatchlistDO, StrategyDO
 - **Bot wallet** (hue8883): `0x2ba9075a4393227d4f1bee910725a6706de0b078`
 - **Funder wallet**: `0xe0ef345be76588f0975f4ca1c87e609e138c5222`
 
@@ -36,6 +37,268 @@ gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.serv
 # Errors after a specific time
 gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="polybot-api" AND severity>=WARNING AND timestamp>="2026-02-19T07:00:00Z"' --limit=10 --format='value(timestamp,textPayload)'
 ```
+
+## Strategy Execution
+
+### Data Dependencies
+
+All strategies run on **REST polling only** — no streaming/WebSocket required for core functionality:
+
+| Data | Source | Transport | Polling interval |
+|------|--------|-----------|-----------------|
+| Spot prices | Binance REST API | HTTPS | Every tick (5s), 1s cache |
+| Fallback prices | Coinbase REST API | HTTPS | On Binance failure |
+| Market discovery | Data API /trades | HTTPS | Every 15-30s |
+| Market resolution | Gamma API /markets | HTTPS | On window end + 10s |
+| Order books | CLOB API /book | HTTPS | Every tick (paper model) |
+
+**Optional enhancement (local dev only)**: Setting `enable_order_flow: true` in strategy params opens a Binance WebSocket (`wss://stream.binance.com:9443/ws/{symbol}@aggTrade`) for real-time buy/sell volume imbalance. This adds a 6th signal layer (confidence multiplier 0.4-1.5x) but **does not work in deployed CF Workers** (Workers cannot hold persistent outbound WebSocket connections). Default is `false`.
+
+### Local Development Setup
+
+```bash
+cd worker
+
+# Start wrangler dev with persistent DO state, debug logging, port 8787
+./dev.sh
+
+# Apply schema (first time only)
+npx wrangler d1 execute polybot --file=schema-ops.sql
+
+# Create a spread sniper strategy
+curl -X POST localhost:8787/api/strategy/configs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Sniper paper",
+    "strategy_type": "spread-sniper",
+    "mode": "paper",
+    "max_capital_usd": 2000,
+    "params": {"enable_order_flow": true}
+  }'
+
+# Create with balance protection (ratchet lock)
+# balance_usd=100 means: start with $100 bankroll, lock profits in $100 increments,
+# auto-stop when working capital hits $0. lock_increment_usd defaults to balance_usd.
+curl -X POST localhost:8787/api/strategy/configs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Sniper protected",
+    "strategy_type": "spread-sniper",
+    "mode": "paper",
+    "max_capital_usd": 2000,
+    "balance_usd": 100,
+    "params": {"enable_order_flow": true}
+  }'
+
+# Create a directional maker strategy
+curl -X POST localhost:8787/api/strategy/configs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Maker paper",
+    "strategy_type": "directional-maker",
+    "mode": "paper",
+    "max_capital_usd": 2000,
+    "params": {"enable_order_flow": true}
+  }'
+
+# Start strategies
+curl -X POST localhost:8787/api/strategy/start/<config-id>
+
+# Monitor
+curl -s localhost:8787/api/strategy/statuses | python3 -m json.tool
+curl -s localhost:8787/api/strategy/status/<config-id> | python3 -m json.tool
+curl -s localhost:8787/api/strategy/logs/<config-id>?limit=30
+```
+
+**Local dev notes**:
+- Always use `./dev.sh` (never `npm exec wrangler dev` — it swallows flags). See `dev.sh` for details.
+- `--persist-to .wrangler/state` keeps DO state across wrangler restarts
+- `enable_order_flow: true` works because `wrangler dev` runs in Node.js (WebSocket connections persist via DO alarms)
+- DOs may lose state on eviction — strategy configs are in D1 (durable), but window state (active positions, inventory) is in-memory
+- The cron trigger (`* * * * *`) auto-restarts DOs but only in production; locally, restart manually if ticking stops
+
+#### Auto-start on login (macOS LaunchAgent)
+
+A LaunchAgent at `~/Library/LaunchAgents/com.polybot.worker.plist` auto-starts the worker dev server on login and restarts it if it crashes. This is **local dev only** — the deployed worker runs on Cloudflare.
+
+```bash
+# Load (enable auto-start)
+launchctl load ~/Library/LaunchAgents/com.polybot.worker.plist
+
+# Unload (disable auto-start)
+launchctl unload ~/Library/LaunchAgents/com.polybot.worker.plist
+
+# Manual stop/start
+launchctl stop com.polybot.worker
+launchctl start com.polybot.worker
+
+# Logs
+tail -f worker/launchd-out.log
+tail -f worker/launchd-err.log
+```
+
+If the Node.js path changes (e.g. nvm version update), edit the `PATH` in the plist to match `which npx`.
+
+### Remote/Production Setup
+
+```bash
+cd worker
+
+# Deploy worker
+npx wrangler deploy
+
+# Apply schema to remote D1
+npx wrangler d1 execute polybot --remote --file=schema-ops.sql
+
+# Balance protection migration (one-time, if not yet applied to remote)
+npx wrangler d1 execute polybot --remote --command "ALTER TABLE strategy_configs ADD COLUMN balance_usd REAL DEFAULT NULL;"
+npx wrangler d1 execute polybot --remote --command "ALTER TABLE strategy_configs ADD COLUMN lock_increment_usd REAL DEFAULT NULL;"
+
+# Create strategy (use deployed worker URL)
+WORKER=https://polybot-copy-listener.timstew.workers.dev
+curl -X POST $WORKER/api/strategy/configs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Sniper production",
+    "strategy_type": "spread-sniper",
+    "mode": "paper",
+    "max_capital_usd": 2000,
+    "params": {}
+  }'
+
+# Start
+curl -X POST $WORKER/api/strategy/start/<config-id>
+
+# Monitor
+curl -s $WORKER/api/strategy/statuses | python3 -m json.tool
+```
+
+**Production notes**:
+- Do NOT set `enable_order_flow: true` — CF Workers cannot hold WebSocket connections across requests
+- All price data comes from Binance/Coinbase REST APIs (no streaming dependency)
+- Strategy signal uses 5 layers: magnitude, momentum, acceleration, volatility regime, hysteresis (all REST-based)
+- The cron trigger restarts DOs every minute as a heartbeat; `userStopped` flag prevents unwanted restarts
+- The cron also sweeps unredeemed positions via Cloud Run `/api/redeem/sweep` every minute, independent of strategy lifecycle
+- After deploying, StrategyDO may run old code — stop and restart strategies to pick up changes
+
+### Strategy Types
+
+| Type | File | Approach | Best for |
+|------|------|----------|----------|
+| `spread-sniper` | `spread-sniper.ts` | Direction-agnostic, neutral fair value, pure spread capture | Consistent returns, low variance |
+| `directional-maker` | `directional-maker.ts` | Aggressive signal-biased maker, sells ALL losing-side inventory on flip | Trending markets (higher variance) |
+| `safe-maker` | `safe-maker.ts` | Conservative signal-biased maker, protects paired inventory from sale | Lower risk directional |
+| `conviction-maker` | `conviction-maker.ts` | One-sided conviction bets, only bids when signal > 0.60, hold to resolution | Strong trends, BTC lead-lag |
+| `directional-taker` | `directional-taker.ts` | Market-takes based on signal | Not viable (ultra-wide spreads) |
+| `unified-adaptive` | `unified-adaptive.ts` | Picks sniper/maker per window, adaptive sizing | Mixed conditions |
+| `split-arb` | `split-arb.ts` | Complementary token arbitrage | Low-spread opportunities |
+| `passive-mm` | `passive-mm.ts` | Passive market making | General market making |
+
+### Monitoring Commands
+
+```bash
+# All strategy statuses
+curl -s localhost:8787/api/strategy/statuses | python3 -c "
+import json, sys
+for sid, s in json.load(sys.stdin).items():
+    c = s.get('state', {}).get('custom', {})
+    pnl = c.get('totalPnl', s.get('state', {}).get('total_pnl', 0))
+    aw = len(c.get('activeWindows', []))
+    cw = len(c.get('completedWindows', []))
+    print(f'{s.get(\"config\",{}).get(\"name\",sid)}: PnL=\${pnl:.2f} active={aw} done={cw}')
+"
+
+# Detailed window view for a single strategy
+curl -s localhost:8787/api/strategy/status/<id> | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d['state']['custom']
+for w in c.get('activeWindows', []):
+    t = w['market']['title']
+    print(f'  ACTIVE {t}: inv={w[\"upInventory\"]}/{w[\"downInventory\"]}')
+for w in c.get('completedWindows', [])[-5:]:
+    print(f'  DONE {w[\"title\"]}: {w[\"outcome\"]} pnl=\${w[\"netPnl\"]:.2f}')
+"
+
+# Signal-level logs
+curl -s "localhost:8787/api/strategy/logs/<id>?limit=30&level=signal"
+
+# Strategy trades from D1
+curl -s localhost:8787/api/strategy/trades/<id> | python3 -m json.tool | head -40
+```
+
+### D1 Strategy Queries
+
+```sql
+-- Strategy performance summary
+SELECT strategy_id, COUNT(*) as trades,
+  ROUND(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 2) as wins,
+  ROUND(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END), 2) as losses,
+  ROUND(SUM(pnl), 2) as net_pnl
+FROM strategy_trades GROUP BY strategy_id;
+
+-- Recent signal logs (flips, dead zones)
+SELECT timestamp, symbol, direction, signal_strength, flip_count, phase, message
+FROM strategy_logs
+WHERE strategy_id = '<id>' AND level = 'signal'
+ORDER BY timestamp DESC LIMIT 50;
+
+-- Delete old strategy logs (cleanup)
+DELETE FROM strategy_logs WHERE timestamp < datetime('now', '-24 hours');
+```
+
+### Troubleshooting
+
+### Stopping Strategies (Graceful Wind-Down)
+
+Clicking stop enters **wind-down mode** instead of killing immediately:
+- No new window entries
+- Bids on the light side to create matched pairs (reduces unmatched exposure)
+- Waits for existing windows to resolve, then auto-stops
+
+```bash
+# First stop = wind-down (keeps ticking, completes existing windows)
+curl -X POST localhost:8787/api/strategy/stop/<id>
+# Returns: {"status": "winding_down"}
+
+# Second stop = force-stop (immediate halt, same as old behavior)
+curl -X POST localhost:8787/api/strategy/stop/<id>
+# Returns: {"status": "stopped"}
+
+# Or force-stop directly (skip wind-down)
+curl -X POST localhost:8787/api/strategy/force-stop/<id>
+```
+
+Safety triggers (balance protection, balance alarm) also enter wind-down rather than hard-killing, so in-flight positions can resolve profitably.
+
+**Strategy stopped ticking**: The DO alarm chain can break if an error occurs or the DO is evicted. The `/status` endpoint has self-heal logic that re-arms the alarm if stale >30s, so check status first. If still stuck, force-stop and restart:
+```bash
+# Check if self-heal kicks in
+curl -s localhost:8787/api/strategy/status/<id> | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'running={d[\"running\"]} ticks={d[\"state\"][\"ticks\"]} last_tick={d[\"state\"][\"last_tick_at\"]}')"
+
+# If still stuck, force-stop and restart
+curl -X POST localhost:8787/api/strategy/force-stop/<id>
+curl -X POST localhost:8787/api/strategy/start/<id>
+```
+
+**One-sided inventory**: If a strategy accumulates heavily on one side (e.g., 90 UP / 0 DN), check:
+1. Per-tick safety is running (cancels heavy-side bids every tick)
+2. `max_inventory_ratio` is set (default 2:1 for maker)
+3. Signal amplitude isn't overwhelming inventory skew (maker: signal=0.20, skew=0.25)
+
+**Strategy code not updating**: After editing `.ts` files, wrangler dev auto-rebuilds, but running DOs keep old code in memory. Stop the strategy (wind-down first if mid-trade, then restart once windows resolve) or force-stop if no positions are in flight:
+```bash
+# Safe: wind-down → wait for auto-stop → restart
+curl -X POST localhost:8787/api/strategy/stop/<id>
+# ... wait for active windows to resolve, then:
+curl -X POST localhost:8787/api/strategy/start/<id>
+
+# Quick: force-stop if no active windows / positions
+curl -X POST localhost:8787/api/strategy/force-stop/<id>
+curl -X POST localhost:8787/api/strategy/start/<id>
+```
+
+**5-min windows losing money**: The spread sniper uses adaptive bid sizing — 5-min windows get smaller bids (10 instead of 30) to prevent one-sided accumulation. If you see 30/0 inventory on 5-min windows, the adaptive sizing may not be active.
 
 ## D1 Database Queries
 
