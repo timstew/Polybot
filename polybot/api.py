@@ -1600,3 +1600,426 @@ def similar_bots(address: str, top: int = Query(20, ge=1, le=50)):
 
     results = find_similar_bots(ref, candidates, top=top)
     return {"reference": w, "similar": results}
+
+
+# ── Strategy execution endpoints ─────────────────────────────────────
+
+
+def _get_clob_client():
+    """Initialize an authenticated ClobClient, or raise HTTPException."""
+    from polybot.config import Config
+
+    cfg = Config.from_env()
+    if not cfg.private_key:
+        raise HTTPException(status_code=503, detail="POLYMARKET_PRIVATE_KEY not configured")
+    try:
+        from py_clob_client.client import ClobClient
+
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=cfg.private_key,
+            chain_id=137,
+            signature_type=cfg.signature_type,
+            funder=cfg.funder_address or None,
+        )
+        client.set_api_creds(client.create_or_derive_api_creds())
+        return client
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ClobClient init failed: {e}")
+
+
+@app.post("/api/strategy/order")
+def strategy_place_order(body: dict):
+    """Place a GTC limit order for a strategy.
+
+    Body: {token_id, side, size, price}
+    Returns: {order_id, status} or {error}
+    """
+    import math
+
+    client = _get_clob_client()
+    token_id = body.get("token_id", "")
+    side = body.get("side", "BUY")
+    size = float(body.get("size", 0))
+    price = float(body.get("price", 0))
+
+    if not token_id:
+        return {"status": "failed", "error": "token_id required"}
+    if size < 5:
+        return {"status": "failed", "error": f"size {size} below minimum 5 shares"}
+    if price <= 0 or price >= 1:
+        return {"status": "failed", "error": f"price {price} must be between 0 and 1"}
+
+    try:
+        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        clob_side = BUY if side == "BUY" else SELL
+        price = math.floor(price * 10000) / 10000  # 4 decimal truncate
+        size = math.floor(size * 100) / 100  # 2 decimal truncate
+
+        order = client.create_order(
+            OrderArgs(token_id=token_id, size=size, side=clob_side, price=price)
+        )
+        resp = client.post_order(order, "GTC")
+
+        if resp.get("success") or resp.get("orderID"):
+            order_id = resp.get("orderID", "")
+            logger.info("[STRATEGY] %s %.2f @ $%.4f on %s order=%s", side, size, price, token_id[:10], order_id[:12])
+
+            # Check if the order filled immediately (GTC can match on placement)
+            if order_id:
+                try:
+                    order_info = client.get_order(order_id)
+                    if order_info.get("status") == "MATCHED":
+                        matched_size = float(order_info.get("size_matched", 0))
+                        matched_price = float(order_info.get("price", price))
+                        logger.info("[STRATEGY] IMMEDIATE FILL: %s %.2f @ $%.4f", side, matched_size, matched_price)
+                        return {
+                            "status": "filled",
+                            "order_id": order_id,
+                            "size": matched_size if matched_size > 0 else size,
+                            "price": matched_price,
+                        }
+                except Exception as e:
+                    logger.warning("[STRATEGY] get_order check failed (non-fatal): %s", e)
+
+            return {
+                "status": "placed",
+                "order_id": order_id,
+                "size": size,
+                "price": price,
+            }
+        else:
+            return {"status": "failed", "error": f"Order rejected: {resp}"}
+    except Exception as e:
+        logger.exception("Strategy order failed")
+        return {"status": "failed", "error": str(e)}
+
+
+@app.post("/api/strategy/cancel")
+def strategy_cancel_order(body: dict):
+    """Cancel an open order.
+
+    Body: {order_id}
+    Returns: {success: bool}
+    """
+    client = _get_clob_client()
+    order_id = body.get("order_id", "")
+    if not order_id:
+        return {"success": False, "error": "order_id required"}
+
+    try:
+        resp = client.cancel(order_id)
+        canceled = bool(resp.get("canceled") or resp.get("success"))
+        return {"success": canceled, "response": resp}
+    except Exception as e:
+        logger.exception("Strategy cancel failed")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/strategy/orders")
+def strategy_list_orders(market: str = Query("", description="Optional condition_id filter")):
+    """List open orders, optionally filtered by market."""
+    client = _get_clob_client()
+    try:
+        open_orders = client.get_orders()
+        orders = open_orders if isinstance(open_orders, list) else []
+
+        if market:
+            orders = [o for o in orders if o.get("asset_id", "") == market or o.get("token_id", "") == market]
+
+        return {
+            "orders": [
+                {
+                    "order_id": o.get("id", o.get("orderID", "")),
+                    "token_id": o.get("asset_id", o.get("token_id", "")),
+                    "side": o.get("side", ""),
+                    "price": float(o.get("price", 0)),
+                    "size": float(o.get("original_size", o.get("size", 0))),
+                    "size_matched": float(o.get("size_matched", 0)),
+                    "status": o.get("status", ""),
+                    "created_at": o.get("created_at", ""),
+                }
+                for o in orders
+            ]
+        }
+    except Exception as e:
+        logger.exception("Strategy list orders failed")
+        return {"orders": [], "error": str(e)}
+
+
+@app.get("/api/strategy/order-status/{order_id}")
+def strategy_order_status(order_id: str):
+    """Check status of a CLOB order. Returns size_matched and status."""
+    client = _get_clob_client()
+    try:
+        order = client.get_order(order_id)
+        return {
+            "order_id": order.get("id", order_id),
+            "status": order.get("status", "UNKNOWN"),
+            "size_matched": float(order.get("size_matched", 0)),
+            "original_size": float(order.get("original_size", 0)),
+            "price": float(order.get("price", 0)),
+            "side": order.get("side", ""),
+            "outcome": order.get("outcome", ""),
+        }
+    except Exception as e:
+        logger.exception("Order status check failed")
+        return {"order_id": order_id, "status": "ERROR", "error": str(e)}
+
+
+@app.get("/api/strategy/book/{token_id}")
+def strategy_get_book(token_id: str):
+    """Get orderbook snapshot for a token."""
+    try:
+        resp = http_requests.get(
+            f"https://clob.polymarket.com/book?token_id={token_id}",
+            timeout=5,
+        )
+        if not resp.ok:
+            return {"bids": [], "asks": [], "error": f"CLOB API {resp.status_code}"}
+        book = resp.json()
+        return {
+            "bids": [{"price": float(l.get("price", 0)), "size": float(l.get("size", 0))} for l in book.get("bids", [])],
+            "asks": [{"price": float(l.get("price", 0)), "size": float(l.get("size", 0))} for l in book.get("asks", [])],
+        }
+    except Exception as e:
+        return {"bids": [], "asks": [], "error": str(e)}
+
+
+@app.get("/api/strategy/balance")
+def strategy_get_balance():
+    """Get USDC balance for the funder wallet."""
+    client = _get_clob_client()
+    try:
+        balances = client.get_balances()
+        usdc = float(balances.get("USDC", 0)) if isinstance(balances, dict) else 0
+        return {"balance": round(usdc, 2)}
+    except Exception as e:
+        logger.exception("Strategy balance check failed")
+        return {"balance": 0, "error": str(e)}
+
+
+@app.get("/api/strategy/wallet-overview")
+def strategy_wallet_overview():
+    """Aggregated wallet overview: USDC balance, POL balance, unredeemed positions."""
+    cfg = Config.from_env()
+    if not cfg.funder_address:
+        raise HTTPException(status_code=503, detail="POLYMARKET_FUNDER_ADDRESS not configured")
+
+    result: dict = {"wallet_address": cfg.funder_address}
+
+    # USDC balance via on-chain balanceOf
+    try:
+        from web3 import Web3
+
+        w3 = Web3(Web3.HTTPProvider("https://polygon-bor.publicnode.com"))
+        usdc_addr = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+        wallet_cs = Web3.to_checksum_address(cfg.funder_address)
+        # ERC-20 balanceOf(address) → uint256
+        data = "0x70a08231" + bytes.fromhex(wallet_cs[2:].lower().zfill(64)).hex()
+        raw = w3.eth.call({"to": usdc_addr, "data": data})
+        result["usdc_balance"] = round(int(raw.hex(), 16) / 1e6, 2)
+    except Exception as e:
+        logger.warning("USDC balance fetch failed: %s", e)
+        result["usdc_balance"] = 0
+
+    # POL (native token) balance
+    try:
+        from web3 import Web3
+
+        w3 = Web3(Web3.HTTPProvider("https://polygon-bor.publicnode.com"))
+        wallet_cs = Web3.to_checksum_address(cfg.funder_address)
+        wei = w3.eth.get_balance(wallet_cs)
+        result["pol_balance"] = round(wei / 1e18, 2)
+    except Exception as e:
+        logger.warning("POL balance fetch failed: %s", e)
+        result["pol_balance"] = 0
+
+    # All positions — split into redeemable vs not-yet-redeemable winners
+    try:
+        resp = http_requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={
+                "user": cfg.funder_address,
+                "sizeThreshold": 1,
+                "limit": 100,
+                "sortBy": "RESOLVING",
+                "sortDirection": "DESC",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        all_positions = resp.json()
+
+        redeemable = [p for p in all_positions if p.get("redeemable") and float(p.get("curPrice", 0)) >= 0.95]
+        pending_wins = [p for p in all_positions if not p.get("redeemable") and float(p.get("curPrice", 0)) >= 0.95]
+
+        result["unredeemed_count"] = len(redeemable)
+        result["unredeemed_value"] = round(sum(float(p.get("size", 0)) for p in redeemable), 2)
+        result["pending_wins_count"] = len(pending_wins)
+        result["pending_wins_value"] = round(sum(float(p.get("size", 0)) for p in pending_wins), 2)
+    except Exception as e:
+        logger.warning("Positions fetch failed: %s", e)
+        result["unredeemed_count"] = 0
+        result["unredeemed_value"] = 0
+        result["pending_wins_count"] = 0
+        result["pending_wins_value"] = 0
+
+    return result
+
+
+@app.get("/api/strategy/activity")
+def strategy_get_activity(limit: int = Query(50, ge=1, le=200)):
+    """Fetch recent activity (trades) for the strategy wallet from the Data API."""
+    cfg = Config.from_env()
+    if not cfg.funder_address:
+        return {"trades": [], "error": "POLYMARKET_FUNDER_ADDRESS not configured"}
+    try:
+        resp = http_requests.get(
+            f"https://data-api.polymarket.com/activity",
+            params={"user": cfg.funder_address, "limit": limit},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        trades = []
+        for ev in events:
+            if ev.get("type") != "TRADE":
+                continue
+            trades.append({
+                "id": ev.get("id", ""),
+                "asset": ev.get("asset", ""),
+                "side": "BUY" if ev.get("side") == "BUY" else "SELL",
+                "price": float(ev.get("price", 0)),
+                "size": float(ev.get("size", 0)),
+                "timestamp": ev.get("timestamp", ""),
+                "type": ev.get("type", ""),
+            })
+        return {"trades": trades}
+    except Exception as e:
+        logger.exception("Strategy activity fetch failed")
+        return {"trades": [], "error": str(e)}
+
+
+# ── Redemption endpoints ─────────────────────────────────────────────
+
+
+@app.get("/api/redeem/positions")
+def redeem_list_positions():
+    """List all redeemable positions (read-only, no on-chain action)."""
+    from polybot.redeem import get_redeemable_positions
+
+    cfg = Config.from_env()
+    if not cfg.private_key:
+        raise HTTPException(status_code=503, detail="POLYMARKET_PRIVATE_KEY not configured")
+    try:
+        positions = get_redeemable_positions(
+            private_key=cfg.private_key,
+            signature_type=cfg.signature_type,
+            funder_address=cfg.funder_address or None,
+        )
+        return {"positions": positions, "count": len(positions)}
+    except Exception as e:
+        logger.exception("Failed to fetch redeemable positions")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/redeem")
+def redeem_all_positions():
+    """Redeem all winning positions for USDC.e via the Polymarket relayer."""
+    from polybot.redeem import redeem_all
+
+    cfg = Config.from_env()
+    if not cfg.private_key:
+        raise HTTPException(status_code=503, detail="POLYMARKET_PRIVATE_KEY not configured")
+    try:
+        results = redeem_all(
+            private_key=cfg.private_key,
+            signature_type=cfg.signature_type,
+            funder_address=cfg.funder_address or None,
+        )
+        return {"redeemed": len(results), "results": results}
+    except Exception as e:
+        logger.exception("Redemption failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/redeem/conditions")
+def redeem_specific_conditions(body: dict):
+    """Redeem specific condition IDs.
+
+    Body: {condition_ids: ["0x...", "0x..."]}
+    Called by the Worker after resolveWindows() confirms market outcomes.
+    """
+    from polybot.redeem import redeem_conditions
+
+    condition_ids = body.get("condition_ids", [])
+    if not condition_ids:
+        return {"redeemed": 0, "results": []}
+
+    cfg = Config.from_env()
+    if not cfg.private_key:
+        raise HTTPException(status_code=503, detail="POLYMARKET_PRIVATE_KEY not configured")
+
+    try:
+        results = redeem_conditions(
+            private_key=cfg.private_key,
+            condition_ids=condition_ids,
+            signature_type=cfg.signature_type,
+            funder_address=cfg.funder_address or None,
+        )
+        return {"redeemed": len(results), "results": results}
+    except Exception as e:
+        logger.exception("Condition redemption failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/redeem/sweep")
+def redeem_sweep():
+    """Find all redeemable positions and redeem them.
+
+    Safety net for orphaned positions (e.g., worker crash during open windows).
+    Called periodically by StrategyDO or manually.
+    """
+    from polybot.redeem import redeem_conditions
+
+    cfg = Config.from_env()
+    if not cfg.private_key or not cfg.funder_address:
+        raise HTTPException(status_code=503, detail="Wallet not configured")
+
+    # Find redeemable positions
+    try:
+        resp = http_requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={
+                "user": cfg.funder_address,
+                "sizeThreshold": 1,
+                "limit": 100,
+                "sortBy": "RESOLVING",
+                "sortDirection": "DESC",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        positions = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Position fetch failed: {e}")
+
+    redeemable = [p for p in positions if p.get("redeemable") and float(p.get("curPrice", 0)) >= 0.95]
+    if not redeemable:
+        return {"redeemed": 0, "results": [], "scanned": len(positions)}
+
+    condition_ids = list({p["conditionId"] for p in redeemable})
+    try:
+        results = redeem_conditions(
+            private_key=cfg.private_key,
+            condition_ids=condition_ids,
+            signature_type=cfg.signature_type,
+            funder_address=cfg.funder_address or None,
+        )
+        return {"redeemed": len(results), "results": results, "scanned": len(positions)}
+    except Exception as e:
+        logger.exception("Sweep redemption failed")
+        raise HTTPException(status_code=500, detail=str(e))
