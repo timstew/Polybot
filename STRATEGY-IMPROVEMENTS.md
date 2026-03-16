@@ -1,26 +1,218 @@
 # Strategy Improvements
 
-> Last updated: March 13, 2026. Reflects current codebase state after unified balance protection, proportional drawdown, and grounded fills.
+> Last updated: March 16, 2026. Reflects adaptive repricing (volatility offset, time-decay, reluctant requoting), tape fill protection, and maker rebate tracking.
 
 ---
 
 ## Top 10 Most Impactful Remaining Improvements
 
-These are the highest-leverage changes still TODO, ranked by expected impact.
-Focus on unified-adaptive since it supersedes running sniper+maker in parallel.
+Ranked by expected impact. Focus on safe-maker + directional-maker since they run real+paper side-by-side.
 
 | # | Improvement | Expected Impact | Status |
 |---|------------|-----------------|--------|
-| 1 | **Per-crypto bid sizing** — BTC=50, ETH=40, SOL=30, XRP=20 based on liquidity | +$2.00/window | TODO |
-| 2 | **Dynamic bid offset by volatility** — widen in choppy, tighten in trending | +$1.50/window | TODO |
-| 3 | **Multi-tier bids** — place 2-3 bids at different offsets (0.44, 0.46, 0.48) | +$1.25/window | TODO |
-| 4 | **Per-crypto conviction bias** — XRP=2.5x, BTC=1.5x (tuned per asset alpha) | +$1.50/window (XRP) | TODO |
-| 5 | **Window-end acceleration** — tighten offset in last 30% if still unmatched | +$0.80/window | TODO |
-| 6 | **Momentum-based position sizing** — increase bias in strong trends, reduce in chop | +$2.00/window trending | TODO |
-| 7 | **Adaptive pair cost by duration** — 5min=0.90, 15min=0.93, 60min=0.96 | +$1.50/window on 5min | TODO |
-| 8 | **Higher default_bid_size (60)** — ramp-up lag is #1 drag on unified-adaptive | +$1.50/window avg | EVAL (liquidity EMA addresses this adaptively) |
-| 9 | **Skip low-liquidity time slots** — track fill rates by hour | +5% win rate | TODO |
-| 10 | **Maker rebate tracking** — 20% of taker fees as rebates, not modeled | +3% profit | TODO |
+| 1 | **Inventory-aware asymmetric offsets** — widen heavy-side offset, tighten light-side offset instead of binary cancel | +$2.50/window | TODO |
+| 2 | **Fill rate feedback loop** — auto-tune offset to target ~60% fill rate per symbol/regime | +$2.00/window | TODO |
+| 3 | **Cross-asset momentum cascade** — use BTC lead-lag to pre-adjust ALT offsets before price catches up | +$1.50/window ALTs | TODO |
+| 4 | **Per-crypto bid sizing** — BTC=50, ETH=40, SOL=30, XRP=20 based on liquidity depth | +$2.00/window | TODO |
+| 5 | **Multi-tier bids** — 2-3 price levels per side for smoother fills and better average price | +$1.25/window | TODO |
+| 6 | **Conditional entry timing** — wait 15-30s after window open for volume/spread confirmation | +$1.50/window | TODO |
+| 7 | **Polymarket tape order flow signal** — analyze buy/sell imbalance in existing tape data | +$1.00/window | TODO |
+| 8 | **Per-crypto conviction bias** — tune per asset from realized directional accuracy | +$1.50/window (XRP) | TODO |
+| 9 | **Adaptive pair cost by duration** — 5min=0.90, 15min=0.93, 60min=0.96 | +$1.50/window on 5min | TODO |
+| 10 | **Window overlap exploitation** — use 5min resolution as signal for overlapping 15min window | +$0.80/window | TODO |
+
+### Recently completed (March 15-16)
+
+| Improvement | Impact | Strategies |
+|------------|--------|------------|
+| **Dynamic bid offset by volatility** — `vol_offset_scale_high/low` scales offset by `signal.volatilityRegime` | Wider in choppy (protection), tighter in calm (fills) | safe-maker, directional-maker |
+| **Window-end time-decay** — `tighten_start_pct` linearly reduces offset for unfilled sides in last 30% of window | More fills near window end | safe-maker, directional-maker |
+| **Reluctant requoting** — `min_requote_delta` (2c) skips cancel+replace when new bid is barely different | Preserves queue priority | safe-maker, directional-maker |
+| **Tape fill protection** — check trade tape before paper cancel to catch fills between ticks | No more lost paper fills on requote | safe-maker, directional-maker, conviction-maker |
+| **Maker rebate tracking** — fee_equivalent stored in D1 for all BUY fills | Accurate rebate pool weighting | all strategies |
+| **D1 records for immediate fills** — placeOrder returning "filled" now writes to strategy_trades | Complete trade audit trail | all strategies |
+
+---
+
+## New Improvement Ideas (Deep Analysis)
+
+### 1. Inventory-Aware Asymmetric Offsets
+
+**Problem**: Current per-tick inventory safety is binary — cancel the heavy-side bid entirely or keep it. This loses queue position and stops price discovery on that side.
+
+**Proposal**: Replace the binary cancel with continuous offset scaling based on inventory ratio.
+
+```
+Example: UP=30, DN=10 (need more DN)
+  Current behavior: cancel UP bid entirely
+  Proposed behavior:
+    UP offset = bid_offset * 2.0  (wider → less likely to fill, still quoted)
+    DN offset = bid_offset * 0.5  (tighter → more likely to fill)
+
+Inventory ratio = max(UP,DN) / max(min(UP,DN), 1)
+  ratio < 1.3:  symmetric offsets (balanced enough)
+  ratio 1.3-2:  light-side offset * 0.7, heavy-side offset * 1.5
+  ratio > 2:    light-side offset * 0.5, heavy-side offset * 2.0 (or cancel)
+```
+
+**Why it's better**: Smoothly steers toward balance instead of all-or-nothing. Heavy side still gets quoted (at a wide offset) so if the market reverses, we can still fill. Light side gets aggressive pricing to attract the fills we need.
+
+**Estimated complexity**: Low. Modify the inventory check in `updateQuotes` to adjust offset instead of cancelling. No new params needed (can reuse the ratio threshold).
+
+### 2. Fill Rate Feedback Loop
+
+**Problem**: Fixed offsets don't account for realized fill probability. offset=0.02 fills 95% of the time in volatile markets (adverse selection — we fill when the market moves against us) but only 10% in calm markets (capital sitting idle).
+
+**Proposal**: Track per-symbol, per-volatility-regime fill rates. Auto-tune offset to target ~60% fill rate.
+
+```
+After each window resolves:
+  fill_rate = fills_received / ticks_with_resting_bid
+  Store in EMA bucket keyed by (symbol, volatilityRegime)
+
+Next window, compute target offset:
+  if fill_rate > 0.75: widen offset by 10% (too many fills = adverse selection)
+  if fill_rate < 0.40: tighten offset by 10% (too few fills = missing opportunities)
+  Bounded by [0.01, 0.08]
+```
+
+**Why it matters**: This is the missing feedback loop. Currently we guess offsets; this learns them. Unified-adaptive already has fill bucket EMA for bid sizing — this would be the analogous system for offset tuning.
+
+**Interaction with volatility-adaptive offset**: The vol multiplier handles regime shifts within a window. The fill rate loop handles cross-window learning. They stack: `base_offset * vol_multiplier * fill_rate_adjustment`.
+
+### 3. Cross-Asset Momentum Cascade
+
+**Problem**: BTC moves first, ALTs follow 5-30 seconds later. conviction-maker has `computeLeadLagBonus()` but safe-maker and directional-maker don't use it. When BTC spikes UP, our ALT DN bids fill (adverse selection) before the ALT price catches up.
+
+**Proposal**: Share the lead-lag module across all maker strategies. When BTC makes a sharp move (>0.1% in 30s):
+
+```
+For each ALT (ETH, SOL, XRP):
+  if BTC direction confirms ALT signal: tighten conviction-side offset
+  if BTC direction contradicts ALT signal: widen both offsets (danger)
+  if BTC move is very strong + ALT hasn't moved yet: cancel ALT bids entirely for 2 ticks
+```
+
+**Expected impact**: Prevents the most common adverse selection pattern — BTC moves, ALT bids fill on the wrong side before the ALT signal updates.
+
+### 4. Polymarket Tape Order Flow Signal
+
+**Problem**: We fetch the trade tape every tick for fill validation but throw away the flow information.
+
+**Proposal**: Analyze the tape for order flow imbalance as a 6th signal layer (in addition to the existing 5-layer signal from Binance prices).
+
+```
+Recent tape (last 60s):
+  up_buy_volume = sum of BUY trades on UP token
+  dn_buy_volume = sum of BUY trades on DN token
+  imbalance = (up_buy_volume - dn_buy_volume) / (up_buy_volume + dn_buy_volume + 1)
+
+imbalance > +0.3: strong UP buying pressure → boost UP signal
+imbalance < -0.3: strong DN buying pressure → boost DN signal
+|imbalance| < 0.1: balanced → no adjustment
+```
+
+**Key insight**: This is a Polymarket-native signal. The Binance price signal tells us where the crypto price is going. The tape signal tells us what Polymarket participants believe the resolution will be. When they agree, conviction is high. When they diverge, caution.
+
+**No extra API calls needed** — tape is already fetched for fill validation.
+
+### 5. Conditional Entry Timing
+
+**Problem**: All strategies enter as soon as they discover a market at window open. But the first 30 seconds often have no fill activity (market hasn't warmed up) and the opening price move can be misleading.
+
+**Proposal**: Delay entry by 15-30 seconds with specific entry gates:
+
+```
+Wait to enter until ALL of:
+  1. Tape shows >= 3 trades in last 30s (minimum liquidity)
+  2. |upAsk - dnAsk| < 0.15 (spread isn't already lopsided)
+  3. No price move > 0.3% in last 15s (not entering into a spike)
+  4. At least 2 signal ticks available (enough data for momentum layer)
+```
+
+**Trade-off**: We miss the first 15-30s of fill opportunities. But we avoid the most dangerous entries (one-sided fills on opening momentum). Net positive for maker strategies, less important for sniper (which doesn't care about direction).
+
+### 6. Window Overlap Exploitation
+
+**Problem**: When 5min and 15min windows overlap on the same crypto, they share the same underlying price but resolve at different times. The 5min resolution provides free information for the remaining 15min window, but we currently ignore it.
+
+**Proposal**: When a 5min window resolves while a 15min window is still open on the same symbol:
+
+```
+5min resolves UP → BTC was trending up in recent 5min
+  - Boost UP conviction on 15min window
+  - Tighten UP offset (more aggressive entry)
+  - If 15min has one-sided DN inventory, consider selling (signal says UP)
+
+5min resolves DOWN → opposite adjustments
+```
+
+**Subtlety**: The 5min resolution tells us about the last 5 minutes, not the next 10. A reversal is possible. Weight this signal at ~30% strength, not a hard override.
+
+### 7. Resolution Front-Running (New Strategy Concept)
+
+**Concept**: A new strategy type that only operates in the last 60-120 seconds before resolution, when the outcome is often deterministic.
+
+```
+120s before resolution:
+  Fetch Binance price → compare to market threshold
+  If price is >0.5% above threshold → outcome almost certainly UP
+  If UP token ask < $0.92 → buy UP as taker (pay fee, but high expected value)
+
+Expected value:
+  If BTC is $84,500 and threshold is $84,000:
+    P(UP) ≈ 0.95 (price needs to drop 0.6% in 2 minutes — unlikely)
+    EV = 0.95 * ($1.00 - $0.92 - fee) = 0.95 * $0.02 = $0.019/share
+    At 100 shares: ~$1.90 per window, ~$0.50 fee = ~$1.40 net
+
+Risk: Sudden reversal in last 60s wipes the position.
+Mitigation: Only enter when margin > 0.5%, stop-loss if margin drops < 0.2%.
+```
+
+**Key difference from existing strategies**: This is a taker strategy (pays fees) but only enters with very high confidence. It works because the wide ask spread ($0.99) isn't the entry point — we're buying at $0.85-$0.92 from sellers who don't realize the outcome is almost locked.
+
+---
+
+## Safe Maker
+
+**File**: `worker/src/strategies/safe-maker.ts`
+
+Conservative signal-biased maker that protects paired inventory. Clone of directional-maker with one key difference: never sells inventory that's part of a balanced pair.
+
+### Recent Changes (March 15-16)
+
+| Change | Details |
+|--------|---------|
+| **Volatility-adaptive offset** | `vol_offset_scale_high=1.5`, `vol_offset_scale_low=0.5` scales `bid_offset` by `signal.volatilityRegime` |
+| **Time-decay tightening** | `tighten_start_pct=0.70` — offset decays linearly to 0 in last 30% of window for unfilled sides only |
+| **Reluctant requoting** | `min_requote_delta=0.02` — won't cancel+replace unless new bid is at least 2c different |
+| **Tape fill protection** | Checks trade tape before paper cancel in both flip and non-flip requote paths |
+| **D1 immediate fill records** | All three immediate fill paths (UP, DN, wind-down) now write to `strategy_trades` |
+| **Fee equivalent tracking** | `fee_amount` in D1 stores `calcFeePerShare * size` for rebate pool weighting |
+
+### Adaptive Offset Flow
+
+```
+baseOffset (param: bid_offset = 0.02)
+  → * volMultiplier (0.5 in low vol / 1.0 normal / 1.5 in high vol)
+  → * timeDecay (1.0 → 0.0 in last 30% of window, unfilled sides only)
+  → finalOffset
+  → rawBid = fairValue - finalOffset
+  → complementary cap: min(rawBid, max_pair_cost - otherSideAvgCost)
+  → round to cents
+  → skip requote if |newBid - currentBid| < min_requote_delta (0.02)
+```
+
+### Remaining Improvements
+
+| # | Improvement | Status | Notes |
+|---|------------|--------|-------|
+| 1 | Inventory-aware asymmetric offsets | TODO | Currently binary cancel; should use continuous offset scaling |
+| 2 | Fill rate feedback loop | TODO | Auto-tune offset from realized fill rates |
+| 3 | Cross-asset momentum cascade | TODO | Use BTC lead-lag to pre-adjust ALT offsets |
+| 4 | Multi-tier bids (2-3 levels) | TODO | Single bid per side currently |
+| 5 | Per-crypto bid sizing | TODO | Uniform sizing; BTC has more liquidity |
+| 6 | Conditional entry timing | TODO | Enters immediately on market discovery |
 
 ---
 
@@ -123,16 +315,21 @@ All handled by `strategy.ts` — UA no longer has its own wallet system:
 - **Excess lock**: Profits above `max_capital_usd` are locked (strategy can't use more than it needs)
 - **Proportional drawdown**: When balance drops below HWM, `max_capital_usd` scales proportionally. Floor at 25% capacity. Configured via `max_drawdown_pct` param.
 
+### Recent Changes (March 16)
+
+- **D1 immediate fill records**: UP and DN immediate fills in `makerUpdateQuotes` now write to `strategy_trades`
+- **Fee equivalent tracking**: All 8 BUY D1 inserts (sniper real/paper UP/DN, maker paper UP/DN, maker immediate UP/DN) now store `calcFeePerShare * size` as `fee_amount`
+
 ### Remaining Improvements
 
 | # | Improvement | Status | Notes |
 |---|------------|--------|-------|
-| 1 | Per-crypto bid sizing | TODO | Currently uniform; BTC has more liquidity than XRP |
-| 2 | Dynamic bid offset by volatility | TODO | Fixed offset (sniper=0.04, maker=0.02) |
+| 1 | Port adaptive repricing from safe-maker | TODO | UA has its own requoting system; could benefit from vol-adaptive offset, time-decay, reluctant requoting |
+| 2 | Per-crypto bid sizing | TODO | Currently uniform; BTC has more liquidity than XRP |
 | 3 | Multi-tier bids (2-3 price levels) | TODO | Currently single bid per side |
-| 4 | Window-end acceleration | TODO | Could tighten offset in last 30% |
+| 4 | Tape order flow signal | TODO | Tape already fetched; not analyzing buy/sell imbalance |
 | 5 | Per-crypto conviction bias | TODO | Currently uniform 2.0x bias |
-| 6 | Adaptive pair cost targets | TODO | Could start tight, loosen if fills slow |
+| 6 | Window overlap exploitation | TODO | 5min resolution could inform overlapping 15min window |
 
 Previously proposed items that are now implemented:
 - ~~Mode switching mid-window~~ → implemented as "deferred upgrade" (sniper→maker after 3 ticks if signal strengthens)
@@ -210,13 +407,13 @@ Direction doesn't matter. As long as both sides fill equally, every window is pr
 | 1 | Fix maker fee calculation | DONE | Zero fee on resting bid fills |
 | 2 | Timeframe-adaptive bid sizing | DONE | 5min=10, 15min=30 (scales with duration) |
 | 3 | Increase bid size on 15-min | DONE | Configurable, tested at 15/30/60 |
-| 4 | Dynamic bid offset by volatility | TODO | Still uses fixed 0.04 offset |
+| 4 | Dynamic bid offset by volatility | TODO | Not yet ported from safe-maker (sniper uses fixed neutral offset) |
 | 5 | Per-crypto bid sizing | TODO | Uniform sizing currently |
 | 6 | Smarter rebalance selling | DONE | Book-based sell pricing (best bid or limit), not fixed 0.48 |
 | 7 | Multi-tier bid placement | TODO | Single bid per side |
-| 8 | Window-end acceleration | TODO | Could tighten offset in last 30% |
+| 8 | Window-end acceleration | TODO | Not yet ported from safe-maker (sniper uses fixed wind-down timing) |
 | 9 | Skip low-liquidity time slots | TODO | No time-of-day awareness |
-| 10 | Maker rebate tracking | TODO | Not modeled in paper P&L |
+| 10 | Maker rebate tracking | DONE | fee_equivalent stored in D1 for all strategies |
 
 Additional features implemented since original list:
 - **Ask imbalance gate** (0.15 threshold) — prevents one-sided entry
@@ -253,13 +450,18 @@ Every 5 seconds (tick):
   |        - Non-conviction side: bid at fairValue - bid_offset
   |        - Conviction side: bid SIZE = base * conviction_bias (2x)
   |        - Non-conviction side: bid SIZE = base / conviction_bias (0.5x)
-  |     e. INVENTORY SAFETY (every tick):
+  |     e. ADAPTIVE REPRICING (new):
+  |        - Volatility scaling: bid_offset * volMultiplier (0.5x/1.0x/1.5x)
+  |        - Time-decay: offset → 0 in last 30% for unfilled sides
+  |        - Reluctant requoting: skip if |newBid - oldBid| < 2c
+  |        - Tape fill check before paper cancel
+  |     f. INVENTORY SAFETY (every tick):
   |        - Cancel heavy-side bids if ratio > max_inventory_ratio
-  |     f. DIRECTION CHANGE (hysteresis):
+  |     g. DIRECTION CHANGE (hysteresis):
   |        - Dead zone prevents flips on < 0.02% moves
   |        - Track confirmedDirection, flipCount, lastDirectionChangeAt
   |        - After 3+ flips → stop quoting (market too choppy)
-  |     g. WIND-DOWN: stop quoting 45s before end, exit 15s before end
+  |     h. WIND-DOWN: stop quoting 45s before end, exit 15s before end
   |
   3. ENTER NEW WINDOWS
   |   For each market not tracked:
@@ -281,10 +483,6 @@ Signal says UP:
   UP bid:   30 shares at $0.52  (conviction side: 2x size, higher fair value)
   DN bid:   8 shares at $0.44   (non-conviction: 0.5x size, lower fair value)
 
-If both fill (paired):
-  Cost: 30 * $0.52 + 30 * $0.44 = $28.80    → pair cost $0.96
-  Wait... that's too expensive. Let's be precise:
-
 Matched pairs (min of both fills):
   8 matched pairs at ($0.52 + $0.44) = $0.96 → profit $0.04 * 8 = $0.32
   22 excess UP at $0.52 → directional bet on UP
@@ -302,10 +500,10 @@ So the maker gets:
 | 1 | Fix maker fee calculation | DONE | Zero fee on resting bid fills |
 | 2 | Reduce signal amplitude for 5-min | PARTIAL | Uses configurable `signal_amplitude` (default 0.20); could auto-reduce for short windows |
 | 3 | Increase bid size | DONE | Configurable, duration-scaled, tested at 15/30/60 |
-| 4 | Per-crypto conviction strength | TODO | Uniform conviction_bias currently |
-| 5 | Adaptive pair cost by duration | TODO | Fixed max_pair_cost |
+| 4 | Dynamic bid offset by volatility | DONE | `vol_offset_scale_high=1.5`, `vol_offset_scale_low=0.5` |
+| 5 | Window-end acceleration | DONE | `tighten_start_pct=0.70` — linear offset decay in last 30% for unfilled sides |
 | 6 | Direction-aware rebalancing | DONE | Sells wrong-side excess, window poisoning on rebalance |
-| 7 | Momentum-based position sizing | TODO | Conviction bias is static, not momentum-reactive |
+| 7 | Reluctant requoting | DONE | `min_requote_delta=0.02` — preserves queue priority |
 | 8 | Hybrid timeframe strategy | DONE (via UA) | UA does this automatically via mode selection |
 | 9 | Inventory-aware stop-quoting | PARTIAL | Per-tick inventory safety cancels heavy-side bids; stop-quoting is time-based |
 | 10 | Flip-count-based sizing | DONE | `max_flips_per_window=3` stops quoting on choppy windows |
@@ -314,6 +512,40 @@ Additional features implemented since original list:
 - **Grounded fills** (trade-tape matching) — real price/size validation for paper mode
 - **Per-tick inventory safety** — cancel heavy-side bids every tick
 - **Dead zone hysteresis** — prevents false direction flips on noise
+- **Tape fill protection** — checks tape before paper cancel on requote
+- **D1 immediate fill records** — all three immediate fill paths write to strategy_trades
+- **Fee equivalent tracking** — fee_amount in D1 for rebate pool weighting
+
+---
+
+## Conviction Maker
+
+**File**: `worker/src/strategies/conviction-maker.ts`
+
+### How It Works
+
+One-sided conviction bets. Only bids when signal > 0.60. No hedging, holds to resolution.
+
+Key differences from directional-maker:
+- Bids ONLY on conviction side (no hedge bids on the other side)
+- Sits out when signal < min_signal_strength (0.60 default)
+- No sell logic — holds to resolution
+- Cross-asset lead-lag (BTC leads ALTs) via `computeLeadLagBonus()`
+- Conviction scaling: stronger signal → larger position (0.60→36 units, 0.80→48, 1.00→60)
+
+### Recent Changes (March 16)
+
+- Tape fill check before paper cancel in requote path
+- D1 records for immediate fills
+- Fee equivalent tracking in all D1 inserts
+
+### Remaining Improvements
+
+| # | Improvement | Status | Notes |
+|---|------------|--------|-------|
+| 1 | Port adaptive repricing | TODO | No vol-adaptive offset or time-decay yet (simpler single-side requoting) |
+| 2 | Dynamic conviction threshold by asset | TODO | Fixed 0.60 threshold; some assets need higher |
+| 3 | Partial exit on signal weakening | TODO | Currently all-or-nothing hold to resolution |
 
 ---
 
