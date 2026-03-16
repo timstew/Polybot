@@ -24,17 +24,7 @@ import type {
 } from "../strategy";
 import { registerStrategy } from "../strategy";
 import { calcFeePerShare, CRYPTO_FEES, type FeeParams } from "../categories";
-
-// ── Types ────────────────────────────────────────────────────────────
-
-interface CryptoMarket {
-  title: string;
-  slug: string;
-  conditionId: string;
-  endDate: string;
-  upTokenId: string;
-  downTokenId: string;
-}
+import { discoverCryptoMarkets, type CryptoMarket } from "./price-feed";
 
 interface SplitPosition {
   market: CryptoMarket;
@@ -173,104 +163,6 @@ function findBestSplit(
   return best;
 }
 
-// ── Market Discovery ─────────────────────────────────────────────────
-
-async function discoverMarkets(
-  cryptos: string[]
-): Promise<CryptoMarket[]> {
-  const markets: CryptoMarket[] = [];
-  const seen = new Set<string>();
-
-  try {
-    // Fetch recent trades to find active crypto binary markets
-    const resp = await fetch(
-      "https://data-api.polymarket.com/trades?limit=200"
-    );
-    if (!resp.ok) return markets;
-    const trades = (await resp.json()) as Array<{
-      title?: string;
-      eventSlug?: string;
-    }>;
-
-    const eventSlugs = new Set<string>();
-    for (const t of trades) {
-      const title = t.title || "";
-      const eventSlug = t.eventSlug || "";
-      if (!eventSlug) continue;
-      // Match "up or down" pattern in crypto markets
-      if (!title.toLowerCase().includes("up or down")) continue;
-      const matchesCrypto = cryptos.some((c) =>
-        title.toLowerCase().includes(c.toLowerCase())
-      );
-      if (!matchesCrypto) continue;
-      if (seen.has(eventSlug)) continue;
-      seen.add(eventSlug);
-      eventSlugs.add(eventSlug);
-    }
-
-    // Fetch market details from Gamma API
-    // Do these in parallel for speed
-    const slugArray = Array.from(eventSlugs);
-    const eventResponses = await Promise.allSettled(
-      slugArray.map(async (slug) => {
-        const evResp = await fetch(
-          `https://gamma-api.polymarket.com/events?slug=${slug}`
-        );
-        if (!evResp.ok) return [];
-        return (await evResp.json()) as Array<{
-          title: string;
-          markets: Array<{
-            question: string;
-            slug: string;
-            conditionId: string;
-            endDate: string;
-            closed: boolean;
-            clobTokenIds: string;
-            outcomes: string;
-          }>;
-        }>;
-      })
-    );
-
-    for (const result of eventResponses) {
-      if (result.status !== "fulfilled") continue;
-      for (const ev of result.value) {
-        for (const m of ev.markets) {
-          if (m.closed) continue;
-          const outcomes = JSON.parse(m.outcomes || "[]") as string[];
-          const tokens = JSON.parse(m.clobTokenIds || "[]") as string[];
-          if (outcomes.length !== 2 || tokens.length !== 2) continue;
-
-          const upIdx = outcomes.findIndex(
-            (o) => o.toLowerCase() === "up" || o.toLowerCase() === "yes"
-          );
-          const downIdx = outcomes.findIndex(
-            (o) => o.toLowerCase() === "down" || o.toLowerCase() === "no"
-          );
-          if (upIdx === -1 || downIdx === -1) continue;
-
-          // Skip markets that are about to resolve (< 2 minutes)
-          const timeToEnd = new Date(m.endDate).getTime() - Date.now();
-          if (timeToEnd < 120_000) continue;
-
-          markets.push({
-            title: m.question,
-            slug: m.slug,
-            conditionId: m.conditionId,
-            endDate: m.endDate,
-            upTokenId: tokens[upIdx],
-            downTokenId: tokens[downIdx],
-          });
-        }
-      }
-    }
-  } catch {
-    // Discovery failure — return empty
-  }
-
-  return markets;
-}
-
 // ── Strategy Implementation ──────────────────────────────────────────
 
 class SplitArbStrategy implements Strategy {
@@ -293,7 +185,7 @@ class SplitArbStrategy implements Strategy {
     // 1. Refresh market discovery periodically
     const now = Date.now();
     if (now - this.lastDiscovery > params.discovery_interval_ms) {
-      this.marketCache = await discoverMarkets(params.target_cryptos);
+      this.marketCache = await discoverCryptoMarkets(params.target_cryptos);
       this.lastDiscovery = now;
       ctx.log(`Discovered ${this.marketCache.length} active crypto binary markets`);
     }

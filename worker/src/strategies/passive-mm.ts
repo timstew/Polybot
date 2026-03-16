@@ -457,6 +457,12 @@ class ScalpMMStrategy implements Strategy {
     const currentInv = targetSide === "up" ? upSize : downSize;
     if (currentInv >= params.max_inventory_per_side) return;
 
+    // Global capital check
+    const capitalDeployed = this.scalps.reduce((sum, sc) =>
+      sum + sc.inventory.reduce((iSum, inv) => iSum + inv.size * inv.avgCostBasis, 0), 0
+    );
+    if (capitalDeployed > ctx.config.max_capital_usd) return;
+
     const book = await ctx.api.getBook(targetTokenId);
     const mid = getMid(book);
     const spread = getSpread(book);
@@ -584,10 +590,18 @@ class ScalpMMStrategy implements Strategy {
       this.scalps.map((s) => s.market.conditionId)
     );
 
+    // Global capital check: total cost of all inventory across all scalps
+    const capitalDeployed = this.scalps.reduce((sum, s) =>
+      sum + s.inventory.reduce((iSum, inv) => iSum + inv.size * inv.avgCostBasis, 0), 0
+    );
+
     let opened = 0;
     for (const market of this.marketCache) {
       if (opened >= slots) break;
       if (activeConditions.has(market.conditionId)) continue;
+
+      // Capital limit check
+      if (capitalDeployed > ctx.config.max_capital_usd) break;
 
       const timeToEnd = new Date(market.endDate).getTime() - Date.now();
       if (timeToEnd < params.exit_before_ms * 3) continue;
