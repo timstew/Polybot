@@ -58,5 +58,6 @@ export interface Env {
   LISTENER: DurableObjectNamespace;
   FIREHOSE: DurableObjectNamespace;
   WATCHLIST: DurableObjectNamespace;
+  STRATEGY: DurableObjectNamespace;
   PYTHON_API_URL: string;
 }

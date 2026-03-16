@@ -16,6 +16,9 @@ export { StrategyDO } from "./strategy";
 // Register strategy implementations (side-effect imports)
 import "./strategies/split-arb";
 import "./strategies/passive-mm";
+import "./strategies/directional-taker";
+import "./strategies/directional-maker";
+import "./strategies/spread-sniper";
 
 // ── Auto-start DOs on first request ────────────────────────────────
 
@@ -612,20 +615,31 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
+
+    // Handle CORS preflight (before try/catch to keep it fast)
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(origin),
+      });
+    }
+
+    try {
+      return await this._handleFetch(request, env, url, origin);
+    } catch (e) {
+      const msg = e instanceof Error ? e.stack || e.message : String(e);
+      console.error(`[WORKER CRASH] ${request.method} ${url.pathname}:`, msg);
+      return jsonCors({ error: "internal_error", message: msg }, request, 500);
+    }
+  },
+
+  async _handleFetch(request: Request, env: Env, url: URL, origin: string): Promise<Response> {
     const fdb = env.FIREHOSE_DB ?? env.DB; // firehose DB (suspect_bots, firehose_trades, firehose_wallets)
 
     // Auto-start DOs on first request (cron doesn't fire in local dev)
     if (!autoStarted) {
       autoStarted = true;
       autoStartDOs(env).catch(() => {});
-    }
-
-    // Handle CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders(origin),
-      });
     }
 
     // ── Firehose cleanup & stats ───────────────────────────────────
@@ -2142,8 +2156,8 @@ export default {
       const body = (await request.json()) as Record<string, unknown>;
       const id = body.id || `strat-${Date.now()}`;
       await env.DB.prepare(
-        `INSERT INTO strategy_configs (id, name, strategy_type, mode, params, tick_interval_ms, max_capital_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO strategy_configs (id, name, strategy_type, mode, params, tick_interval_ms, max_capital_usd, balance_usd, lock_increment_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
         .bind(
           id,
@@ -2152,7 +2166,9 @@ export default {
           body.mode || "paper",
           JSON.stringify(body.params || {}),
           body.tick_interval_ms || 5000,
-          body.max_capital_usd || 200
+          body.max_capital_usd || 200,
+          body.balance_usd != null ? body.balance_usd : null,
+          body.lock_increment_usd != null ? body.lock_increment_usd : null
         )
         .run();
       return jsonCors({ status: "created", id }, request);
@@ -2172,6 +2188,8 @@ export default {
         "mode",
         "tick_interval_ms",
         "max_capital_usd",
+        "balance_usd",
+        "lock_increment_usd",
       ]) {
         if (body[key] !== undefined) {
           sets.push(`${key} = ?`);
@@ -2194,11 +2212,63 @@ export default {
       return jsonCors({ status: "updated", id: configId }, request);
     }
 
+    // Delete a strategy config (stops it first if running)
+    if (
+      url.pathname.startsWith("/api/strategy/configs/") &&
+      request.method === "DELETE"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      // Stop the DO if running
+      try {
+        const doId = env.STRATEGY.idFromName(configId);
+        const doObj = env.STRATEGY.get(doId);
+        await doObj.fetch(
+          new Request("https://dummy/stop", { method: "POST" })
+        );
+      } catch { /* ignore */ }
+      // Delete from D1
+      await env.DB.prepare("DELETE FROM strategy_configs WHERE id = ?")
+        .bind(configId)
+        .run();
+      // Also clean up trades
+      await env.DB.prepare("DELETE FROM strategy_trades WHERE strategy_id = ?")
+        .bind(configId)
+        .run();
+      return jsonCors({ status: "deleted", id: configId }, request);
+    }
+
     if (
       url.pathname.startsWith("/api/strategy/start/") &&
       request.method === "POST"
     ) {
       const configId = url.pathname.split("/").pop() || "";
+
+      // Single real strategy enforcement: check if another real strategy is already running
+      try {
+        const thisConfig = await env.DB.prepare(
+          "SELECT mode FROM strategy_configs WHERE id = ?"
+        ).bind(configId).first<{ mode: string }>();
+
+        if (thisConfig?.mode === "real") {
+          const otherReal = await env.DB.prepare(
+            "SELECT id, name FROM strategy_configs WHERE mode = 'real' AND active = 1 AND id != ?"
+          ).bind(configId).all();
+
+          if (otherReal.results && otherReal.results.length > 0) {
+            const names = (otherReal.results as Array<{ id: string; name: string }>)
+              .map((r) => r.name)
+              .join(", ");
+            return jsonCors(
+              { error: `Cannot start: other real strategies already running: ${names}. Stop them first.` },
+              request,
+              400
+            );
+          }
+        }
+      } catch {
+        // DB check failed — allow start (fail open, strategy has its own safety)
+      }
+
       const stratId = env.STRATEGY.idFromName(configId);
       const stratObj = env.STRATEGY.get(stratId);
       const resp = await stratObj.fetch(
@@ -2217,8 +2287,53 @@ export default {
       const configId = url.pathname.split("/").pop() || "";
       const stratId = env.STRATEGY.idFromName(configId);
       const stratObj = env.STRATEGY.get(stratId);
+
+      // Check if already winding down — if so, force-stop
+      const statusResp = await stratObj.fetch(new Request("https://dummy/status"));
+      const status = (await statusResp.json()) as { winding_down?: boolean };
+
+      if (status.winding_down) {
+        // Second stop = force-stop
+        const resp = await stratObj.fetch(
+          new Request("https://dummy/stop", { method: "POST" })
+        );
+        const data = await resp.json();
+        return jsonCors(data, request);
+      }
+
+      // First stop = wind-down
+      const resp = await stratObj.fetch(
+        new Request("https://dummy/wind-down", { method: "POST" })
+      );
+      const data = await resp.json();
+      return jsonCors(data, request);
+    }
+
+    // Force-stop: immediate halt (skips wind-down)
+    if (
+      url.pathname.startsWith("/api/strategy/force-stop/") &&
+      request.method === "POST"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const stratId = env.STRATEGY.idFromName(configId);
+      const stratObj = env.STRATEGY.get(stratId);
       const resp = await stratObj.fetch(
         new Request("https://dummy/stop", { method: "POST" })
+      );
+      const data = await resp.json();
+      return jsonCors(data, request);
+    }
+
+    // Reset strategy state (clear stats, keep config)
+    if (
+      url.pathname.startsWith("/api/strategy/reset/") &&
+      request.method === "POST"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const stratId = env.STRATEGY.idFromName(configId);
+      const stratObj = env.STRATEGY.get(stratId);
+      const resp = await stratObj.fetch(
+        new Request("https://dummy/reset-state", { method: "POST" })
       );
       const data = await resp.json();
       return jsonCors(data, request);
@@ -2233,17 +2348,19 @@ export default {
         "SELECT id FROM strategy_configs"
       ).all();
       const configs = (cfgRows.results || []) as Array<{ id: string }>;
-      const statuses: Record<string, unknown> = {};
-      for (const cfg of configs) {
-        try {
-          const doId = env.STRATEGY.idFromName(cfg.id);
-          const doObj = env.STRATEGY.get(doId);
-          const resp = await doObj.fetch(new Request("https://dummy/status"));
-          statuses[cfg.id] = await resp.json();
-        } catch {
-          statuses[cfg.id] = { running: false, config: null, state: null };
-        }
-      }
+      const results = await Promise.all(
+        configs.map(async (cfg) => {
+          try {
+            const doId = env.STRATEGY.idFromName(cfg.id);
+            const doObj = env.STRATEGY.get(doId);
+            const resp = await doObj.fetch(new Request("https://dummy/status"));
+            return [cfg.id, await resp.json()] as const;
+          } catch {
+            return [cfg.id, { running: false, config: null, state: null }] as const;
+          }
+        })
+      );
+      const statuses = Object.fromEntries(results);
       return jsonCors(statuses, request);
     }
 
@@ -2279,6 +2396,26 @@ export default {
       const rows = await env.DB.prepare(
         "SELECT * FROM strategy_trades ORDER BY timestamp DESC LIMIT 100"
       ).all();
+      return jsonCors(rows.results || [], request);
+    }
+
+    if (
+      url.pathname.startsWith("/api/strategy/logs/") &&
+      request.method === "GET"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const limit = parseInt(url.searchParams.get("limit") || "200");
+      const level = url.searchParams.get("level") || "";
+      let query = "SELECT * FROM strategy_logs WHERE strategy_id = ?";
+      const binds: unknown[] = [configId];
+      if (level) {
+        query += " AND level = ?";
+        binds.push(level);
+      }
+      query += " ORDER BY timestamp DESC LIMIT ?";
+      binds.push(Math.min(limit, 1000));
+      const stmt = env.DB.prepare(query);
+      const rows = await stmt.bind(...binds).all();
       return jsonCors(rows.results || [], request);
     }
 
@@ -2396,6 +2533,25 @@ export default {
       }
     } catch {
       // strategy tables might not exist yet
+    }
+
+    // Sweep unredeemed positions every cron tick (1 min)
+    // This runs independently of strategy lifecycle so positions
+    // get redeemed even after all strategies stop.
+    try {
+      const sweepUrl = `${env.PYTHON_API_URL}/api/redeem/sweep`;
+      const sweepResp = await fetch(sweepUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (sweepResp.ok) {
+        const data = (await sweepResp.json()) as { redeemed: number; scanned: number };
+        if (data.redeemed > 0) {
+          console.log(`[cron] REDEEM SWEEP: redeemed ${data.redeemed}/${data.scanned} positions`);
+        }
+      }
+    } catch {
+      // Non-critical — Cloud Run might be cold-starting
     }
   },
 };
