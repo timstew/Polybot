@@ -19,6 +19,10 @@ import "./strategies/passive-mm";
 import "./strategies/directional-taker";
 import "./strategies/directional-maker";
 import "./strategies/spread-sniper";
+import "./strategies/certainty-taker";
+import "./strategies/avellaneda-maker";
+import "./strategies/enhanced-maker";
+import "./strategies/orchestrator";
 
 // ── Auto-start DOs on first request ────────────────────────────────
 
@@ -2143,6 +2147,41 @@ export default {
       return jsonCors({ status: "synced", count: targets.length }, request);
     }
 
+    // ── Orchestrator routes ──────────────────────────────────────────────
+
+    if (url.pathname === "/api/strategy/tactics" && request.method === "GET") {
+      const { listTactics } = await import("./strategies/tactic");
+      return jsonCors(listTactics(), request);
+    }
+
+    if (url.pathname.startsWith("/api/strategy/regime-status/") && request.method === "GET") {
+      const stratId = url.pathname.split("/").pop()!;
+      const doId = env.STRATEGY.idFromName(stratId);
+      const doStub = env.STRATEGY.get(doId);
+      const resp = await doStub.fetch(new Request("https://dummy/status"));
+      const status = await resp.json() as { state?: { custom?: { assetRegimes?: Record<string, unknown> } } };
+      return jsonCors(status?.state?.custom?.assetRegimes ?? {}, request);
+    }
+
+    if (url.pathname.startsWith("/api/strategy/tactic-scores/") && request.method === "GET") {
+      const stratId = url.pathname.split("/").pop()!;
+      const rows = await env.DB.prepare(
+        `SELECT regime, tactic_id, n, total_pnl, avg_pnl, variance, wins, losses, last_updated_at
+         FROM tactic_scores WHERE strategy_id = ? ORDER BY regime, avg_pnl DESC`
+      ).bind(stratId).all();
+      return jsonCors(rows.results || [], request);
+    }
+
+    if (url.pathname.startsWith("/api/strategy/regime-performance/") && request.method === "GET") {
+      const stratId = url.pathname.split("/").pop()!;
+      const rows = await env.DB.prepare(
+        `SELECT regime, tactic_id, COUNT(*) as windows, COALESCE(SUM(pnl), 0) as total_pnl, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
+         FROM strategy_regime_log WHERE strategy_id = ? AND pnl IS NOT NULL
+         GROUP BY regime, tactic_id ORDER BY regime, total_pnl DESC`
+      ).bind(stratId).all();
+      return jsonCors(rows.results || [], request);
+    }
+
     // ── Strategy execution routes ──────────────────────────────────────
 
     if (url.pathname === "/api/strategy/configs" && request.method === "GET") {
@@ -2198,7 +2237,7 @@ export default {
       }
       if (body.params !== undefined) {
         sets.push("params = ?");
-        vals.push(JSON.stringify(body.params));
+        vals.push(typeof body.params === "string" ? body.params : JSON.stringify(body.params));
       }
       if (sets.length > 0) {
         sets.push("updated_at = datetime('now')");
@@ -2209,6 +2248,12 @@ export default {
           .bind(...vals)
           .run();
       }
+      // Notify the DO to re-read config from D1
+      try {
+        const doId = env.STRATEGY.idFromName(configId);
+        const doObj = env.STRATEGY.get(doId);
+        await doObj.fetch(new Request("https://dummy/reload-config", { method: "POST" }));
+      } catch { /* DO may not exist yet */ }
       return jsonCors({ status: "updated", id: configId }, request);
     }
 
@@ -2334,6 +2379,26 @@ export default {
       const stratObj = env.STRATEGY.get(stratId);
       const resp = await stratObj.fetch(
         new Request("https://dummy/reset-state", { method: "POST" })
+      );
+      const data = await resp.json();
+      return jsonCors(data, request);
+    }
+
+    // Manual merge: trigger CTF merge for matched pairs in a window
+    if (
+      url.pathname.startsWith("/api/strategy/merge/") &&
+      request.method === "POST"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const stratId = env.STRATEGY.idFromName(configId);
+      const stratObj = env.STRATEGY.get(stratId);
+      const body = await request.text();
+      const resp = await stratObj.fetch(
+        new Request("https://dummy/merge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        })
       );
       const data = await resp.json();
       return jsonCors(data, request);

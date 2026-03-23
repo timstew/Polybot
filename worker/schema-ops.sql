@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS strategy_configs (
     params TEXT NOT NULL DEFAULT '{}',
     tick_interval_ms INTEGER NOT NULL DEFAULT 5000,
     max_capital_usd REAL NOT NULL DEFAULT 200,
+    balance_usd REAL DEFAULT NULL,
+    lock_increment_usd REAL DEFAULT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -103,7 +105,63 @@ CREATE TABLE IF NOT EXISTS strategy_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_logs_strategy ON strategy_logs(strategy_id, timestamp);
 
--- Balance protection (ratchet lock)
--- NULL = disabled (backward compatible)
-ALTER TABLE strategy_configs ADD COLUMN balance_usd REAL DEFAULT NULL;
-ALTER TABLE strategy_configs ADD COLUMN lock_increment_usd REAL DEFAULT NULL;
+-- Orchestrator regime performance log
+CREATE TABLE IF NOT EXISTS strategy_regime_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    window_duration_ms INTEGER NOT NULL,
+    regime TEXT NOT NULL,
+    regime_confidence REAL NOT NULL,
+    regime_streak INTEGER NOT NULL,
+    tactic_id TEXT NOT NULL,
+    features TEXT NOT NULL DEFAULT '{}',
+    ema_scores TEXT NOT NULL DEFAULT '{}',
+    outcome TEXT,
+    pnl REAL,
+    fill_count INTEGER,
+    pair_cost REAL,
+    was_override INTEGER DEFAULT 0,
+    entered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_regime_log_strategy ON strategy_regime_log(strategy_id, entered_at);
+
+-- Strategy snapshot recording for offline replay / parameter optimization
+CREATE TABLE IF NOT EXISTS strategy_snapshots (
+    id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL,
+    window_title TEXT NOT NULL,
+    crypto_symbol TEXT NOT NULL,
+    window_open_time INTEGER NOT NULL,
+    window_end_time INTEGER NOT NULL,
+    window_duration_ms INTEGER NOT NULL,
+    oracle_strike REAL,
+    price_at_open REAL NOT NULL,
+    hour_utc INTEGER NOT NULL,
+    day_of_week INTEGER NOT NULL,
+    up_token_id TEXT NOT NULL DEFAULT '',
+    down_token_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT,
+    ticks TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_strategy ON strategy_snapshots(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_time ON strategy_snapshots(hour_utc, day_of_week);
+
+-- Bandit tactic scores (Thompson Sampling)
+CREATE TABLE IF NOT EXISTS tactic_scores (
+    strategy_id TEXT NOT NULL,
+    regime TEXT NOT NULL,
+    tactic_id TEXT NOT NULL,
+    n INTEGER NOT NULL DEFAULT 0,
+    total_pnl REAL NOT NULL DEFAULT 0,
+    sum_pnl_sq REAL NOT NULL DEFAULT 0,
+    wins INTEGER NOT NULL DEFAULT 0,
+    losses INTEGER NOT NULL DEFAULT 0,
+    avg_pnl REAL NOT NULL DEFAULT 0,
+    variance REAL NOT NULL DEFAULT 0,
+    last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (strategy_id, regime, tactic_id)
+);
