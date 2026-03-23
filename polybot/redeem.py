@@ -228,3 +228,89 @@ def _redeem_onchain(
                 pass
 
     return results
+
+
+def _build_ctf_merge_data(condition_id: str, amount: int) -> bytes:
+    """Encode mergePositions(address,bytes32,bytes32,uint256[],uint256) for CTF."""
+    sel = _selector("mergePositions(address,bytes32,bytes32,uint256[],uint256)")
+    cid_bytes = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
+    args = eth_encode(
+        ["address", "bytes32", "bytes32", "uint256[]", "uint256"],
+        [USDC_POLYGON, ZERO_BYTES32, cid_bytes, [1, 2], amount],
+    )
+    return sel + args
+
+
+def merge_positions(
+    condition_id: str,
+    amount: float,
+    private_key: str = "",
+    funder_address: str | None = None,
+) -> dict:
+    """Merge matched YES+NO tokens back to USDC via CTF contract.
+
+    Returns {status, tx_hash, gas_used, duration_ms}.
+    """
+    pk = private_key or os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    address = funder_address or os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
+    if not pk or not address:
+        return {"status": "failed", "error": "Missing POLYMARKET_PRIVATE_KEY or POLYMARKET_FUNDER_ADDRESS"}
+
+    # amount in token units → raw (×1e6 for USDC decimals)
+    int_amount = int(amount * 1e6)
+    if int_amount <= 0:
+        return {"status": "failed", "error": f"Invalid amount: {amount}"}
+
+    w3 = _get_web3()
+    account = Account.from_key(pk)
+    calldata = _build_ctf_merge_data(condition_id, int_amount)
+    target_cs = Web3.to_checksum_address(CTF_ADDRESS)
+
+    start = time.time()
+    try:
+        nonce = w3.eth.get_transaction_count(account.address)
+        gas_price = int(w3.eth.gas_price * 1.2)
+
+        tx = {
+            "to": target_cs,
+            "from": account.address,
+            "data": calldata,
+            "value": 0,
+            "nonce": nonce,
+            "gasPrice": gas_price,
+            "chainId": 137,
+        }
+        gas_estimate = w3.eth.estimate_gas(tx)
+        tx["gas"] = int(gas_estimate * 1.3)
+
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        logger.info("Sent merge tx for %s: %s (amount=%s)", condition_id[:16], tx_hash.hex()[:16], amount)
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        duration_ms = int((time.time() - start) * 1000)
+
+        if receipt["status"] == 1:
+            logger.info("Merged %s: tx=%s gas=%d %dms", condition_id[:16], tx_hash.hex()[:16], receipt["gasUsed"], duration_ms)
+            return {
+                "status": "merged",
+                "tx_hash": tx_hash.hex(),
+                "gas_used": receipt["gasUsed"],
+                "duration_ms": duration_ms,
+            }
+        else:
+            logger.error("Merge reverted %s: tx=%s", condition_id[:16], tx_hash.hex()[:16])
+            return {
+                "status": "failed",
+                "tx_hash": tx_hash.hex(),
+                "error": "transaction reverted",
+                "duration_ms": duration_ms,
+            }
+    except Exception as e:
+        duration_ms = int((time.time() - start) * 1000)
+        logger.error("Merge failed for %s: %s", condition_id[:16], e)
+        return {
+            "status": "failed",
+            "error": str(e),
+            "duration_ms": duration_ms,
+        }

@@ -579,14 +579,14 @@ def execute_real_trade(body: dict):
         # Balance check for BUY orders
         if side == "BUY":
             try:
-                balances = client.get_balances()
-                usdc_balance = (
-                    float(balances.get("USDC", 0)) if isinstance(balances, dict) else 0
-                )
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                bal_result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                raw = bal_result.get("balance", 0) if isinstance(bal_result, dict) else 0
+                usdc_balance = int(raw) / 1e6
                 if usdc_balance < notional:
                     return {
                         "status": "failed",
-                        "error": f"insufficient_balance",
+                        "error": "insufficient_balance",
                         "balance": round(usdc_balance, 2),
                         "required": round(notional, 2),
                     }
@@ -1630,10 +1630,11 @@ def _get_clob_client():
 
 @app.post("/api/strategy/order")
 def strategy_place_order(body: dict):
-    """Place a GTC limit order for a strategy.
+    """Place an order for a strategy.
 
-    Body: {token_id, side, size, price}
-    Returns: {order_id, status} or {error}
+    Body: {token_id, side, size, price, order_type?}
+    order_type: "GTC" (default), "FAK" (fill-and-kill), "FOK" (fill-or-kill)
+    Returns: {order_id, status, size, price} or {error}
     """
     import math
 
@@ -1642,7 +1643,10 @@ def strategy_place_order(body: dict):
     side = body.get("side", "BUY")
     size = float(body.get("size", 0))
     price = float(body.get("price", 0))
+    order_type = body.get("order_type", "GTC").upper()
 
+    if order_type not in ("GTC", "FAK", "FOK"):
+        return {"status": "failed", "error": f"order_type must be GTC, FAK, or FOK, got {order_type}"}
     if not token_id:
         return {"status": "failed", "error": "token_id required"}
     if size < 5:
@@ -1661,7 +1665,7 @@ def strategy_place_order(body: dict):
         order = client.create_order(
             OrderArgs(token_id=token_id, size=size, side=clob_side, price=price)
         )
-        resp = client.post_order(order, "GTC")
+        resp = client.post_order(order, order_type)
 
         if resp.get("success") or resp.get("orderID"):
             order_id = resp.get("orderID", "")
@@ -1793,8 +1797,11 @@ def strategy_get_balance():
     """Get USDC balance for the funder wallet."""
     client = _get_clob_client()
     try:
-        balances = client.get_balances()
-        usdc = float(balances.get("USDC", 0)) if isinstance(balances, dict) else 0
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        # USDC has 6 decimals on Polygon; the API returns raw wei-like amount
+        raw = result.get("balance", 0) if isinstance(result, dict) else 0
+        usdc = int(raw) / 1e6
         return {"balance": round(usdc, 2)}
     except Exception as e:
         logger.exception("Strategy balance check failed")
@@ -2022,4 +2029,31 @@ def redeem_sweep():
         return {"redeemed": len(results), "results": results, "scanned": len(positions)}
     except Exception as e:
         logger.exception("Sweep redemption failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/merge/positions")
+def merge_positions_endpoint(body: dict):
+    """Merge matched conditional token pairs back to USDC via CTF contract.
+
+    Body: {condition_id: "0x...", amount: 50.0}
+    Returns: {status, tx_hash, gas_used, duration_ms}
+    """
+    from polybot.redeem import merge_positions
+
+    condition_id = body.get("condition_id", "")
+    amount = body.get("amount", 0)
+    if not condition_id or amount <= 0:
+        raise HTTPException(status_code=400, detail="Need condition_id and amount > 0")
+
+    try:
+        result = merge_positions(
+            condition_id=condition_id,
+            amount=amount,
+            private_key=cfg.private_key,
+            funder_address=cfg.funder_address or None,
+        )
+        return result
+    except Exception as e:
+        logger.exception("Merge failed")
         raise HTTPException(status_code=500, detail=str(e))
