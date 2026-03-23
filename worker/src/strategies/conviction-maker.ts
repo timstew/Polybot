@@ -1,15 +1,22 @@
 /**
- * Conviction Maker Strategy
+ * Conviction Maker Strategy — Sequential Conviction-First Pairing
  *
- * Only bets when confident. Only bets one side. Holds to resolution.
+ * Two-phase approach to binary "Up or Down" crypto markets:
  *
- * Key differences from directional-maker:
- * - Bids ONLY on conviction side (no hedge bids)
- * - Sits out when signal < min_signal_strength (0.60 default, higher threshold)
- * - No sell logic — holds to resolution
+ * Phase 1: Buy conviction side at a discount below the CLOB book mid.
+ *   Signal says DOWN → rest a bid on DOWN at 20-25% below book mid.
+ *   Be patient — in oscillating markets, the price bounces to our level.
+ *
+ * Phase 2: After conviction fill, pair it with the other side.
+ *   DOWN filled at $0.65 → bid UP at max $0.93 - $0.65 = $0.28.
+ *   UP is cheap in a DOWN market, so this usually fills quickly.
+ *
+ * Result: pair cost < $1.00 → structurally profitable regardless of outcome.
+ *
+ * Key features retained from old conviction-maker:
  * - Cross-asset lead-lag (BTC leads ALTs)
  * - Window timing awareness (early/mid/late phases)
- * - Conviction scaling (stronger signal → larger position)
+ * - Signal-strength gating (sits out when weak)
  */
 
 import type { Strategy, StrategyContext, OrderBook } from "../strategy";
@@ -29,13 +36,17 @@ import {
   checkMarketResolution,
   enableOrderFlow,
   disableOrderFlow,
+  fetchOracleStrike,
+  toOracleSymbol,
+  toVariant,
   CRYPTO_SYMBOL_MAP,
-  type TradeTapeEntry,
-  fetchTradeTape,
-  checkTapeFill,
 } from "./price-feed";
+import { classifyRegime, computeRegimeFeatures } from "./regime";
 
 // ── Types ────────────────────────────────────────────────────────────
+
+/** Phase of the two-step fill sequence */
+type FillPhase = "seeking_conviction" | "seeking_pair" | "paired" | "one_sided";
 
 interface ConvictionWindowPosition {
   market: CryptoMarket;
@@ -43,17 +54,23 @@ interface ConvictionWindowPosition {
   windowOpenTime: number;
   windowEndTime: number;
   priceAtWindowOpen: number;
+  oracleStrike: number | null;
 
-  // Single active bid (one side only)
+  // Current bid (either conviction or pair side)
   bidOrderId: string | null;
   bidSide: "UP" | "DOWN" | null;
   bidPrice: number;
   bidSize: number;
 
-  // Accumulated inventory (one side only)
-  inventory: number;
-  avgCost: number;
-  inventorySide: "UP" | "DOWN" | null;
+  // Two-sided inventory tracking
+  upInventory: number;
+  upAvgCost: number;
+  downInventory: number;
+  downAvgCost: number;
+
+  // Sequential fill phase
+  fillPhase: FillPhase;
+  convictionDirection: "UP" | "DOWN";
 
   // Signal tracking
   lastSignalDirection: "UP" | "DOWN" | null;
@@ -68,9 +85,9 @@ interface ConvictionWindowPosition {
   // Stats
   fillCount: number;
   totalBuyCost: number;
-  convictionSide: "UP" | "DOWN" | null;
   signalStrengthAtEntry: number;
   enteredAt: number;
+  tickAction: string;
 
   // Set when window is past end time but awaiting Polymarket resolution
   binancePrediction?: "UP" | "DOWN" | null;
@@ -79,10 +96,10 @@ interface ConvictionWindowPosition {
 interface CompletedConvictionWindow {
   title: string;
   cryptoSymbol: string;
-  convictionSide: "UP" | "DOWN" | null;
+  convictionSide: "UP" | "DOWN";
   outcome: "UP" | "DOWN" | "UNKNOWN";
-  inventory: number;
-  inventorySide: "UP" | "DOWN" | null;
+  upInventory: number;
+  downInventory: number;
   totalBuyCost: number;
   netPnl: number;
   signalStrength: number;
@@ -90,8 +107,10 @@ interface CompletedConvictionWindow {
   correct: boolean;
   completedAt: string;
   priceMovePct: number;
-  avgCost: number;
+  upAvgCost: number;
+  downAvgCost: number;
   flipCount: number;
+  fillPhase: FillPhase;
   leadLagBonus: number;
   phase: "early" | "mid" | "late";
 }
@@ -114,7 +133,6 @@ interface ConvictionCustomState {
 interface ConvictionMakerParams {
   target_cryptos: string[];
   base_bid_size: number;
-  bid_offset: number;
   min_spread: number;
   requote_threshold_pct: number;
   observation_seconds: number;
@@ -128,6 +146,10 @@ interface ConvictionMakerParams {
   dead_zone_pct: number;
   max_flips_before_sit_out: number;
   grounded_fills: boolean;
+  max_pair_cost: number;
+  // Conviction discount: how far below book mid to bid on conviction side
+  conviction_discount: number; // default 0.20 (20% below book mid)
+  pair_discount: number;       // default 0.10 (10% below book mid for pairing side)
   // Lead-lag params
   enable_lead_lag: boolean;
   lead_lag_lookback_ms: number;
@@ -140,20 +162,22 @@ interface ConvictionMakerParams {
 const DEFAULT_PARAMS: ConvictionMakerParams = {
   target_cryptos: ["Bitcoin", "Ethereum", "Solana", "XRP"],
   base_bid_size: 30,
-  bid_offset: 0.02,
   min_spread: 0.03,
   requote_threshold_pct: 0.05,
   observation_seconds: 20,
   stop_quoting_before_end_ms: 45_000,
   max_capital_per_window: 50,
   max_concurrent_windows: 12,
-  min_signal_strength: 0.60,
+  min_signal_strength: 0.55,
   fee_params: CRYPTO_FEES,
   discovery_interval_ms: 15_000,
   enable_order_flow: false,
   dead_zone_pct: 0,
   max_flips_before_sit_out: 2,
   grounded_fills: true,
+  max_pair_cost: 0.93,
+  conviction_discount: 0.15,
+  pair_discount: 0.08,
   // Lead-lag
   enable_lead_lag: true,
   lead_lag_lookback_ms: 60_000,
@@ -164,6 +188,11 @@ const DEFAULT_PARAMS: ConvictionMakerParams = {
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+function getMid(book: OrderBook): number | null {
+  if (book.bids.length === 0 || book.asks.length === 0) return null;
+  return (book.bids[0].price + book.asks[0].price) / 2;
+}
 
 function findPriceAtTime(
   history: PriceSnapshot[],
@@ -200,12 +229,6 @@ function emptyCustom(): ConvictionCustomState {
   };
 }
 
-/**
- * Get the current window phase based on elapsed time.
- * early (first 30%): full signal — momentum most reliable
- * mid (30-70%): full signal — best entry window
- * late (last 30%): signal penalized — mean reversion risk
- */
 function getWindowPhase(
   now: number,
   windowOpenTime: number,
@@ -255,45 +278,8 @@ class ConvictionMakerStrategy implements Strategy {
     return best;
   }
 
-  private simulatePaperFill(
-    bidPrice: number,
-    bidSize: number,
-    book: OrderBook,
-    tokenId: string,
-    tape: TradeTapeEntry[],
-    grounded: boolean
-  ): { filled: boolean; fillPrice: number } {
-    const bestAsk = this.getBestAsk(book);
-
-    if (bestAsk !== null && bidPrice >= bestAsk) {
-      return { filled: true, fillPrice: bestAsk };
-    }
-
-    if (grounded) {
-      return checkTapeFill(tape, tokenId, bidPrice, bidSize);
-    }
-
-    if (bestAsk === null) return { filled: false, fillPrice: 0 };
-    const distance = bestAsk - bidPrice;
-
-    let depthBonus = 0;
-    const totalAskDepth = book.asks.reduce((s, l) => s + l.size, 0);
-    if (totalAskDepth > 100) depthBonus = 0.05;
-    if (totalAskDepth > 500) depthBonus = 0.10;
-
-    const fillProb = Math.min(0.6, 0.30 * Math.exp(-distance * 20) + depthBonus);
-    if (Math.random() <= fillProb) {
-      return { filled: true, fillPrice: bidPrice };
-    }
-    return { filled: false, fillPrice: 0 };
-  }
-
   /**
-   * Compute lead-lag bonus for ALT coins based on BTC's recent move.
-   * BTC tends to lead ALT moves by seconds to minutes.
-   * If BTC confirms the ALT signal direction → boost.
-   * If BTC contradicts → penalize.
-   * If BTC move is very strong + ALT signal is weak → override direction to follow BTC.
+   * BTC lead-lag: if BTC confirms ALT direction → boost, contradicts → penalize.
    */
   private computeLeadLagBonus(
     targetSymbol: string,
@@ -323,23 +309,12 @@ class ConvictionMakerStrategy implements Strategy {
     const moveMagnitude = Math.min(1.0, Math.abs(btcMovePct) / (SIGNAL_THRESHOLDS["BTCUSDT"] ?? 0.15));
 
     if (btcDirection === signalDirection) {
-      // BTC confirms ALT signal → boost scaled by BTC move size
-      return {
-        bonus: params.lead_lag_bonus * moveMagnitude,
-        overrideDirection: null,
-      };
+      return { bonus: params.lead_lag_bonus * moveMagnitude, overrideDirection: null };
     } else {
-      // BTC contradicts ALT signal → penalize
       const penalty = -params.lead_lag_bonus * 0.5 * moveMagnitude;
-
-      // If BTC move is very strong and ALT signal is weak → override direction
       if (moveMagnitude > 0.7 && signalStrength < 0.5) {
-        return {
-          bonus: params.lead_lag_bonus * moveMagnitude * 0.5,
-          overrideDirection: btcDirection,
-        };
+        return { bonus: params.lead_lag_bonus * moveMagnitude * 0.5, overrideDirection: btcDirection };
       }
-
       return { bonus: penalty, overrideDirection: null };
     }
   }
@@ -370,11 +345,7 @@ class ConvictionMakerStrategy implements Strategy {
   }
 
   async tick(ctx: StrategyContext): Promise<void> {
-    const params = {
-      ...DEFAULT_PARAMS,
-      ...ctx.config.params,
-    } as ConvictionMakerParams;
-
+    const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as ConvictionMakerParams;
     const now = Date.now();
 
     // 1. Discover markets
@@ -389,11 +360,9 @@ class ConvictionMakerStrategy implements Strategy {
       }
     }
 
-    // 2. Fetch prices — ALWAYS include BTCUSDT for lead-lag
+    // 2. Fetch prices — always include BTCUSDT for lead-lag
     const activeSymbols = new Set<string>();
-    if (params.enable_lead_lag) {
-      activeSymbols.add("BTCUSDT");
-    }
+    if (params.enable_lead_lag) activeSymbols.add("BTCUSDT");
     for (const m of this.marketCache) {
       const sym = extractCryptoSymbol(m.title);
       if (sym) activeSymbols.add(sym);
@@ -408,17 +377,13 @@ class ConvictionMakerStrategy implements Strategy {
         if (!this.custom.priceHistory[sym]) this.custom.priceHistory[sym] = [];
         this.custom.priceHistory[sym].push(snap);
         if (this.custom.priceHistory[sym].length > 60) {
-          this.custom.priceHistory[sym] =
-            this.custom.priceHistory[sym].slice(-60);
+          this.custom.priceHistory[sym] = this.custom.priceHistory[sym].slice(-60);
         }
       }
     }
 
-    // Prune price history for symbols no longer active
     for (const sym of Object.keys(this.custom.priceHistory)) {
-      if (!activeSymbols.has(sym)) {
-        delete this.custom.priceHistory[sym];
-      }
+      if (!activeSymbols.has(sym)) delete this.custom.priceHistory[sym];
     }
 
     // 3. Manage active windows
@@ -442,7 +407,7 @@ class ConvictionMakerStrategy implements Strategy {
     if (ctx.windingDown) {
       const before = this.custom.activeWindows.length;
       this.custom.activeWindows = this.custom.activeWindows.filter(
-        w => w.inventory > 0 || w.totalBuyCost > 0
+        w => w.upInventory + w.downInventory > 0 || w.totalBuyCost > 0
       );
       if (this.custom.activeWindows.length < before) {
         ctx.log(`Wind-down: dropped ${before - this.custom.activeWindows.length} empty window(s)`);
@@ -451,7 +416,7 @@ class ConvictionMakerStrategy implements Strategy {
 
     // 6. Status
     const totalInv = this.custom.activeWindows.reduce(
-      (s, w) => s + w.inventory, 0
+      (s, w) => s + w.upInventory + w.downInventory, 0
     );
     if (ctx.windingDown) {
       this.custom.scanStatus = this.custom.activeWindows.length > 0
@@ -476,7 +441,7 @@ class ConvictionMakerStrategy implements Strategy {
     // 7. Persist
     ctx.state.custom = this.custom as unknown as Record<string, unknown>;
     ctx.state.capital_deployed = this.custom.activeWindows.reduce(
-      (sum, w) => sum + w.totalBuyCost, 0
+      (sum, w) => sum + w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost, 0
     );
     ctx.state.total_pnl = this.custom.totalPnl;
   }
@@ -485,47 +450,56 @@ class ConvictionMakerStrategy implements Strategy {
     const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as ConvictionMakerParams;
     for (const w of this.custom.activeWindows) {
       if (w.bidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.bidOrderId, ctx.config.mode);
+        const r = await safeCancelOrder(ctx.api, w.bidOrderId);
         if (r.cleared) {
-          if (r.fill) this.recordFillFromCancel(ctx, w, r.fill.size, r.fill.price, params);
+          if (r.fill && w.bidSide) this.recordFill(ctx, w, w.bidSide, r.fill.size, r.fill.price);
           w.bidOrderId = null;
         }
       }
     }
-    if (params.enable_order_flow) {
-      disableOrderFlow();
-    }
-    ctx.log(
-      `Stopped: cancelled all bids. ${this.custom.totalFills} fills, P&L=$${ctx.state.total_pnl.toFixed(2)}`
-    );
+    if (params.enable_order_flow) disableOrderFlow();
+    ctx.log(`Stopped: cancelled all bids. ${this.custom.totalFills} fills, P&L=$${ctx.state.total_pnl.toFixed(2)}`);
   }
 
-  private recordFillFromCancel(
+  /** Record a fill on either side (maker fills = zero fee) */
+  private recordFill(
     ctx: StrategyContext,
     w: ConvictionWindowPosition,
+    side: "UP" | "DOWN",
     size: number,
-    price: number,
-    params: ConvictionMakerParams
+    price: number
   ): void {
-    if (!w.bidSide) return;
-    // Maker fills (resting limit orders) have ZERO fee on Polymarket.
     const costBasis = price;
-    if (w.inventory > 0 && w.inventorySide === w.bidSide) {
-      const totalCost = w.avgCost * w.inventory + costBasis * size;
-      w.inventory += size;
-      w.avgCost = totalCost / w.inventory;
+    if (side === "UP") {
+      if (w.upInventory > 0) {
+        const totalCost = w.upAvgCost * w.upInventory + costBasis * size;
+        w.upInventory += size;
+        w.upAvgCost = totalCost / w.upInventory;
+      } else {
+        w.upInventory = size;
+        w.upAvgCost = costBasis;
+      }
     } else {
-      w.inventory = size;
-      w.avgCost = costBasis;
-      w.inventorySide = w.bidSide;
+      if (w.downInventory > 0) {
+        const totalCost = w.downAvgCost * w.downInventory + costBasis * size;
+        w.downInventory += size;
+        w.downAvgCost = totalCost / w.downInventory;
+      } else {
+        w.downInventory = size;
+        w.downAvgCost = costBasis;
+      }
     }
     w.fillCount++;
     w.totalBuyCost += costBasis * size;
     this.custom.totalFills++;
-    ctx.log(
-      `CANCEL-FILL ${w.bidSide}: ${w.market.title.slice(0, 25)} ${size}@${price.toFixed(3)} (discovered during cancel)`,
-      { level: "trade", symbol: w.cryptoSymbol, direction: w.bidSide, phase: "cancel_fill" }
-    );
+
+    // Update fill phase
+    const hasConv = w.convictionDirection === "UP" ? w.upInventory > 0 : w.downInventory > 0;
+    const hasPair = w.convictionDirection === "UP" ? w.downInventory > 0 : w.upInventory > 0;
+    if (hasConv && hasPair) w.fillPhase = "paired";
+    else if (hasConv) w.fillPhase = "seeking_pair";
+    else if (hasPair) w.fillPhase = "one_sided"; // shouldn't happen, but defensive
+    else w.fillPhase = "seeking_conviction";
   }
 
   // ── Enter new windows ─────────────────────────────────────────────
@@ -541,10 +515,10 @@ class ConvictionMakerStrategy implements Strategy {
     const skipCounts: Record<string, number> = {};
     let marketsScanned = 0;
 
-    const capitalAtRisk = this.custom.activeWindows.reduce(
-      (sum, w) => sum + w.inventory * w.avgCost, 0
+    const capitalCommitted = this.custom.activeWindows.reduce(
+      (sum, w) => sum + w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost
+        + (w.bidOrderId ? w.bidSize * w.bidPrice : 0), 0
     );
-    const totalSpent = this.custom.activeWindows.reduce((sum, w) => sum + w.totalBuyCost, 0);
 
     const windowsBefore = this.custom.activeWindows.length;
     for (const market of this.marketCache) {
@@ -555,12 +529,8 @@ class ConvictionMakerStrategy implements Strategy {
       if (!sym) continue;
       marketsScanned++;
 
-      const estNewWindowCost = 0.50 * params.base_bid_size;
-      if (capitalAtRisk + estNewWindowCost > ctx.config.max_capital_usd) {
-        skipCounts["capital limit"] = (skipCounts["capital limit"] || 0) + 1;
-        break;
-      }
-      if (ctx.config.mode === "real" && totalSpent + estNewWindowCost > ctx.config.max_capital_usd) {
+      const estCost = params.max_pair_cost * params.base_bid_size;
+      if (capitalCommitted + estCost > ctx.config.max_capital_usd) {
         skipCounts["capital limit"] = (skipCounts["capital limit"] || 0) + 1;
         break;
       }
@@ -570,29 +540,17 @@ class ConvictionMakerStrategy implements Strategy {
       const windowOpenTime = endMs - windowDuration;
       const timeToEnd = endMs - now;
 
-      if (now < windowOpenTime) {
-        skipCounts["not yet open"] = (skipCounts["not yet open"] || 0) + 1;
-        continue;
-      }
-      if (timeToEnd < params.stop_quoting_before_end_ms) {
-        skipCounts["ending soon"] = (skipCounts["ending soon"] || 0) + 1;
-        continue;
-      }
+      if (now < windowOpenTime) { skipCounts["not yet open"] = (skipCounts["not yet open"] || 0) + 1; continue; }
+      if (timeToEnd < params.stop_quoting_before_end_ms) { skipCounts["ending soon"] = (skipCounts["ending soon"] || 0) + 1; continue; }
 
-      // Get or record reference price
+      // Observation period
       const refKey = market.conditionId;
       const history = this.custom.priceHistory[sym] || [];
       const latestSnap = history.length > 0 ? history[history.length - 1] : null;
 
       if (!this.custom.windowRefPrices[refKey]) {
-        if (!latestSnap) {
-          skipCounts["no price data"] = (skipCounts["no price data"] || 0) + 1;
-          continue;
-        }
-        this.custom.windowRefPrices[refKey] = {
-          price: latestSnap.price,
-          recordedAt: latestSnap.timestamp,
-        };
+        if (!latestSnap) { skipCounts["no price data"] = (skipCounts["no price data"] || 0) + 1; continue; }
+        this.custom.windowRefPrices[refKey] = { price: latestSnap.price, recordedAt: latestSnap.timestamp };
         skipCounts["observing"] = (skipCounts["observing"] || 0) + 1;
         continue;
       }
@@ -600,76 +558,55 @@ class ConvictionMakerStrategy implements Strategy {
       const ref = this.custom.windowRefPrices[refKey];
       const openPrice = ref.price;
       const timeSinceRef = now - ref.recordedAt;
-      if (timeSinceRef < params.observation_seconds * 1000) {
-        skipCounts["observing"] = (skipCounts["observing"] || 0) + 1;
-        continue;
-      }
+      if (timeSinceRef < params.observation_seconds * 1000) { skipCounts["observing"] = (skipCounts["observing"] || 0) + 1; continue; }
 
       // Compute signal
       const currentSnap = await fetchSpotPrice(sym);
-      if (!currentSnap) {
-        skipCounts["no price data"] = (skipCounts["no price data"] || 0) + 1;
-        continue;
-      }
-      const signal = computeSignal(
-        sym,
-        openPrice,
-        currentSnap.price,
-        timeSinceRef,
-        history.filter((s) => s.timestamp >= ref.recordedAt)
-      );
+      if (!currentSnap) { skipCounts["no price data"] = (skipCounts["no price data"] || 0) + 1; continue; }
+      const signal = computeSignal(sym, openPrice, currentSnap.price, timeSinceRef,
+        history.filter((s) => s.timestamp >= ref.recordedAt));
 
-      // Apply lead-lag bonus
+      // Lead-lag bonus
       const { bonus: leadLagBonus, overrideDirection } = this.computeLeadLagBonus(
-        sym, signal.direction, signal.signalStrength, params
-      );
+        sym, signal.direction, signal.signalStrength, params);
       let adjustedStrength = Math.max(0, Math.min(1.0, signal.signalStrength + leadLagBonus));
-      let adjustedDirection = overrideDirection ?? signal.direction;
+      const adjustedDirection = overrideDirection ?? signal.direction;
 
-      // Apply late-phase penalty
+      // Late-phase penalty
       const phase = getWindowPhase(now, windowOpenTime, endMs);
-      if (phase === "late") {
-        adjustedStrength *= params.late_phase_penalty;
-      }
+      if (phase === "late") adjustedStrength *= params.late_phase_penalty;
 
-      // Only enter if signal meets threshold
       if (adjustedStrength < params.min_signal_strength) {
-        skipCounts[`weak signal (${adjustedStrength.toFixed(2)})`] = (skipCounts[`weak signal (${adjustedStrength.toFixed(2)})`] || 0) + 1;
+        skipCounts["weak signal"] = (skipCounts["weak signal"] || 0) + 1;
         continue;
       }
+
+      // Fetch oracle strike
+      let oracleStrike: number | null = null;
+      try {
+        const eventStart = new Date(windowOpenTime).toISOString();
+        oracleStrike = await fetchOracleStrike(toOracleSymbol(sym), toVariant(windowDuration), eventStart);
+      } catch { /* best-effort */ }
 
       const window: ConvictionWindowPosition = {
-        market,
-        cryptoSymbol: sym,
-        windowOpenTime,
-        windowEndTime: endMs,
-        priceAtWindowOpen: openPrice,
-        bidOrderId: null,
-        bidSide: null,
-        bidPrice: 0,
-        bidSize: 0,
-        inventory: 0,
-        avgCost: 0,
-        inventorySide: null,
-        lastSignalDirection: adjustedDirection,
-        lastQuotedAt: 0,
-        lastQuotedPriceChangePct: signal.priceChangePct,
-        confirmedDirection: adjustedDirection,
-        flipCount: 0,
-        lastDirectionChangeAt: now,
-        fillCount: 0,
-        totalBuyCost: 0,
-        convictionSide: adjustedDirection,
-        signalStrengthAtEntry: adjustedStrength,
-        enteredAt: now,
+        market, cryptoSymbol: sym, windowOpenTime, windowEndTime: endMs,
+        priceAtWindowOpen: openPrice, oracleStrike,
+        bidOrderId: null, bidSide: null, bidPrice: 0, bidSize: 0,
+        upInventory: 0, upAvgCost: 0, downInventory: 0, downAvgCost: 0,
+        fillPhase: "seeking_conviction", convictionDirection: adjustedDirection,
+        lastSignalDirection: adjustedDirection, lastQuotedAt: 0, lastQuotedPriceChangePct: signal.priceChangePct,
+        confirmedDirection: adjustedDirection, flipCount: 0, lastDirectionChangeAt: now,
+        fillCount: 0, totalBuyCost: 0, signalStrengthAtEntry: adjustedStrength,
+        enteredAt: now, tickAction: "",
       };
 
       this.custom.activeWindows.push(window);
 
       const llStr = leadLagBonus !== 0 ? ` ll=${leadLagBonus >= 0 ? "+" : ""}${leadLagBonus.toFixed(2)}` : "";
+      const oStr = oracleStrike != null ? ` oracle=$${oracleStrike.toFixed(0)}` : "";
       ctx.log(
-        `ENTERED: ${market.title.slice(0, 35)} ${sym} ${adjustedDirection}@${(adjustedStrength * 100).toFixed(0)}% phase=${phase}${llStr}`,
-        { level: "signal", symbol: sym, direction: adjustedDirection, signalStrength: adjustedStrength, priceChangePct: signal.priceChangePct, momentum: signal.momentum, volatilityRegime: signal.volatilityRegime, inDeadZone: false, flipCount: 0, phase: "entry" }
+        `ENTERED: ${market.title.slice(0, 35)} ${sym} conv=${adjustedDirection}@${(adjustedStrength * 100).toFixed(0)}% phase=${phase}${llStr}${oStr}`,
+        { level: "signal", symbol: sym, direction: adjustedDirection, signalStrength: adjustedStrength, phase: "entry" }
       );
     }
     return { entered: this.custom.activeWindows.length - windowsBefore, marketsScanned, skipCounts };
@@ -686,54 +623,59 @@ class ConvictionMakerStrategy implements Strategy {
     for (const w of this.custom.activeWindows) {
       const timeToEnd = w.windowEndTime - now;
 
-      if (now > w.windowEndTime + 300_000) continue;
+      if (now > w.windowEndTime + 300_000) { w.tickAction = "Awaiting resolution"; continue; }
 
-      // Wind-down: cancel bids, hold inventory to resolution
+      // Wind-down: cancel bids, hold to resolution
       if (ctx.windingDown) {
-        if (w.bidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.bidOrderId, ctx.config.mode);
+        if (w.bidOrderId && w.bidSide) {
+          const r = await safeCancelOrder(ctx.api, w.bidOrderId);
           if (r.cleared) {
-            if (r.fill) this.recordFillFromCancel(ctx, w, r.fill.size, r.fill.price, params);
+            if (r.fill) this.recordFill(ctx, w, w.bidSide, r.fill.size, r.fill.price);
             w.bidOrderId = null;
           }
         }
+        const pc = (w.upInventory > 0 && w.downInventory > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+        w.tickAction = `Wind-down: ${w.upInventory}↑/${w.downInventory}↓${pc}`;
         continue;
       }
 
-      // Stop quoting phase: cancel bids (no sell logic, hold to resolution)
+      // Stop quoting phase
       if (timeToEnd < params.stop_quoting_before_end_ms) {
-        if (w.bidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.bidOrderId, ctx.config.mode);
+        if (w.bidOrderId && w.bidSide) {
+          const r = await safeCancelOrder(ctx.api, w.bidOrderId);
           if (r.cleared) {
-            if (r.fill) this.recordFillFromCancel(ctx, w, r.fill.size, r.fill.price, params);
+            if (r.fill) this.recordFill(ctx, w, w.bidSide, r.fill.size, r.fill.price);
             w.bidOrderId = null;
           }
         }
+        const pc = (w.upInventory > 0 && w.downInventory > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+        w.tickAction = `Stop: ${w.fillPhase} ${w.upInventory}↑/${w.downInventory}↓${pc}`;
         continue;
+      }
+
+      // Retry oracle strike
+      if (w.oracleStrike == null) {
+        try {
+          const eventStart = new Date(w.windowOpenTime).toISOString();
+          const wDurMs = w.windowEndTime - w.windowOpenTime;
+          w.oracleStrike = await fetchOracleStrike(toOracleSymbol(w.cryptoSymbol), toVariant(wDurMs), eventStart);
+        } catch { /* best-effort */ }
       }
 
       // Compute signal
+      const effectiveStrike = w.oracleStrike ?? w.priceAtWindowOpen;
       const currentSnap = await fetchSpotPrice(w.cryptoSymbol);
       if (!currentSnap) continue;
-
       const history = this.custom.priceHistory[w.cryptoSymbol] || [];
-      const signalOpts: ComputeSignalOptions = {
-        prevDirection: w.confirmedDirection,
-      };
+      const signalOpts: ComputeSignalOptions = { prevDirection: w.confirmedDirection };
       if (params.dead_zone_pct > 0) signalOpts.deadZonePct = params.dead_zone_pct;
-      const signal = computeSignal(
-        w.cryptoSymbol,
-        w.priceAtWindowOpen,
-        currentSnap.price,
-        now - w.windowOpenTime,
-        history.filter((s) => s.timestamp >= w.windowOpenTime),
-        signalOpts
-      );
+      const signal = computeSignal(w.cryptoSymbol, effectiveStrike, currentSnap.price,
+        now - w.windowOpenTime, history.filter(s => s.timestamp >= w.windowOpenTime), signalOpts);
 
       // Check fills on pending bid
-      await this.checkFills(ctx, w, params, signal);
+      await this.checkFills(ctx, w, params);
 
-      // Update signal and requote
+      // Update quotes (sequential logic)
       await this.updateQuotes(ctx, w, params, signal);
     }
   }
@@ -741,76 +683,40 @@ class ConvictionMakerStrategy implements Strategy {
   private async checkFills(
     ctx: StrategyContext,
     w: ConvictionWindowPosition,
-    params: ConvictionMakerParams,
-    _signal: WindowSignal
+    params: ConvictionMakerParams
   ): Promise<void> {
     if (!w.bidOrderId || !w.bidSide) return;
 
-    const tape = ctx.config.mode !== "real" ? await fetchTradeTape() : [];
-    const tokenId = w.bidSide === "UP" ? w.market.upTokenId : w.market.downTokenId;
+    const status = await ctx.api.getOrderStatus(w.bidOrderId);
+    if (status.status === "MATCHED" && status.size_matched > 0) {
+      const costBasis = status.price || w.bidPrice;
+      const filledSize = status.size_matched;
+      const side = w.bidSide;
+      const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
 
-    let filled = false;
-    let costBasis = w.bidPrice;
-    let filledSize = w.bidSize;
-
-    if (ctx.config.mode === "real") {
-      const status = await ctx.api.getOrderStatus(w.bidOrderId);
-      if (status.status === "MATCHED" && status.size_matched > 0) {
-        filled = true;
-        filledSize = status.size_matched;
-        costBasis = status.price || w.bidPrice;
-      }
-    } else {
-      const book = await this.getBookCached(ctx, tokenId);
-      const result = this.simulatePaperFill(w.bidPrice, w.bidSize, book, tokenId, tape, params.grounded_fills);
-      if (result.filled) {
-        filled = true;
-        costBasis = result.fillPrice;
-      }
-    }
-
-    if (filled) {
-      // Maker fills (resting limit orders) have ZERO fee on Polymarket.
-      // checkFills only detects fills on resting orders, so no fee applies.
-      if (w.inventory > 0 && w.inventorySide === w.bidSide) {
-        const totalCost = w.avgCost * w.inventory + costBasis * filledSize;
-        w.inventory += filledSize;
-        w.avgCost = totalCost / w.inventory;
-      } else {
-        w.inventory = filledSize;
-        w.avgCost = costBasis;
-        w.inventorySide = w.bidSide;
-      }
-      w.fillCount++;
-      w.totalBuyCost += costBasis * filledSize;
-      this.custom.totalFills++;
+      this.recordFill(ctx, w, side, filledSize, costBasis);
 
       const book = await this.getBookCached(ctx, tokenId);
       const bestAsk = this.getBestAsk(book);
+      const phaseLabel = side === w.convictionDirection ? "CONVICTION" : "PAIR";
       ctx.log(
-        `CONVICTION FILL ${w.bidSide}: ${w.market.title.slice(0, 30)} ${filledSize}@${costBasis.toFixed(3)} inv=${w.inventory.toFixed(0)} ask=${bestAsk?.toFixed(3) ?? "?"}`,
-        { level: "trade", symbol: w.cryptoSymbol, direction: w.bidSide, phase: "fill" }
+        `${phaseLabel} FILL ${side}: ${w.market.title.slice(0, 30)} ${filledSize}@${costBasis.toFixed(3)} ask=${bestAsk?.toFixed(3) ?? "?"} → ${w.fillPhase}`,
+        { level: "trade", symbol: w.cryptoSymbol, direction: side, phase: "fill" }
       );
 
       const feeEquivalent = calcFeePerShare(costBasis, params.fee_params) * filledSize;
       await ctx.db
         .prepare(
           `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
-           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
-        )
+           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`)
         .bind(
-          `cv-${w.bidSide.toLowerCase()}-${crypto.randomUUID()}`,
-          ctx.config.id,
-          tokenId,
-          w.market.slug,
-          `${w.market.title} [CONV ${w.bidSide}]`,
-          costBasis,
-          filledSize,
-          feeEquivalent
-        )
+          `cv-${side.toLowerCase()}-${crypto.randomUUID()}`, ctx.config.id, tokenId,
+          w.market.slug, `${w.market.title} [CONV ${phaseLabel} ${side}]`,
+          costBasis, filledSize, feeEquivalent)
         .run();
 
       w.bidOrderId = null;
+      w.bidSide = null;
     }
   }
 
@@ -822,207 +728,245 @@ class ConvictionMakerStrategy implements Strategy {
   ): Promise<void> {
     const now = Date.now();
 
-    // Detect confirmed direction flip
-    const confirmedFlip =
-      w.confirmedDirection !== null &&
-      signal.direction !== w.confirmedDirection &&
-      !signal.inDeadZone;
-
+    // Track direction flips
+    const confirmedFlip = w.confirmedDirection !== null
+      && signal.direction !== w.confirmedDirection && !signal.inDeadZone;
     if (confirmedFlip) {
       w.flipCount++;
       ctx.log(
-        `FLIP #${w.flipCount}: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} ${w.confirmedDirection} -> ${signal.direction}`,
-        { level: "signal", symbol: w.cryptoSymbol, direction: signal.direction, signalStrength: signal.signalStrength, priceChangePct: signal.priceChangePct, momentum: signal.momentum, volatilityRegime: signal.volatilityRegime, inDeadZone: signal.inDeadZone, flipCount: w.flipCount, phase: "flip" }
+        `FLIP #${w.flipCount}: ${w.market.title.slice(0, 25)} ${w.confirmedDirection} → ${signal.direction}`,
+        { level: "signal", symbol: w.cryptoSymbol, direction: signal.direction, flipCount: w.flipCount, phase: "flip" }
       );
       w.confirmedDirection = signal.direction;
       w.lastDirectionChangeAt = now;
+
+      // On flip, update conviction direction IF we haven't filled conviction yet
+      if (w.fillPhase === "seeking_conviction") {
+        w.convictionDirection = signal.direction;
+        // Cancel stale bid (wrong side now)
+        if (w.bidOrderId && w.bidSide) {
+          const r = await safeCancelOrder(ctx.api, w.bidOrderId);
+          if (r.cleared) {
+            if (r.fill) this.recordFill(ctx, w, w.bidSide, r.fill.size, r.fill.price);
+            w.bidOrderId = null; w.bidSide = null;
+          }
+        }
+      }
     } else if (w.confirmedDirection === null) {
       w.confirmedDirection = signal.direction;
     }
 
-    // Apply lead-lag bonus
+    // Lead-lag
     const { bonus: leadLagBonus, overrideDirection } = this.computeLeadLagBonus(
-      w.cryptoSymbol, signal.direction, signal.signalStrength, params
-    );
+      w.cryptoSymbol, signal.direction, signal.signalStrength, params);
     let adjustedStrength = Math.max(0, Math.min(1.0, signal.signalStrength + leadLagBonus));
     const adjustedDirection = overrideDirection ?? signal.direction;
 
-    // Apply late-phase penalty
     const phase = getWindowPhase(now, w.windowOpenTime, w.windowEndTime);
-    if (phase === "late") {
-      adjustedStrength *= params.late_phase_penalty;
-    }
+    if (phase === "late") adjustedStrength *= params.late_phase_penalty;
 
-    // Signal-derived fair value for conviction side
-    const dirSign = adjustedDirection === "UP" ? 1 : -1;
-    const fairVal = Math.max(0.05, Math.min(0.95,
-      0.50 + adjustedStrength * 0.40 * dirSign
-    ));
-    const bidFairVal = adjustedDirection === "UP" ? fairVal : (1.0 - fairVal);
+    // Fetch book mids
+    const [upBook, downBook] = await Promise.all([
+      this.getBookCached(ctx, w.market.upTokenId),
+      this.getBookCached(ctx, w.market.downTokenId),
+    ]);
+    const upMid = getMid(upBook);
+    const downMid = getMid(downBook);
+    const bkStr = `bk=${upMid?.toFixed(2) ?? "?"}/${downMid?.toFixed(2) ?? "?"}`;
+
+    // Regime classification for adaptive discounts
+    const history = this.custom.priceHistory[w.cryptoSymbol] || [];
+    const effectiveStrike = w.oracleStrike ?? w.priceAtWindowOpen;
+    const regimeFeatures = computeRegimeFeatures(history, signal, effectiveStrike, w.windowOpenTime, w.windowEndTime);
+    const { regime } = classifyRegime(regimeFeatures);
+
+    // Continuous vol-based discount scaling
+    // realizedVol = stddev of tick returns (% terms). Typical: calm <0.005, normal 0.005-0.03, volatile >0.03
+    // Scale: calm → 0.3x (shallower, fill more), normal → 1.0x, volatile → 1.5x (deeper, catch bounces)
+    const volScale = Math.max(0.3, Math.min(1.5, (regimeFeatures.realizedVol ?? 0.015) / 0.015));
+    // Regime bonus for non-vol factors
+    const regimeBonus =
+      regime === "oscillating" ? 0.15 :   // oscillating → slightly deeper (price bounces)
+      regime === "trending"    ? -0.20 :  // trending → shallower (don't miss the move)
+      0;
+
+    /** Compute effective discount clamped to [0.03, 0.30] */
+    const computeEffectiveDiscount = (baseDiscount: number): number =>
+      Math.max(0.03, Math.min(0.30, baseDiscount * volScale + regimeBonus * baseDiscount));
 
     // Periodic signal log
     if (ctx.state.ticks % 5 === 0) {
       const llStr = leadLagBonus !== 0 ? ` ll=${leadLagBonus >= 0 ? "+" : ""}${leadLagBonus.toFixed(2)}` : "";
       ctx.log(
-        `SIGNAL: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} ${adjustedDirection} str=${(adjustedStrength * 100).toFixed(0)}% fv=${bidFairVal.toFixed(2)} inv=${w.inventory} flips=${w.flipCount} phase=${phase}${llStr}`,
-        { level: "signal", symbol: w.cryptoSymbol, direction: adjustedDirection, signalStrength: adjustedStrength, priceChangePct: signal.priceChangePct, momentum: signal.momentum, volatilityRegime: signal.volatilityRegime, inDeadZone: signal.inDeadZone, flipCount: w.flipCount, phase: "manage" }
+        `SIGNAL: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} ${adjustedDirection} str=${(adjustedStrength * 100).toFixed(0)}% ${bkStr} regime=${regime} phase=${w.fillPhase} inv=${w.upInventory}↑/${w.downInventory}↓${llStr}`,
+        { level: "signal", symbol: w.cryptoSymbol, direction: adjustedDirection, signalStrength: adjustedStrength, flipCount: w.flipCount, phase: "manage" }
       );
     }
 
-    // Max flips exceeded: sit out, cancel bid, hold to resolution
-    if (w.flipCount > params.max_flips_before_sit_out) {
-      if (w.bidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.bidOrderId, ctx.config.mode);
+    // Max flips: sit out if still seeking conviction
+    if (w.flipCount > params.max_flips_before_sit_out && w.fillPhase === "seeking_conviction") {
+      if (w.bidOrderId && w.bidSide) {
+        const r = await safeCancelOrder(ctx.api, w.bidOrderId);
         if (r.cleared) {
-          if (r.fill) this.recordFillFromCancel(ctx, w, r.fill.size, r.fill.price, params);
-          w.bidOrderId = null;
+          if (r.fill) this.recordFill(ctx, w, w.bidSide, r.fill.size, r.fill.price);
+          w.bidOrderId = null; w.bidSide = null;
         }
       }
-      if (confirmedFlip) {
-        ctx.log(
-          `SIT OUT (${w.flipCount} flips): ${w.market.title.slice(0, 25)} holding to resolution`,
-          { level: "signal", symbol: w.cryptoSymbol, flipCount: w.flipCount, phase: "sit_out" }
-        );
-      }
+      w.tickAction = `Sat out: choppy (${w.flipCount} flips)`;
       return;
     }
 
-    // Below conviction threshold: cancel bid, sit out
-    if (adjustedStrength < params.min_signal_strength) {
-      if (w.bidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.bidOrderId, ctx.config.mode);
+    // Below strength threshold (only gate conviction phase — always try to pair)
+    if (adjustedStrength < params.min_signal_strength && w.fillPhase === "seeking_conviction") {
+      if (w.bidOrderId && w.bidSide) {
+        const r = await safeCancelOrder(ctx.api, w.bidOrderId);
         if (r.cleared) {
-          if (r.fill) this.recordFillFromCancel(ctx, w, r.fill.size, r.fill.price, params);
-          w.bidOrderId = null;
+          if (r.fill) this.recordFill(ctx, w, w.bidSide, r.fill.size, r.fill.price);
+          w.bidOrderId = null; w.bidSide = null;
         }
       }
+      w.tickAction = `Weak: ${(adjustedStrength * 100).toFixed(0)}% ${bkStr}`;
       return;
     }
 
-    // Check if we need to requote
-    const directionChanged = confirmedFlip;
-    const priceMoved =
-      Math.abs(signal.priceChangePct - w.lastQuotedPriceChangePct) >
-      params.requote_threshold_pct;
-    const needsQuote =
-      directionChanged || priceMoved || w.lastQuotedAt === 0;
+    // Already paired — hold to resolution, no more bidding
+    if (w.fillPhase === "paired") {
+      const pc = (w.upAvgCost + w.downAvgCost).toFixed(2);
+      w.tickAction = `Paired: ${w.upInventory}↑/${w.downInventory}↓ pc=${pc} ${bkStr}`;
+      return;
+    }
 
-    if (!needsQuote) return;
-
-    // Cancel existing bid before requoting — check tape first in paper mode
+    // Already have a bid resting — let it work (no aggressive requoting)
     if (w.bidOrderId) {
-      if (ctx.config.mode !== "real" && w.bidSide) {
-        const tape = await fetchTradeTape();
-        const tokenId = w.bidSide === "UP" ? w.market.upTokenId : w.market.downTokenId;
-        const tapeFill = checkTapeFill(tape, tokenId, w.bidPrice, w.bidSize);
-        if (tapeFill.filled) {
-          this.recordFillFromCancel(ctx, w, w.bidSize, tapeFill.fillPrice, params);
-          w.bidOrderId = null;
-        }
-      }
-      if (w.bidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.bidOrderId, ctx.config.mode);
-        if (r.cleared) {
-          if (r.fill) this.recordFillFromCancel(ctx, w, r.fill.size, r.fill.price, params);
-          w.bidOrderId = null;
-        }
-      }
+      const bidLabel = w.bidSide === "UP" ? "▲" : "▼";
+      w.tickAction = `${w.fillPhase}: resting ${bidLabel}${w.bidPrice.toFixed(2)} sz=${w.bidSize} ${bkStr}`;
+      return;
     }
 
-    // Conviction scaling: stronger signal → larger position
-    // Signal 0.60 → 36 units, 0.80 → 48 units, 1.00 → 60 units
-    const wDurMs = w.windowEndTime - w.windowOpenTime;
-    const durationScale = Math.min(1.0, (wDurMs / 60_000) / 15);
-    const effectiveBaseSize = Math.max(10, Math.round(params.base_bid_size * durationScale));
-    const bidSize = Math.round(effectiveBaseSize * (adjustedStrength / 0.5));
+    // ── Place new bid based on fill phase ──
 
-    // Per-window capital check
-    if (w.inventory * w.avgCost > params.max_capital_per_window) return;
+    const convSide = w.convictionDirection;
+    const pairSide: "UP" | "DOWN" = convSide === "UP" ? "DOWN" : "UP";
 
-    // Global capital check
-    const capitalAtRisk = this.custom.activeWindows.reduce(
-      (sum, aw) => sum + aw.inventory * aw.avgCost, 0
-    );
-    if (capitalAtRisk > ctx.config.max_capital_usd) return;
-    if (ctx.config.mode === "real") {
-      const totalSpent = this.custom.activeWindows.reduce((sum, aw) => sum + aw.totalBuyCost, 0);
-      if (totalSpent > ctx.config.max_capital_usd) return;
-    }
-
-    // Bid price: fair value minus offset
-    const bidPrice = Math.max(0.01, bidFairVal - params.bid_offset);
-    const roundedBid = Math.floor(bidPrice * 100) / 100;
-
-    // Determine which token
-    const tokenId = adjustedDirection === "UP" ? w.market.upTokenId : w.market.downTokenId;
-
-    // Place conviction bid
-    const result = await ctx.api.placeOrder({
-      token_id: tokenId,
-      side: "BUY",
-      size: bidSize,
-      price: roundedBid,
-      market: w.market.slug,
-      title: `${w.market.title} [CONV ${adjustedDirection} bid]`,
-    });
-
-    if (result.status === "filled") {
-      const fillPrice = result.price;
-      const fillSize = result.size;
-      const feeEquivalent = calcFeePerShare(fillPrice, params.fee_params) * fillSize;
-      const costBasis = fillPrice; // Maker fills have zero fee; track fee_equivalent separately for rebate pool
-      if (w.inventory > 0 && w.inventorySide === adjustedDirection) {
-        const totalCost = w.avgCost * w.inventory + costBasis * fillSize;
-        w.inventory += fillSize;
-        w.avgCost = totalCost / w.inventory;
-      } else {
-        w.inventory = fillSize;
-        w.avgCost = costBasis;
-        w.inventorySide = adjustedDirection;
+    if (w.fillPhase === "seeking_conviction") {
+      // Phase 1: bid on conviction side at discount below book mid
+      const convBookMid = convSide === "UP" ? upMid : downMid;
+      if (convBookMid == null) {
+        w.tickAction = `Waiting: no book for ${convSide}`;
+        return;
       }
-      w.fillCount++;
-      w.totalBuyCost += costBasis * fillSize;
-      this.custom.totalFills++;
-      ctx.log(
-        `CONVICTION FILL ${adjustedDirection} (immediate): ${w.market.title.slice(0, 30)} ${fillSize}@${fillPrice.toFixed(3)} str=${(adjustedStrength * 100).toFixed(0)}%`,
-        { level: "trade", symbol: w.cryptoSymbol, direction: adjustedDirection, signalStrength: adjustedStrength, phase: "fill" }
-      );
-      const tokenId = adjustedDirection === "UP" ? w.market.upTokenId : w.market.downTokenId;
-      await ctx.db
-        .prepare(
+
+      const discount = computeEffectiveDiscount(params.conviction_discount);
+      const bidPrice = Math.max(0.01, convBookMid * (1 - discount));
+      const roundedBid = Math.floor(bidPrice * 100) / 100;
+
+      // Conviction scaling: stronger signal → larger position
+      const wDurMs = w.windowEndTime - w.windowOpenTime;
+      const durationScale = Math.min(1.0, (wDurMs / 60_000) / 15);
+      const effectiveBase = Math.max(10, Math.round(params.base_bid_size * durationScale));
+      let bidSize = Math.round(effectiveBase * (adjustedStrength / 0.5));
+
+      // Capital check
+      const capUsed = this.custom.activeWindows.reduce(
+        (s, aw) => s + aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost
+          + (aw.bidOrderId && aw !== w ? aw.bidSize * aw.bidPrice : 0), 0);
+      const remaining = ctx.config.max_capital_usd - capUsed;
+      if (bidSize * roundedBid > remaining) bidSize = Math.floor(remaining / roundedBid);
+      if (bidSize < 5) { w.tickAction = `Capital limit ${bkStr}`; return; }
+
+      const tokenId = convSide === "UP" ? w.market.upTokenId : w.market.downTokenId;
+      const result = await ctx.api.placeOrder({
+        token_id: tokenId, side: "BUY", size: bidSize, price: roundedBid,
+        market: w.market.slug, title: `${w.market.title} [CONV ${convSide} bid]`,
+      });
+
+      if (result.status === "filled") {
+        this.recordFill(ctx, w, convSide, result.size, result.price);
+        ctx.log(
+          `CONVICTION FILL ${convSide} (imm): ${w.market.title.slice(0, 30)} ${result.size}@${result.price.toFixed(3)} disc=${(discount * 100).toFixed(0)}%`,
+          { level: "trade", symbol: w.cryptoSymbol, direction: convSide, phase: "fill" }
+        );
+        const feeEq = calcFeePerShare(result.price, params.fee_params) * result.size;
+        await ctx.db.prepare(
           `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
-           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
-        )
-        .bind(
-          `cv-${adjustedDirection.toLowerCase()}-imm-${crypto.randomUUID()}`,
-          ctx.config.id,
-          tokenId,
-          w.market.slug,
-          `${w.market.title} [CONV ${adjustedDirection} imm]`,
-          costBasis,
-          fillSize,
-          feeEquivalent
-        )
-        .run();
-    } else if (result.status === "placed") {
-      w.bidOrderId = result.order_id;
-      w.bidSide = adjustedDirection;
-      w.bidPrice = roundedBid;
-      w.bidSize = bidSize;
+           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`)
+          .bind(`cv-${convSide.toLowerCase()}-imm-${crypto.randomUUID()}`, ctx.config.id, tokenId,
+            w.market.slug, `${w.market.title} [CONV ${convSide} imm]`, result.price, result.size, feeEq).run();
+      } else if (result.status === "placed") {
+        w.bidOrderId = result.order_id;
+        w.bidSide = convSide;
+        w.bidPrice = roundedBid;
+        w.bidSize = bidSize;
+      }
+
+      const bidLabel = convSide === "UP" ? "▲" : "▼";
+      w.tickAction = `Seek ${convSide}: ${bidLabel}${roundedBid.toFixed(2)} disc=${(discount * 100).toFixed(0)}%@${regime.slice(0, 4)} ${bkStr}`;
+
+    } else if (w.fillPhase === "seeking_pair") {
+      // Phase 2: conviction filled, now pair with the other side
+      const convCost = convSide === "UP" ? w.upAvgCost : w.downAvgCost;
+      const maxPairBid = params.max_pair_cost - convCost;
+
+      const pairBookMid = pairSide === "UP" ? upMid : downMid;
+      const discount = computeEffectiveDiscount(params.pair_discount);
+      // Use book mid with discount, but cap at max_pair_cost
+      let bidPrice: number;
+      if (pairBookMid != null) {
+        bidPrice = Math.min(maxPairBid, pairBookMid * (1 - discount));
+      } else {
+        bidPrice = maxPairBid * 0.9; // conservative fallback
+      }
+      bidPrice = Math.max(0.01, bidPrice);
+      const roundedBid = Math.floor(bidPrice * 100) / 100;
+
+      // Match conviction-side inventory for full pairing
+      const convInv = convSide === "UP" ? w.upInventory : w.downInventory;
+      const pairInv = pairSide === "UP" ? w.upInventory : w.downInventory;
+      let bidSize = Math.max(5, convInv - pairInv); // fill the gap
+
+      // Capital check
+      const capUsed = this.custom.activeWindows.reduce(
+        (s, aw) => s + aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost
+          + (aw.bidOrderId && aw !== w ? aw.bidSize * aw.bidPrice : 0), 0);
+      const remaining = ctx.config.max_capital_usd - capUsed;
+      if (bidSize * roundedBid > remaining) bidSize = Math.floor(remaining / roundedBid);
+      if (bidSize < 5) { w.tickAction = `Capital limit (pair) ${bkStr}`; return; }
+
+      const tokenId = pairSide === "UP" ? w.market.upTokenId : w.market.downTokenId;
+      const result = await ctx.api.placeOrder({
+        token_id: tokenId, side: "BUY", size: bidSize, price: roundedBid,
+        market: w.market.slug, title: `${w.market.title} [CONV PAIR ${pairSide} bid]`,
+      });
+
+      if (result.status === "filled") {
+        this.recordFill(ctx, w, pairSide, result.size, result.price);
+        const pc = (w.upAvgCost + w.downAvgCost).toFixed(2);
+        ctx.log(
+          `PAIR FILL ${pairSide} (imm): ${w.market.title.slice(0, 30)} ${result.size}@${result.price.toFixed(3)} pc=${pc}`,
+          { level: "trade", symbol: w.cryptoSymbol, direction: pairSide, phase: "fill" }
+        );
+        const feeEq = calcFeePerShare(result.price, params.fee_params) * result.size;
+        await ctx.db.prepare(
+          `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
+           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`)
+          .bind(`cv-${pairSide.toLowerCase()}-pair-${crypto.randomUUID()}`, ctx.config.id, tokenId,
+            w.market.slug, `${w.market.title} [CONV PAIR ${pairSide}]`, result.price, result.size, feeEq).run();
+      } else if (result.status === "placed") {
+        w.bidOrderId = result.order_id;
+        w.bidSide = pairSide;
+        w.bidPrice = roundedBid;
+        w.bidSize = bidSize;
+      }
+
+      const bidLabel = pairSide === "UP" ? "▲" : "▼";
+      const projPC = (convCost + roundedBid).toFixed(2);
+      w.tickAction = `Pair ${pairSide}: ${bidLabel}${roundedBid.toFixed(2)} disc=${(discount * 100).toFixed(0)}%@${regime.slice(0, 4)} max=${maxPairBid.toFixed(2)} projPC=${projPC} ${bkStr}`;
     }
 
     // Update tracking
     w.lastSignalDirection = adjustedDirection;
     w.lastQuotedAt = now;
     w.lastQuotedPriceChangePct = signal.priceChangePct;
-    w.convictionSide = adjustedDirection;
-
-    if (directionChanged) {
-      ctx.log(
-        `REQUOTE: ${w.market.title.slice(0, 30)} conviction=${adjustedDirection} str=${(adjustedStrength * 100).toFixed(0)}% size=${bidSize} phase=${phase}`,
-        { level: "signal", symbol: w.cryptoSymbol, direction: adjustedDirection, signalStrength: adjustedStrength, phase: "requote" }
-      );
-    }
   }
 
   // ── Resolve completed windows ─────────────────────────────────────
@@ -1038,8 +982,7 @@ class ConvictionMakerStrategy implements Strategy {
       const w = this.custom.activeWindows[i];
       if (now < w.windowEndTime + 60_000) continue;
 
-      // No inventory — nothing to resolve
-      if (w.inventory === 0) {
+      if (w.upInventory === 0 && w.downInventory === 0) {
         ctx.log(`EXPIRED (no fills): ${w.market.title.slice(0, 35)}`);
         toRemove.push(i);
         continue;
@@ -1047,80 +990,53 @@ class ConvictionMakerStrategy implements Strategy {
 
       let outcome: "UP" | "DOWN" | "UNKNOWN" = "UNKNOWN";
 
-      // 1. Check Polymarket resolution
       try {
-        const resolution = await checkMarketResolution(
-          w.market.slug, w.market.upTokenId, w.market.downTokenId
-        );
-        if (resolution.closed && resolution.outcome) {
-          outcome = resolution.outcome;
-        }
+        const resolution = await checkMarketResolution(w.market.slug, w.market.upTokenId, w.market.downTokenId);
+        if (resolution.closed && resolution.outcome) outcome = resolution.outcome;
       } catch { /* Gamma API failure */ }
 
-      // Compute Binance prediction for UI (never used for actual outcome)
       let closePrice: number | null = null;
       const history = this.custom.priceHistory[w.cryptoSymbol] || [];
       closePrice = findPriceAtTime(history, w.windowEndTime);
-      if (!closePrice) {
-        const snap = await fetchSpotPrice(w.cryptoSymbol);
-        closePrice = snap?.price ?? null;
-      }
+      if (!closePrice) { const snap = await fetchSpotPrice(w.cryptoSymbol); closePrice = snap?.price ?? null; }
       if (closePrice !== null && w.priceAtWindowOpen > 0) {
         w.binancePrediction = closePrice >= w.priceAtWindowOpen ? "UP" : "DOWN";
       }
 
       if (outcome === "UNKNOWN") {
-        // Wait for Polymarket — never use Binance for actual resolution
-        if (now < w.windowEndTime + 1800_000) continue; // give up after 30min
-        ctx.log(
-          `RESOLUTION TIMEOUT: ${w.market.title.slice(0, 25)} Polymarket not resolved after 30min, marking UNKNOWN`
-        );
+        if (now < w.windowEndTime + 1800_000) continue;
+        ctx.log(`RESOLUTION TIMEOUT: ${w.market.title.slice(0, 25)} after 30min`);
       }
 
-      // P&L: conviction side wins → inv * (1.0 - avgCost) - fees
-      //       wrong → -inv * avgCost (total loss)
-      let netPnl = 0;
-      const correct = outcome !== "UNKNOWN" && w.inventorySide === outcome;
-
+      // P&L: paired → winning side pays $1, losing = $0. One-sided → win all or lose all.
+      let winningPayout = 0;
+      let losingLoss = 0;
       if (outcome !== "UNKNOWN") {
-        if (correct) {
-          const payoutFee = calcFeePerShare(1.0, params.fee_params) * w.inventory;
-          netPnl = w.inventory * (1.0 - w.avgCost) - payoutFee;
-        } else {
-          netPnl = -(w.inventory * w.avgCost);
-        }
+        const winInv = outcome === "UP" ? w.upInventory : w.downInventory;
+        const winCost = outcome === "UP" ? w.upAvgCost : w.downAvgCost;
+        const loseInv = outcome === "UP" ? w.downInventory : w.upInventory;
+        const loseCost = outcome === "UP" ? w.downAvgCost : w.upAvgCost;
+        const payoutFee = calcFeePerShare(1.0, params.fee_params) * winInv;
+        winningPayout = winInv * (1.0 - winCost) - payoutFee;
+        losingLoss = -(loseInv * loseCost);
       }
+      const netPnl = winningPayout + losingLoss;
+      const correct = outcome !== "UNKNOWN" && w.convictionDirection === outcome;
 
       const priceMovePct = closePrice !== null && w.priceAtWindowOpen > 0
-        ? ((closePrice - w.priceAtWindowOpen) / w.priceAtWindowOpen) * 100
-        : 0;
-
-      const phase = getWindowPhase(w.enteredAt, w.windowOpenTime, w.windowEndTime);
+        ? ((closePrice - w.priceAtWindowOpen) / w.priceAtWindowOpen) * 100 : 0;
+      const entryPhase = getWindowPhase(w.enteredAt, w.windowOpenTime, w.windowEndTime);
 
       const completed: CompletedConvictionWindow = {
-        title: w.market.title,
-        cryptoSymbol: w.cryptoSymbol,
-        convictionSide: w.convictionSide,
-        outcome,
-        inventory: w.inventory,
-        inventorySide: w.inventorySide,
-        totalBuyCost: w.totalBuyCost,
-        netPnl,
-        signalStrength: w.signalStrengthAtEntry,
-        fillCount: w.fillCount,
-        correct,
-        completedAt: new Date().toISOString(),
-        priceMovePct,
-        avgCost: w.avgCost,
-        flipCount: w.flipCount,
-        leadLagBonus: 0,
-        phase,
+        title: w.market.title, cryptoSymbol: w.cryptoSymbol, convictionSide: w.convictionDirection,
+        outcome, upInventory: w.upInventory, downInventory: w.downInventory, totalBuyCost: w.totalBuyCost,
+        netPnl, signalStrength: w.signalStrengthAtEntry, fillCount: w.fillCount, correct,
+        completedAt: new Date().toISOString(), priceMovePct, upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
+        flipCount: w.flipCount, fillPhase: w.fillPhase, leadLagBonus: 0, phase: entryPhase,
       };
 
       this.custom.completedWindows.push(completed);
-      if (this.custom.completedWindows.length > 50) {
-        this.custom.completedWindows = this.custom.completedWindows.slice(-50);
-      }
+      if (this.custom.completedWindows.length > 50) this.custom.completedWindows = this.custom.completedWindows.slice(-50);
 
       this.custom.totalPnl += netPnl;
       this.custom.windowsTraded++;
@@ -1128,8 +1044,7 @@ class ConvictionMakerStrategy implements Strategy {
       if (outcome !== "UNKNOWN" && !correct) this.custom.windowsLost++;
 
       const total = this.custom.windowsWon + this.custom.windowsLost;
-      this.custom.directionalAccuracy =
-        total > 0 ? this.custom.windowsWon / total : 0;
+      this.custom.directionalAccuracy = total > 0 ? this.custom.windowsWon / total : 0;
 
       if (!this.custom.perAsset[w.cryptoSymbol]) {
         this.custom.perAsset[w.cryptoSymbol] = { won: 0, lost: 0, pnl: 0, fills: 0 };
@@ -1140,47 +1055,32 @@ class ConvictionMakerStrategy implements Strategy {
       asset.pnl += netPnl;
       asset.fills += w.fillCount;
 
-      const outcomeLabel =
-        outcome === "UNKNOWN"
-          ? "UNKNOWN"
-          : `${outcome} ${correct ? "CORRECT" : "WRONG"}`;
-
+      const outcomeLabel = outcome === "UNKNOWN" ? "UNKNOWN" : `${outcome} ${correct ? "CORRECT" : "WRONG"}`;
+      const pc = (w.upInventory > 0 && w.downInventory > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
       ctx.log(
-        `RESOLVED: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} ${priceMovePct >= 0 ? "+" : ""}${priceMovePct.toFixed(3)}% → ${outcomeLabel} | inv=${w.inventory} ${w.inventorySide ?? "?"} cost=${w.avgCost.toFixed(3)} fills=${w.fillCount} flips=${w.flipCount} | net=$${netPnl.toFixed(2)} | W/L=${this.custom.windowsWon}/${this.custom.windowsLost}`,
+        `RESOLVED: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} ${priceMovePct >= 0 ? "+" : ""}${priceMovePct.toFixed(3)}% → ${outcomeLabel} | ${w.fillPhase} ${w.upInventory}↑/${w.downInventory}↓${pc} fills=${w.fillCount} flips=${w.flipCount} | win=$${winningPayout.toFixed(2)} lose=$${losingLoss.toFixed(2)} net=$${netPnl.toFixed(2)} | W/L=${this.custom.windowsWon}/${this.custom.windowsLost}`,
         { level: "signal", symbol: w.cryptoSymbol, direction: outcome === "UNKNOWN" ? undefined : outcome, signalStrength: w.signalStrengthAtEntry, flipCount: w.flipCount, phase: "resolve" }
       );
 
-      await ctx.db
-        .prepare(
-          `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
-           VALUES (?, ?, ?, ?, ?, 'RESOLVE', 0, 0, 0, datetime('now'), ?)`
-        )
-        .bind(
-          `cv-resolve-${crypto.randomUUID()}`,
-          ctx.config.id,
-          w.market.conditionId,
-          w.market.slug,
-          `${w.market.title} [CONV ${outcomeLabel} fills=${w.fillCount}]`,
-          netPnl
-        )
-        .run();
+      await ctx.db.prepare(
+        `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
+         VALUES (?, ?, ?, ?, ?, 'RESOLVE', 0, 0, 0, datetime('now'), ?)`)
+        .bind(`cv-resolve-${crypto.randomUUID()}`, ctx.config.id, w.market.conditionId, w.market.slug,
+          `${w.market.title} [CONV ${outcomeLabel} ${w.fillPhase} fills=${w.fillCount}]`, netPnl).run();
 
       toRemove.push(i);
     }
 
-    // Auto-redeem in real mode
-    if (ctx.config.mode === "real" && toRemove.length > 0) {
+    // Auto-redeem
+    if (toRemove.length > 0) {
       const conditionIds = toRemove
         .map((i) => this.custom.activeWindows[i]?.market.conditionId)
         .filter((cid): cid is string => !!cid);
       if (conditionIds.length > 0) {
         try {
           const result = await ctx.api.redeemConditions(conditionIds);
-          if (result.error) {
-            ctx.log(`AUTO-REDEEM ERROR: ${result.error}`, { level: "error", phase: "redeem" } as never);
-          } else {
-            ctx.log(`AUTO-REDEEM OK: ${conditionIds.length} conditions, redeemed=${result.redeemed}`, { level: "info", phase: "redeem" } as never);
-          }
+          if (result.error) ctx.log(`AUTO-REDEEM ERROR: ${result.error}`, { level: "error", phase: "redeem" } as never);
+          else ctx.log(`AUTO-REDEEM OK: ${conditionIds.length} conditions, redeemed=${result.redeemed}`, { level: "info", phase: "redeem" } as never);
         } catch (e) {
           ctx.log(`AUTO-REDEEM EXCEPTION: ${e}`, { level: "error", phase: "redeem" } as never);
         }

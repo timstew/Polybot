@@ -18,6 +18,7 @@ import {
   type WindowSignal,
   type ComputeSignalOptions,
   fetchSpotPrice,
+  fetchTradeTape,
   computeSignal,
   extractCryptoSymbol,
   discoverCryptoMarkets,
@@ -25,11 +26,16 @@ import {
   checkMarketResolution,
   enableOrderFlow,
   disableOrderFlow,
+  fetchOracleStrike,
+  toOracleSymbol,
+  toVariant,
+  calculatePTrue,
+  estimateVolatility5min,
   CRYPTO_SYMBOL_MAP,
-  type TradeTapeEntry,
-  fetchTradeTape,
-  checkTapeFill,
 } from "./price-feed";
+import { classifyRegime, computeRegimeFeatures, type RegimeType, type RegimeFeatures } from "./regime";
+import { tryMerge } from "./merge";
+import type { TickSnapshot, BookConvictionSnapshot, TapeBucket, TapeMeta } from "../optimizer/types";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -70,6 +76,12 @@ interface MakerWindowPosition {
   pendingSellSize: number;
   pendingSellCostBasis: number;
 
+  // Oracle + book tracking
+  oracleStrike: number | null;
+  lastUpMid: number | null;
+  lastDownMid: number | null;
+  lastFlipSellAt: number;
+
   // Stats
   fillCount: number;
   sellCount: number;
@@ -78,12 +90,42 @@ interface MakerWindowPosition {
   convictionSide: "UP" | "DOWN" | null;
   signalStrengthAtEntry: number;
   enteredAt: number;
+  tickAction: string;
 
   // Set when window is past end time but awaiting Polymarket resolution
   binancePrediction?: "UP" | "DOWN" | null;
+
+  // Transient — set by updateQuotes(), read by snapshot recorder
+  lastRegime?: RegimeType;
+  lastRegimeFeatures?: RegimeFeatures;
+  lastRegimeScores?: Record<string, number>;
+  lastFairUp?: number;
+  lastFairDown?: number;
+  lastBookConviction?: BookConvictionSnapshot;
+  lastBookBids?: { price: number; size: number }[];
+
+  // Snapshot recording (populated when record_snapshots=true)
+  tickSnapshots?: TickSnapshot[];
 }
 
-interface CompletedMakerWindow {
+interface BookConviction {
+  upMid: number | null;
+  downMid: number | null;
+  bookDirection: "UP" | "DOWN" | "NEUTRAL";
+  bookStrength: number;       // 0-1
+  bookBidDepthRatio: number;  // UP depth / total depth
+  midDelta: number;           // tick-over-tick UP mid change
+  agreement: number;          // -1 to +1 with signal direction
+}
+
+interface CombinedConviction {
+  combinedStrength: number;
+  combinedDirection: "UP" | "DOWN";
+  sellApproved: boolean;
+  reason: string;
+}
+
+export interface CompletedMakerWindow {
   title: string;
   cryptoSymbol: string;
   convictionSide: "UP" | "DOWN" | null;
@@ -106,7 +148,7 @@ interface CompletedMakerWindow {
   flipCount: number;
 }
 
-interface MakerCustomState {
+export interface MakerCustomState {
   activeWindows: MakerWindowPosition[];
   completedWindows: CompletedMakerWindow[];
   priceHistory: Record<string, PriceSnapshot[]>;
@@ -119,9 +161,10 @@ interface MakerCustomState {
   directionalAccuracy: number;
   perAsset: Record<string, { won: number; lost: number; pnl: number; fills: number }>;
   scanStatus: string;
+  currentBaseSize?: number;
 }
 
-interface DirectionalMakerParams {
+export interface DirectionalMakerParams {
   target_cryptos: string[];
   base_bid_size: number;
   conviction_bias: number;
@@ -142,14 +185,21 @@ interface DirectionalMakerParams {
   max_pair_cost: number; // UP_bid + DN_bid must be <= this (default 0.96)
   max_inventory_ratio: number; // stop bidding on heavy side when ratio exceeds this (default 3)
   grounded_fills: boolean; // use trade tape instead of probabilistic model (default true)
+  max_bid_per_side: number; // hard cap on any single-side bid price (default 0.45)
   // Adaptive repricing
   min_requote_delta: number; // min bid price change ($) to trigger requote (default 0.02)
   vol_offset_scale_high: number; // multiply bid_offset in high volatility (default 1.5)
   vol_offset_scale_low: number; // multiply bid_offset in low volatility (default 0.5)
   tighten_start_pct: number; // window progress % to start tightening offset (default 0.70)
+  merge_enabled?: boolean;
+  // Multi-source conviction gates
+  min_flip_sell_strength: number; // combined strength required for flip sell (default 0.55)
+  flip_sell_cooldown_ms: number;  // min ms between flip sells on same window (default 15000)
+  sell_excess: boolean; // sell excess (unpaired) inventory on flips/rebalance (default true)
+  record_snapshots?: boolean; // record per-tick snapshots for offline replay (default false)
 }
 
-const DEFAULT_PARAMS: DirectionalMakerParams = {
+export const DEFAULT_PARAMS: DirectionalMakerParams = {
   target_cryptos: ["Bitcoin", "Ethereum", "Solana", "XRP"],
   base_bid_size: 30,
   conviction_bias: 2.0,
@@ -170,11 +220,17 @@ const DEFAULT_PARAMS: DirectionalMakerParams = {
   max_pair_cost: 0.93, // UP_bid + DN_bid <= 0.93 ensures ~7% structural profit per pair
   max_inventory_ratio: 2, // stop bidding heavy side when UP/DN ratio > 2:1
   grounded_fills: true, // use observed trade tape for paper fills (realistic)
+  max_bid_per_side: 0.45, // never bid above $0.45 per side (prevents costly taker fills at $0.85+)
   // Adaptive repricing
   min_requote_delta: 0.02, // won't requote unless new bid differs by >= 2¢
   vol_offset_scale_high: 1.5, // widen offset in high volatility
   vol_offset_scale_low: 0.5, // tighten offset in low volatility
   tighten_start_pct: 0.70, // start tightening at 70% through window
+  merge_enabled: true,
+  min_flip_sell_strength: 0.55,
+  flip_sell_cooldown_ms: 15_000,
+  sell_excess: true,
+  record_snapshots: false,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -207,7 +263,7 @@ function findPriceAtTime(
   return null;
 }
 
-function emptyCustom(): MakerCustomState {
+export function emptyCustom(): MakerCustomState {
   return {
     activeWindows: [],
     completedWindows: [],
@@ -231,15 +287,21 @@ interface BookCacheEntry {
   fetchedAt: number;
 }
 
-class SafeMakerStrategy implements Strategy {
+export class SafeMakerStrategy implements Strategy {
   name = "safe-maker";
-  private custom: MakerCustomState = emptyCustom();
-  private marketCache: CryptoMarket[] = [];
-  private lastDiscovery = 0;
+  protected custom: MakerCustomState = emptyCustom();
+  protected marketCache: CryptoMarket[] = [];
+  protected lastDiscovery = 0;
 
   // Book cache: 5s TTL, shared across windows to avoid redundant fetches
-  private bookCache: Map<string, BookCacheEntry> = new Map();
+  protected bookCache: Map<string, BookCacheEntry> = new Map();
   private static BOOK_CACHE_TTL = 5_000;
+
+  protected getBaseSize(params: DirectionalMakerParams): number {
+    return params.base_bid_size;
+  }
+
+  protected onWindowResolved(_completed: CompletedMakerWindow, _params: DirectionalMakerParams, _ctx: StrategyContext): void {}
 
   private async getBookCached(ctx: StrategyContext, tokenId: string): Promise<OrderBook> {
     const now = Date.now();
@@ -261,46 +323,112 @@ class SafeMakerStrategy implements Strategy {
     return best;
   }
 
-  /**
-   * Book-based paper fill simulation.
-   * Uses real CLOB book data to determine if a resting bid would fill.
-   * - Bid >= bestAsk → immediate fill at bestAsk (crossing the spread, taker)
-   * - Bid < bestAsk → probability decays exponentially with distance from best ask
-   */
-  private simulatePaperFill(
-    bidPrice: number,
-    bidSize: number,
-    book: OrderBook,
-    tokenId: string,
-    tape: TradeTapeEntry[],
-    grounded: boolean
-  ): { filled: boolean; fillPrice: number } {
-    const bestAsk = this.getBestAsk(book);
+  private async computeBookConviction(
+    ctx: StrategyContext,
+    w: MakerWindowPosition,
+    signal: WindowSignal
+  ): Promise<BookConviction> {
+    const [upBook, downBook] = await Promise.all([
+      this.getBookCached(ctx, w.market.upTokenId),
+      this.getBookCached(ctx, w.market.downTokenId),
+    ]);
 
-    // Bid crosses the spread — immediate fill at best ask (taker)
-    if (bestAsk !== null && bidPrice >= bestAsk) {
-      return { filled: true, fillPrice: bestAsk };
+    const upMid = getMid(upBook);
+    const downMid = getMid(downBook);
+
+    // Determine book direction from deviation
+    let bookDirection: "UP" | "DOWN" | "NEUTRAL" = "NEUTRAL";
+    let bookStrength = 0;
+
+    if (upMid != null && downMid != null) {
+      const deviation = upMid - downMid;
+      if (Math.abs(deviation) > 0.04) {
+        bookDirection = deviation > 0 ? "UP" : "DOWN";
+      }
+      bookStrength = Math.min(1.0, Math.abs(deviation) / 0.50);
+    } else if (upMid != null) {
+      // Single-book fallback
+      if (upMid > 0.54) { bookDirection = "UP"; bookStrength = Math.min(1.0, (upMid - 0.50) / 0.50); }
+      else if (upMid < 0.46) { bookDirection = "DOWN"; bookStrength = Math.min(1.0, (0.50 - upMid) / 0.50); }
+    } else if (downMid != null) {
+      if (downMid > 0.54) { bookDirection = "DOWN"; bookStrength = Math.min(1.0, (downMid - 0.50) / 0.50); }
+      else if (downMid < 0.46) { bookDirection = "UP"; bookStrength = Math.min(1.0, (0.50 - downMid) / 0.50); }
     }
 
-    if (grounded) {
-      // Grounded mode: only fill if enough real volume traded through our level
-      return checkTapeFill(tape, tokenId, bidPrice, bidSize);
+    // Bid depth ratio: UP bid depth / total bid depth
+    const upBidDepth = upBook.bids.reduce((s, l) => s + l.size, 0);
+    const dnBidDepth = downBook.bids.reduce((s, l) => s + l.size, 0);
+    const totalBidDepth = upBidDepth + dnBidDepth;
+    const bookBidDepthRatio = totalBidDepth > 0 ? upBidDepth / totalBidDepth : 0.5;
+
+    // Mid delta (tick-over-tick change in UP mid)
+    const midDelta = (upMid != null && w.lastUpMid != null) ? upMid - w.lastUpMid : 0;
+
+    // Agreement with signal direction
+    let agreement = 0;
+    const signalScale = Math.min(1, signal.signalStrength / 0.5);
+    if (bookDirection !== "NEUTRAL") {
+      const matches = bookDirection === signal.direction;
+      agreement = matches
+        ? bookStrength * signalScale
+        : -bookStrength * signalScale;
     }
 
-    // Legacy probabilistic model
-    if (bestAsk === null) return { filled: false, fillPrice: 0 };
-    const distance = bestAsk - bidPrice;
+    // Update last mids for next tick
+    w.lastUpMid = upMid;
+    w.lastDownMid = downMid;
 
-    let depthBonus = 0;
-    const totalAskDepth = book.asks.reduce((s, l) => s + l.size, 0);
-    if (totalAskDepth > 100) depthBonus = 0.05;
-    if (totalAskDepth > 500) depthBonus = 0.10;
+    // Save book bids for snapshot recording (top 5 levels)
+    w.lastBookBids = upBook.bids.slice(0, 5).map(l => ({ price: l.price, size: l.size }));
 
-    const fillProb = Math.min(0.6, 0.30 * Math.exp(-distance * 20) + depthBonus);
-    if (Math.random() <= fillProb) {
-      return { filled: true, fillPrice: bidPrice };
+    return { upMid, downMid, bookDirection, bookStrength, bookBidDepthRatio, midDelta, agreement };
+  }
+
+  private computeCombinedConviction(
+    signal: WindowSignal,
+    book: BookConviction,
+    params: DirectionalMakerParams,
+    w: MakerWindowPosition
+  ): CombinedConviction {
+    const now = Date.now();
+
+    // Oracle already baked into signalStrength via the corrected strike price
+    // Book modulates confidence
+    const bookContribution = book.agreement >= 0
+      ? book.bookStrength * 0.30
+      : -book.bookStrength * 0.30 * 0.5;
+
+    // Choppiness penalty from existing volatilityRegime
+    const chopPenalty = signal.volatilityRegime === "high" ? -0.10
+      : signal.volatilityRegime === "low" ? 0.05
+      : 0;
+
+    const rawCombined = signal.signalStrength * 0.55 + bookContribution + chopPenalty;
+    const combinedStrength = Math.max(0, Math.min(1, rawCombined));
+    const combinedDirection = signal.direction;
+
+    // Three gates for sell approval
+    const cooldownOk = now - w.lastFlipSellAt >= params.flip_sell_cooldown_ms;
+    const strengthOk = combinedStrength >= params.min_flip_sell_strength;
+    const bookNonContradiction = book.agreement >= -0.2
+      && (book.bookDirection === signal.direction || book.bookDirection === "NEUTRAL");
+
+    let sellApproved = cooldownOk && strengthOk && bookNonContradiction;
+    let reason = "approved";
+
+    if (!cooldownOk) {
+      const remaining = Math.ceil((params.flip_sell_cooldown_ms - (now - w.lastFlipSellAt)) / 1000);
+      reason = `cooldown=${remaining}s remaining`;
+      sellApproved = false;
+    } else if (!strengthOk) {
+      reason = `combined_weak: ${(combinedStrength * 100).toFixed(0)}% < ${(params.min_flip_sell_strength * 100).toFixed(0)}%`;
+      sellApproved = false;
+    } else if (!bookNonContradiction) {
+      reason = `book_contradicts: agreement=${book.agreement.toFixed(2)} book=${book.bookDirection} vs signal=${signal.direction}`;
+      sellApproved = false;
     }
-    return { filled: false, fillPrice: 0 };
+
+    return { combinedStrength, combinedDirection, sellApproved, reason };
   }
 
   async init(ctx: StrategyContext): Promise<void> {
@@ -422,7 +550,15 @@ class SafeMakerStrategy implements Strategy {
         .sort((a, b) => b[1] - a[1])
         .map(([reason, count]) => `${count} ${reason}`)
         .join(", ");
-      this.custom.scanStatus = `Scanned ${marketsScanned} markets: ${reasons || "all entered"}`;
+      // Descriptive message when capital is the main blocker
+      if (skipCounts["capital limit"] && skipCounts["capital limit"] >= marketsScanned * 0.5) {
+        const deployed = this.custom.activeWindows.reduce(
+          (sum, w) => sum + w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost, 0
+        );
+        this.custom.scanStatus = `Capital exhausted: $${ctx.config.max_capital_usd.toFixed(2)} available, $${deployed.toFixed(2)} deployed`;
+      } else {
+        this.custom.scanStatus = `Scanned ${marketsScanned} markets: ${reasons || "all entered"}`;
+      }
     } else if (this.marketCache.length > 0) {
       this.custom.scanStatus = "No open windows";
     } else {
@@ -432,7 +568,7 @@ class SafeMakerStrategy implements Strategy {
     // 7. Persist state
     ctx.state.custom = this.custom as unknown as Record<string, unknown>;
     ctx.state.capital_deployed = this.custom.activeWindows.reduce(
-      (sum, w) => sum + w.totalBuyCost, 0
+      (sum, w) => sum + w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost, 0
     );
     ctx.state.total_pnl = this.custom.totalPnl;
   }
@@ -442,14 +578,14 @@ class SafeMakerStrategy implements Strategy {
     const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as DirectionalMakerParams;
     for (const w of this.custom.activeWindows) {
       if (w.upBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
+        const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
         if (r.cleared) {
           if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params);
           w.upBidOrderId = null;
         }
       }
       if (w.downBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
+        const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
         if (r.cleared) {
           if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params);
           w.downBidOrderId = null;
@@ -517,12 +653,15 @@ class SafeMakerStrategy implements Strategy {
     const skipCounts: Record<string, number> = {};
     let marketsScanned = 0;
 
-    // Capital at risk = unmatched exposure (matched pairs are structurally safe).
-    const capitalAtRisk = this.custom.activeWindows.reduce(
-      (sum, w) => sum + Math.max(0, w.upInventory - w.downInventory) * w.upAvgCost + Math.max(0, w.downInventory - w.upInventory) * w.downAvgCost, 0
+    // Total deployed capital: inventory + pending bids (worst case if all fill)
+    const capitalCommitted = this.custom.activeWindows.reduce(
+      (sum, w) => {
+        const inv = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
+        const pending = (w.upBidOrderId ? w.upBidSize * w.upBidPrice : 0)
+          + (w.downBidOrderId ? w.downBidSize * w.downBidPrice : 0);
+        return sum + inv + pending;
+      }, 0
     );
-    // In real mode, also track total USDC spent (regardless of matching) to avoid
-    // draining the wallet beyond what we can afford to have locked up.
     const totalSpent = this.custom.activeWindows.reduce((sum, w) => sum + w.totalBuyCost, 0);
 
     const windowsBefore = this.custom.activeWindows.length;
@@ -536,13 +675,8 @@ class SafeMakerStrategy implements Strategy {
       marketsScanned++;
 
       // Check capital limit before entering new window
-      const estNewWindowCost = params.max_pair_cost * params.base_bid_size;
-      if (capitalAtRisk + estNewWindowCost > ctx.config.max_capital_usd) {
-        skipCounts["capital limit"] = (skipCounts["capital limit"] || 0) + 1;
-        break;
-      }
-      // In real mode, also check total USDC spent (wallet liquidity gate)
-      if (ctx.config.mode === "real" && totalSpent + estNewWindowCost > ctx.config.max_capital_usd) {
+      const estNewWindowCost = params.max_pair_cost * this.getBaseSize(params);
+      if (capitalCommitted + estNewWindowCost > ctx.config.max_capital_usd) {
         skipCounts["capital limit"] = (skipCounts["capital limit"] || 0) + 1;
         break;
       }
@@ -622,6 +756,19 @@ class SafeMakerStrategy implements Strategy {
           ? signal.direction
           : null;
 
+      // Fetch oracle strike for settlement-referenced signal
+      let oracleStrike: number | null = null;
+      try {
+        const eventStart = new Date(windowOpenTime).toISOString();
+        const oracleSymbol = toOracleSymbol(sym);
+        const variant = toVariant(windowDuration);
+        oracleStrike = await fetchOracleStrike(oracleSymbol, variant, eventStart);
+        if (oracleStrike != null) {
+          const drift = Math.abs(oracleStrike - openPrice).toFixed(2);
+          ctx.log(`Oracle strike: $${oracleStrike.toFixed(2)} (Binance: $${openPrice.toFixed(2)}, drift: $${drift})`);
+        }
+      } catch { /* oracle fetch is best-effort */ }
+
       const window: MakerWindowPosition = {
         market,
         cryptoSymbol: sym,
@@ -644,6 +791,10 @@ class SafeMakerStrategy implements Strategy {
         confirmedDirection: convictionSide,
         flipCount: 0,
         lastDirectionChangeAt: now,
+        oracleStrike,
+        lastUpMid: null,
+        lastDownMid: null,
+        lastFlipSellAt: 0,
         pendingSellOrderId: null,
         pendingSellSide: null,
         pendingSellSize: 0,
@@ -655,7 +806,9 @@ class SafeMakerStrategy implements Strategy {
         convictionSide,
         signalStrengthAtEntry: signal.signalStrength,
         enteredAt: now,
+        tickAction: "",
       };
+      if (params.record_snapshots) window.tickSnapshots = [];
 
       this.custom.activeWindows.push(window);
 
@@ -686,47 +839,85 @@ class SafeMakerStrategy implements Strategy {
     const now = Date.now();
 
     for (const w of this.custom.activeWindows) {
+      // Re-init tickSnapshots after DO re-hydration (stripped by persistState)
+      if (params.record_snapshots && !w.tickSnapshots) w.tickSnapshots = [];
+
       const timeToEnd = w.windowEndTime - now;
 
       // Past resolution — handled by resolveWindows
-      if (now > w.windowEndTime + 300_000) continue;
+      if (now > w.windowEndTime + 300_000) {
+        w.tickAction = "Awaiting resolution";
+        continue;
+      }
 
       // Wind-down mode: match light side, cancel heavy side, no new exposure
       if (ctx.windingDown && timeToEnd >= params.stop_quoting_before_end_ms) {
         await this.windDownWindow(ctx, w, params);
+        // tickAction is set inside windDownWindow — don't overwrite it here
         continue;
       }
 
       // Exit inventory phase: dump losing side at market before resolution
       if (timeToEnd < params.exit_inventory_before_end_ms) {
         if (w.upBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
+          const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
         }
         if (w.downBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
+          const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
         }
         // Sell losing side inventory if any
         await this.sellLosingInventory(ctx, w, params, "DUMP");
+        w.tickAction = `Exiting: sell excess ${w.upInventory}↑/${w.downInventory}↓`;
         continue;
       }
 
       // Stop quoting phase: cancel bids, sell losing side
       if (timeToEnd < params.stop_quoting_before_end_ms) {
         if (w.upBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
+          const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
         }
         if (w.downBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
+          const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
         }
+        // Merge matched pairs during wind-down — free capital before resolution
+        if (params.merge_enabled !== false) {
+          const mergeResult = await tryMerge(ctx, w);
+          if (mergeResult) {
+            w.realizedSellPnl += mergeResult.pnl;
+            this.custom.totalPnl = (this.custom.totalPnl as number || 0) + mergeResult.pnl;
+          }
+        }
         await this.sellLosingInventory(ctx, w, params, "WIND DOWN");
+        {
+          const up = w.upInventory, dn = w.downInventory;
+          const pc = (up > 0 && dn > 0) ? (w.upAvgCost + w.downAvgCost).toFixed(2) : "—";
+          w.tickAction = `Stop: holding ${up}↑/${dn}↓ pc=${pc}`;
+        }
         continue;
       }
 
+      // Retry oracle strike if not yet captured (1min cache makes this cheap)
+      if (w.oracleStrike == null) {
+        try {
+          const eventStart = new Date(w.windowOpenTime).toISOString();
+          const oracleSymbol = toOracleSymbol(w.cryptoSymbol);
+          const wDurMs2 = w.windowEndTime - w.windowOpenTime;
+          const variant = toVariant(wDurMs2);
+          w.oracleStrike = await fetchOracleStrike(oracleSymbol, variant, eventStart);
+          if (w.oracleStrike != null) {
+            const drift = Math.abs(w.oracleStrike - w.priceAtWindowOpen).toFixed(2);
+            ctx.log(`Oracle strike (retry): $${w.oracleStrike.toFixed(2)} (Binance: $${w.priceAtWindowOpen.toFixed(2)}, drift: $${drift})`);
+          }
+        } catch { /* best-effort */ }
+      }
+
       // Compute signal once for this tick (used by both checkFills and updateQuotes)
+      // Use oracle strike if available — measures direction against actual settlement reference
+      const effectiveOpenPrice = w.oracleStrike ?? w.priceAtWindowOpen;
       const currentSnap = await fetchSpotPrice(w.cryptoSymbol);
       if (!currentSnap) continue;
 
@@ -737,7 +928,7 @@ class SafeMakerStrategy implements Strategy {
       if (params.dead_zone_pct > 0) signalOpts.deadZonePct = params.dead_zone_pct;
       const signal = computeSignal(
         w.cryptoSymbol,
-        w.priceAtWindowOpen,
+        effectiveOpenPrice,
         currentSnap.price,
         now - w.windowOpenTime,
         history.filter((s) => s.timestamp >= w.windowOpenTime),
@@ -750,17 +941,67 @@ class SafeMakerStrategy implements Strategy {
       // Update signal and requote if needed
       await this.updateQuotes(ctx, w, params, signal);
 
+      // Record tick snapshot for offline replay
+      if (params.record_snapshots && w.tickSnapshots) {
+        const tapeNow = await fetchTradeTape();
+
+        // Build volume buckets per token×price instead of storing raw tape
+        const bucketMap = new Map<string, number>(); // "tokenId:price" → total size
+        const walletSet = new Set<string>();
+        let totalVol = 0;
+        for (const t of tapeNow) {
+          if (t.taker) walletSet.add(t.taker);
+          totalVol += t.size * t.price;
+          const roundedPrice = Math.round(t.price * 100) / 100;
+          const key = `${t.asset}:${roundedPrice}`;
+          bucketMap.set(key, (bucketMap.get(key) ?? 0) + t.size);
+        }
+        const tapeBuckets: TapeBucket[] = [];
+        for (const [key, size] of bucketMap) {
+          const sep = key.lastIndexOf(":");
+          tapeBuckets.push({
+            tokenId: key.slice(0, sep),
+            price: parseFloat(key.slice(sep + 1)),
+            size,
+          });
+        }
+        const tapeMeta: TapeMeta = {
+          totalTrades: tapeNow.length,
+          totalVolume: totalVol,
+          uniqueWallets: walletSet.size,
+        };
+
+        w.tickSnapshots.push({
+          t: now,
+          price: currentSnap.price,
+          signal,
+          regime: w.lastRegime ?? "calm",
+          regimeFeatures: w.lastRegimeFeatures ?? { choppiness: 0, trendStrength: 0, realizedVol: 0, momentum: 0, signalStrength: 0, distanceToStrike: 1, timeRemainingPct: 1, flipCount: 0, orderFlowImbalance: 0 },
+          regimeScores: w.lastRegimeScores ?? {},
+          fairUp: w.lastFairUp ?? 0.50,
+          fairDown: w.lastFairDown ?? 0.50,
+          bookConviction: w.lastBookConviction ?? { upMid: null, downMid: null, bookDirection: "NEUTRAL", bookStrength: 0, bidDepthRatio: 0.5, midDelta: 0, agreement: 0 },
+          tapeBuckets,
+          tapeMeta,
+          bookBids: w.lastBookBids ?? [],
+          upBidOrderId: w.upBidOrderId, upBidPrice: w.upBidPrice, upBidSize: w.upBidSize,
+          downBidOrderId: w.downBidOrderId, downBidPrice: w.downBidPrice, downBidSize: w.downBidSize,
+          upInventory: w.upInventory, downInventory: w.downInventory,
+          upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
+        });
+      }
+
       // Per-tick safety: cancel bids on the heavy side regardless of requote state
       // Covers both one-sided (other side = 0) and ratio-exceeded cases
       const maxInvR = params.max_inventory_ratio;
       const wDur = w.windowEndTime - w.windowOpenTime;
-      const effBase = Math.max(10, Math.round(params.base_bid_size * Math.min(1.0, (wDur / 60_000) / 15)));
+      const effBase = Math.max(3, Math.round(this.getBaseSize(params) * Math.min(1.0, (wDur / 60_000) / 15)));
       if (w.upBidOrderId) {
         const shouldCancelUp =
           (w.upInventory >= effBase && w.downInventory === 0) ||
           (w.downInventory > 0 && w.upInventory / w.downInventory > maxInvR);
         if (shouldCancelUp) {
-          const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
+          const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
         }
       }
@@ -769,7 +1010,7 @@ class SafeMakerStrategy implements Strategy {
           (w.downInventory >= effBase && w.upInventory === 0) ||
           (w.upInventory > 0 && w.downInventory / w.upInventory > maxInvR);
         if (shouldCancelDn) {
-          const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
+          const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
         }
       }
@@ -792,7 +1033,7 @@ class SafeMakerStrategy implements Strategy {
       const history = this.custom.priceHistory[w.cryptoSymbol] || [];
       const signal = computeSignal(
         w.cryptoSymbol,
-        w.priceAtWindowOpen,
+        w.oracleStrike ?? w.priceAtWindowOpen,
         currentSnap.price,
         Date.now() - w.windowOpenTime,
         history.filter((s) => s.timestamp >= w.windowOpenTime)
@@ -805,13 +1046,14 @@ class SafeMakerStrategy implements Strategy {
     // Already balanced — cancel all bids, hold to resolution
     if (gap < 5) {
       if (w.upBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
+        const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
         if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
       }
       if (w.downBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
+        const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
         if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
       }
+      w.tickAction = `Wind-down: balanced (${w.upInventory}↑/${w.downInventory}↓), holding`;
       return;
     }
 
@@ -822,7 +1064,7 @@ class SafeMakerStrategy implements Strategy {
     // Cancel heavy-side bid
     const heavyBidId = heavySide === "UP" ? w.upBidOrderId : w.downBidOrderId;
     if (heavyBidId) {
-      const r = await safeCancelOrder(ctx.api, heavyBidId, ctx.config.mode);
+      const r = await safeCancelOrder(ctx.api, heavyBidId);
       if (r.cleared) {
         if (r.fill) this.recordFillFromCancel(ctx, w, heavySide, r.fill.size, r.fill.price, params);
         if (heavySide === "UP") w.upBidOrderId = null;
@@ -833,7 +1075,7 @@ class SafeMakerStrategy implements Strategy {
     // Bid on the light side, capped at the gap
     const lightBidId = lightSide === "UP" ? w.upBidOrderId : w.downBidOrderId;
     if (!lightBidId) {
-      const bidSize = Math.min(gap, params.base_bid_size);
+      const bidSize = Math.min(gap, this.getBaseSize(params));
       // Conservative pricing: respect max_pair_cost relative to the heavy side's avg cost
       const heavyAvgCost = heavySide === "UP" ? w.upAvgCost : w.downAvgCost;
       const maxBid = heavyAvgCost > 0 ? params.max_pair_cost - heavyAvgCost : 0.46;
@@ -910,6 +1152,8 @@ class SafeMakerStrategy implements Strategy {
         }
       }
     }
+
+    w.tickAction = `Wind-down: matching light side (gap=${gap})`;
 
     if (ctx.state.ticks % 5 === 0) {
       ctx.log(
@@ -989,34 +1233,13 @@ class SafeMakerStrategy implements Strategy {
       }
     }
 
-    // Fetch trade tape once for both UP and DOWN fill checks (paper mode)
-    const tape = ctx.config.mode !== "real" ? await fetchTradeTape() : [];
-
-    // Check UP bid fill
+    // Check UP bid fill (mode-agnostic: PaperStrategyAPI.getOrderStatus simulates fills)
     if (w.upBidOrderId) {
-      let filled = false;
-      let costBasis = w.upBidPrice;
-      let filledSize = w.upBidSize; // paper default
+      const status = await ctx.api.getOrderStatus(w.upBidOrderId);
+      if (status.status === "MATCHED" && status.size_matched > 0) {
+        const filledSize = status.size_matched;
+        const costBasis = status.price || w.upBidPrice;
 
-      if (ctx.config.mode === "real") {
-        // Real mode: check actual CLOB order status
-        const status = await ctx.api.getOrderStatus(w.upBidOrderId);
-        if (status.status === "MATCHED" && status.size_matched > 0) {
-          filled = true;
-          filledSize = status.size_matched;
-          costBasis = status.price || w.upBidPrice;
-        }
-      } else {
-        // Paper mode: simulate fill using book + trade tape
-        const upBook = await this.getBookCached(ctx, w.market.upTokenId);
-        const result = this.simulatePaperFill(w.upBidPrice, w.upBidSize, upBook, w.market.upTokenId, tape, params.grounded_fills);
-        if (result.filled) {
-          filled = true;
-          costBasis = result.fillPrice;
-        }
-      }
-
-      if (filled) {
         if (w.upInventory > 0) {
           const totalCost = w.upAvgCost * w.upInventory + costBasis * filledSize;
           w.upInventory += filledSize;
@@ -1057,29 +1280,13 @@ class SafeMakerStrategy implements Strategy {
       }
     }
 
-    // Check DOWN bid fill
+    // Check DOWN bid fill (mode-agnostic)
     if (w.downBidOrderId) {
-      let filled = false;
-      let costBasis = w.downBidPrice;
-      let filledSize = w.downBidSize; // paper default
+      const status = await ctx.api.getOrderStatus(w.downBidOrderId);
+      if (status.status === "MATCHED" && status.size_matched > 0) {
+        const filledSize = status.size_matched;
+        const costBasis = status.price || w.downBidPrice;
 
-      if (ctx.config.mode === "real") {
-        const status = await ctx.api.getOrderStatus(w.downBidOrderId);
-        if (status.status === "MATCHED" && status.size_matched > 0) {
-          filled = true;
-          filledSize = status.size_matched;
-          costBasis = status.price || w.downBidPrice;
-        }
-      } else {
-        const dnBook = await this.getBookCached(ctx, w.market.downTokenId);
-        const result = this.simulatePaperFill(w.downBidPrice, w.downBidSize, dnBook, w.market.downTokenId, tape, params.grounded_fills);
-        if (result.filled) {
-          filled = true;
-          costBasis = result.fillPrice;
-        }
-      }
-
-      if (filled) {
         if (w.downInventory > 0) {
           const totalCost = w.downAvgCost * w.downInventory + costBasis * filledSize;
           w.downInventory += filledSize;
@@ -1147,20 +1354,69 @@ class SafeMakerStrategy implements Strategy {
       w.confirmedDirection = signal.direction;
     }
 
-    // Signal-derived fair values (used for quoting and fill checking)
-    const dirSign = signal.direction === "UP" ? 1 : -1;
-    const fairUp = Math.max(0.05, Math.min(0.95,
-      0.50 + signal.signalStrength * 0.40 * dirSign
-    ));
-    const fairDown = 1.0 - fairUp;
+    // Compute book conviction (reuses cached books, no extra API calls)
+    const book = await this.computeBookConviction(ctx, w, signal);
+    const combined = this.computeCombinedConviction(signal, book, params, w);
+    const bkStr = `bk=${book.upMid?.toFixed(2) ?? "?"}/${book.downMid?.toFixed(2) ?? "?"}`;
 
-    // Periodic signal log (every ~5th tick) — includes order flow when available
+    // ── Book-anchored fair values with regime discount ──
+    // Classify market regime for discount selection
+    const wDurMs = w.windowEndTime - w.windowOpenTime;
+    const effectiveStrike = w.oracleStrike ?? w.priceAtWindowOpen;
+    const priceHistory = this.custom.priceHistory[w.cryptoSymbol] || [];
+    const regimeFeatures = computeRegimeFeatures(
+      priceHistory, signal, effectiveStrike, w.windowOpenTime, w.windowEndTime
+    );
+    const { regime, scores: regimeScores } = classifyRegime(regimeFeatures);
+
+    // Regime-dependent discount: how far below fair value we bid
+    const regimeDiscount =
+      regime === "oscillating" ? 0.20 :  // patient — price bounces, our bids will get hit
+      regime === "trending"    ? 0.08 :  // aggressive — price runs, can't be too greedy
+      regime === "volatile"    ? 0.18 :  // wide spreads, seek value
+      regime === "calm"        ? 0.12 :  // standard
+      0.12; // near-strike, late-window, etc.
+
+    // Primary: book mids (market consensus). Fallback: P_true (binary option CDF).
+    // Last resort: old signal model.
+    let fairUp: number;
+    let fairDown: number;
+    if (book.upMid != null && book.downMid != null) {
+      fairUp = book.upMid;
+      fairDown = book.downMid;
+    } else {
+      // P_true fallback: uses vol estimate + time remaining for proper binary pricing
+      const vol = estimateVolatility5min(priceHistory);
+      const timeRemaining = w.windowEndTime - now;
+      const pTrue = calculatePTrue(signal.currentPrice, effectiveStrike, "above", timeRemaining, vol);
+      fairUp = pTrue;
+      fairDown = 1.0 - pTrue;
+    }
+    // Apply regime discount: bid below fair value
+    const discountedFairUp = Math.max(0.01, fairUp * (1 - regimeDiscount));
+    const discountedFairDown = Math.max(0.01, fairDown * (1 - regimeDiscount));
+
+    // Save transient values for snapshot recording
+    w.lastRegime = regime;
+    w.lastRegimeFeatures = regimeFeatures;
+    w.lastRegimeScores = regimeScores;
+    w.lastFairUp = fairUp;
+    w.lastFairDown = fairDown;
+    w.lastBookConviction = {
+      upMid: book.upMid, downMid: book.downMid,
+      bookDirection: book.bookDirection, bookStrength: book.bookStrength,
+      bidDepthRatio: book.bookBidDepthRatio, midDelta: book.midDelta,
+      agreement: book.agreement,
+    };
+
+    // Periodic signal log (every ~5th tick)
     if (ctx.state.ticks % 5 === 0) {
       const flowStr = signal.orderFlowAvailable
         ? ` flow=${signal.orderFlowImbalance >= 0 ? "+" : ""}${signal.orderFlowImbalance.toFixed(2)} confX=${signal.confidenceMultiplier.toFixed(1)}`
         : "";
+      const oracleStr = w.oracleStrike != null ? ` oracle=$${w.oracleStrike.toFixed(0)}` : "";
       ctx.log(
-        `SIGNAL: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} ${signal.direction} str=${(signal.signalStrength * 100).toFixed(0)}% fv=${fairUp.toFixed(2)}/${fairDown.toFixed(2)} UP=${w.upInventory} DN=${w.downInventory} flips=${w.flipCount}${flowStr}`,
+        `SIGNAL: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} ${signal.direction} str=${(signal.signalStrength * 100).toFixed(0)}% combined=${(combined.combinedStrength * 100).toFixed(0)}% bk=${book.bookDirection}@${(book.bookStrength * 100).toFixed(0)}% agree=${book.agreement.toFixed(2)} mid=${book.upMid?.toFixed(2) ?? "?"}/${book.downMid?.toFixed(2) ?? "?"} fv=${fairUp.toFixed(2)}/${fairDown.toFixed(2)} disc=${(regimeDiscount * 100).toFixed(0)}%@${regime} UP=${w.upInventory} DN=${w.downInventory} flips=${w.flipCount}${flowStr}${oracleStr}`,
         { level: "signal", symbol: w.cryptoSymbol, direction: signal.direction, signalStrength: signal.signalStrength, priceChangePct: signal.priceChangePct, momentum: signal.momentum, volatilityRegime: signal.volatilityRegime, inDeadZone: signal.inDeadZone, flipCount: w.flipCount, upInventory: w.upInventory, downInventory: w.downInventory, phase: "manage" }
       );
     }
@@ -1168,11 +1424,11 @@ class SafeMakerStrategy implements Strategy {
     // Max flips exceeded: cancel all bids and stop quoting
     if (w.flipCount > params.max_flips_per_window) {
       if (w.upBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
+        const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
         if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
       }
       if (w.downBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
+        const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
         if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
       }
       if (confirmedFlip) {
@@ -1181,6 +1437,7 @@ class SafeMakerStrategy implements Strategy {
           { level: "signal", symbol: w.cryptoSymbol, flipCount: w.flipCount, phase: "max_flips" }
         );
       }
+      w.tickAction = `Sat out: choppy (${w.flipCount} flips)`;
       return;
     }
 
@@ -1192,52 +1449,52 @@ class SafeMakerStrategy implements Strategy {
     const needsQuote =
       directionChanged || priceMoved || w.lastQuotedAt === 0;
 
-    if (!needsQuote) return;
+    if (!needsQuote) {
+      const up = w.upInventory, dn = w.downInventory;
+      const pc = (up > 0 && dn > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+      const dir = signal.direction;
+      const str = (signal.signalStrength * 100).toFixed(0);
+      const discStr = `${(regimeDiscount * 100).toFixed(0)}%@${regime.slice(0, 4)}`;
+      w.tickAction = `${dir} ${str}% ${bkStr} disc=${discStr} → no requote${pc}`;
+      return;
+    }
 
-    // On direction flip, cancel bids and sell the losing side inventory
+    // On direction flip, cancel bids and gate sell behind multi-source conviction
     if (directionChanged) {
-      // Cancel bids with tape fill check (Fix 3a)
       if (w.upBidOrderId) {
-        if (ctx.config.mode !== "real") {
-          const tape = await fetchTradeTape();
-          const tapeFill = checkTapeFill(tape, w.market.upTokenId, w.upBidPrice, w.upBidSize);
-          if (tapeFill.filled) {
-            this.recordFillFromCancel(ctx, w, "UP", w.upBidSize, tapeFill.fillPrice, params);
-            w.upBidOrderId = null;
-          }
-        }
-        if (w.upBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
-          if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
-        }
+        const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
+        if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
       }
       if (w.downBidOrderId) {
-        if (ctx.config.mode !== "real") {
-          const tape = await fetchTradeTape();
-          const tapeFill = checkTapeFill(tape, w.market.downTokenId, w.downBidPrice, w.downBidSize);
-          if (tapeFill.filled) {
-            this.recordFillFromCancel(ctx, w, "DOWN", w.downBidSize, tapeFill.fillPrice, params);
-            w.downBidOrderId = null;
-          }
-        }
-        if (w.downBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
-          if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
-        }
+        const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
+        if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
       }
 
       if (signal.signalStrength >= params.min_signal_strength) {
-        await this.sellLosingInventory(ctx, w, params, "FLIP SELL");
+        if (combined.sellApproved && params.sell_excess) {
+          await this.sellLosingInventory(ctx, w, params, "FLIP SELL");
+          w.lastFlipSellAt = now;
+          ctx.log(
+            `FLIP SELL APPROVED: ${w.cryptoSymbol} combined=${combined.combinedStrength.toFixed(2)} book=${book.bookDirection}@${(book.bookStrength * 100).toFixed(0)}% agree=${book.agreement.toFixed(2)}`,
+            { level: "signal", symbol: w.cryptoSymbol, direction: signal.direction, flipCount: w.flipCount, phase: "flip_sell" }
+          );
+        } else {
+          ctx.log(
+            `FLIP SELL BLOCKED: ${w.cryptoSymbol} ${combined.reason} ${bkStr}`,
+            { level: "signal", symbol: w.cryptoSymbol, direction: signal.direction, flipCount: w.flipCount, phase: "flip_sell_blocked" }
+          );
+        }
       }
     }
 
     // Periodically sell losing-side inventory when signal is strong
-    // (prevents one-sided accumulation between flips)
+    // (prevents one-sided accumulation between flips) — also gated
     if (!directionChanged && signal.signalStrength >= 0.5) {
       const losingSide = signal.direction === "UP" ? "DOWN" : "UP";
       const losingInv = losingSide === "UP" ? w.upInventory : w.downInventory;
-      if (losingInv > 0) {
+      if (losingInv > 0 && combined.sellApproved && params.sell_excess) {
         await this.sellLosingInventory(ctx, w, params, "REBALANCE");
+        w.lastFlipSellAt = now;
       }
     }
 
@@ -1258,9 +1515,13 @@ class SafeMakerStrategy implements Strategy {
     const adjustedBias = scaledBias * signal.confidenceMultiplier;
     // Adaptive bid sizing: scale down for shorter windows (same as sniper)
     // 5min → base * 0.33, 15min → base * 1.0, 60min → base * 1.0
-    const wDurMs = w.windowEndTime - w.windowOpenTime;
     const durationScale = Math.min(1.0, (wDurMs / 60_000) / 15);
-    const effectiveBaseSize = Math.max(10, Math.round(params.base_bid_size * durationScale));
+    let effectiveBaseSize = Math.max(3, Math.round(this.getBaseSize(params) * durationScale));
+    // Capital-aware position sizing: divide available capital across windows × sides
+    const activeCount = this.custom.activeWindows.length;
+    const slots = Math.max(2, activeCount + 1);
+    const maxPerSide = Math.floor(ctx.config.max_capital_usd / (slots * 2 * params.max_bid_per_side));
+    effectiveBaseSize = Math.min(effectiveBaseSize, Math.max(5, maxPerSide));
     let upBidSize = effectiveBaseSize;
     let downBidSize = effectiveBaseSize;
     // Cap asymmetry at 2:1 — never fully stop losing side
@@ -1296,42 +1557,61 @@ class SafeMakerStrategy implements Strategy {
       downBidSize = 0; // one-sided DN — pause until UP fills
     }
 
-    // Per-window capital check (only unmatched tokens are at risk)
-    const unmatchedCost = Math.max(0, w.upInventory - w.downInventory) * w.upAvgCost
-      + Math.max(0, w.downInventory - w.upInventory) * w.downAvgCost;
-    if (unmatchedCost > params.max_capital_per_window) return;
-
-    // Global capital check: unmatched exposure for risk, total spent for wallet liquidity
-    const capitalAtRisk = this.custom.activeWindows.reduce(
-      (sum, aw) => sum + Math.max(0, aw.upInventory - aw.downInventory) * aw.upAvgCost + Math.max(0, aw.downInventory - aw.upInventory) * aw.downAvgCost, 0
-    );
-    if (capitalAtRisk > ctx.config.max_capital_usd) return;
-    if (ctx.config.mode === "real") {
-      const totalSpent = this.custom.activeWindows.reduce((sum, aw) => sum + aw.totalBuyCost, 0);
-      if (totalSpent > ctx.config.max_capital_usd) return;
+    // Per-window capital check (total deployed in this window)
+    const windowCapital = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
+    if (windowCapital > params.max_capital_per_window) {
+      w.tickAction = `Window capital limit`;
+      return;
     }
 
-    // ── Adaptive bid offset (Fix 3c: volatility, Fix 3d: time decay) ──
-    const volMultiplier =
-      signal.volatilityRegime === "high" ? params.vol_offset_scale_high :
-      signal.volatilityRegime === "low"  ? params.vol_offset_scale_low :
-      1.0;
-    const adaptiveOffset = params.bid_offset * volMultiplier;
+    // Global capital check: total deployed + pending bids (worst case if everything fills)
+    const fmt$ = (n: number) => "$" + n.toFixed(0);
+    const capitalCommitted = this.custom.activeWindows.reduce(
+      (sum, aw) => {
+        const inv = aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost;
+        const pending = aw !== w
+          ? (aw.upBidOrderId ? aw.upBidSize * aw.upBidPrice : 0)
+            + (aw.downBidOrderId ? aw.downBidSize * aw.downBidPrice : 0)
+          : 0;
+        return sum + inv + pending;
+      }, 0
+    );
+    // Estimate cost of bids we're about to place (use 0.50 estimate since exact prices computed later)
+    const estBidPrice = 0.50;
+    const estUpBidCost = upBidSize > 0 ? upBidSize * estBidPrice : 0;
+    const estDnBidCost = downBidSize > 0 ? downBidSize * estBidPrice : 0;
+    const capitalIfFilled = capitalCommitted + estUpBidCost + estDnBidCost;
+    if (capitalIfFilled > ctx.config.max_capital_usd) {
+      const remaining = Math.max(0, ctx.config.max_capital_usd - capitalCommitted);
+      if (remaining < 5 * 0.40) {
+        w.tickAction = `Capital limit: ${fmt$(capitalCommitted)}/${fmt$(ctx.config.max_capital_usd)}`;
+        return;
+      }
+      // Scale both bid sizes proportionally to fit
+      const scale = remaining / (estUpBidCost + estDnBidCost);
+      upBidSize = Math.floor(upBidSize * scale);
+      downBidSize = Math.floor(downBidSize * scale);
+      if (upBidSize < 3 && downBidSize < 3) {
+        w.tickAction = `Capital limit: ${fmt$(capitalCommitted)}/${fmt$(ctx.config.max_capital_usd)}`;
+        return;
+      }
+    }
 
-    // Time-decay: tighten offset in last portion of window (only for unfilled sides)
+    // ── Book-anchored bid prices ──
+    // Regime discount already provides the offset from fair value.
+    // Time-decay: tighten discount in last portion of window (unfilled sides bid more aggressively)
     const windowProgress = (now - w.windowOpenTime) / wDurMs;
     const tightenStart = params.tighten_start_pct;
     const timeDecay = windowProgress > tightenStart
       ? 1.0 - (windowProgress - tightenStart) / (1.0 - tightenStart)
       : 1.0;
 
-    const upOffset = w.upInventory > 0 ? adaptiveOffset : adaptiveOffset * timeDecay;
-    const dnOffset = w.downInventory > 0 ? adaptiveOffset : adaptiveOffset * timeDecay;
+    // For unfilled sides, reduce the discount over time (bid closer to fair value)
+    const upBidFair = w.upInventory > 0 ? discountedFairUp : fairUp * (1 - regimeDiscount * timeDecay);
+    const dnBidFair = w.downInventory > 0 ? discountedFairDown : fairDown * (1 - regimeDiscount * timeDecay);
 
-    // Complementary pricing: cumulative upAvgCost + dnBid (or vice versa) <= max_pair_cost
-    // This prevents overpaying across signal flips
-    const rawUpBid = Math.max(0.01, fairUp - upOffset);
-    const rawDnBid = Math.max(0.01, fairDown - dnOffset);
+    const rawUpBid = Math.min(Math.max(0.01, upBidFair), params.max_bid_per_side);
+    const rawDnBid = Math.min(Math.max(0.01, dnBidFair), params.max_bid_per_side);
 
     // Cap each bid based on what the OTHER side already cost us
     let upBid = w.downInventory > 0
@@ -1359,42 +1639,30 @@ class SafeMakerStrategy implements Strategy {
       const needsUpRequote = !w.upBidOrderId || Math.abs(roundedUpBid - w.upBidPrice) >= params.min_requote_delta;
       const needsDnRequote = !w.downBidOrderId || Math.abs(roundedDnBid - w.downBidPrice) >= params.min_requote_delta;
 
-      // Cancel UP bid if requote needed (with tape fill check for paper mode)
+      // Cancel UP bid if requote needed (cancelOrder checks fills before cancelling)
       if (needsUpRequote && w.upBidOrderId) {
-        if (ctx.config.mode !== "real") {
-          const tape = await fetchTradeTape();
-          const tapeFill = checkTapeFill(tape, w.market.upTokenId, w.upBidPrice, w.upBidSize);
-          if (tapeFill.filled) {
-            this.recordFillFromCancel(ctx, w, "UP", w.upBidSize, tapeFill.fillPrice, params);
-            w.upBidOrderId = null;
-          }
-        }
-        if (w.upBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.upBidOrderId, ctx.config.mode);
-          if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
-        }
+        const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
+        if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price, params); w.upBidOrderId = null; }
       }
 
-      // Cancel DN bid if requote needed (with tape fill check for paper mode)
+      // Cancel DN bid if requote needed
       if (needsDnRequote && w.downBidOrderId) {
-        if (ctx.config.mode !== "real") {
-          const tape = await fetchTradeTape();
-          const tapeFill = checkTapeFill(tape, w.market.downTokenId, w.downBidPrice, w.downBidSize);
-          if (tapeFill.filled) {
-            this.recordFillFromCancel(ctx, w, "DOWN", w.downBidSize, tapeFill.fillPrice, params);
-            w.downBidOrderId = null;
-          }
-        }
-        if (w.downBidOrderId) {
-          const r = await safeCancelOrder(ctx.api, w.downBidOrderId, ctx.config.mode);
-          if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
-        }
+        const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
+        if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
       }
     }
 
     // Place UP bid
     if (!w.upBidOrderId && upBidSize > 0) {
-      const roundedBid = Math.floor(upBid * 100) / 100;
+      let roundedBid = Math.floor(upBid * 100) / 100;
+      // Spread guard: never cross the spread (prevents expensive taker fills)
+      const upBook = await this.getBookCached(ctx, w.market.upTokenId);
+      const upBestAsk = this.getBestAsk(upBook);
+      if (upBestAsk !== null && roundedBid >= upBestAsk) {
+        const clamped = Math.max(0.01, upBestAsk - 0.01);
+        ctx.log(`SPREAD GUARD UP: clamped bid ${roundedBid.toFixed(2)} -> ${clamped.toFixed(2)} (ask=${upBestAsk.toFixed(2)})`);
+        roundedBid = clamped;
+      }
       const result = await ctx.api.placeOrder({
         token_id: w.market.upTokenId,
         side: "BUY",
@@ -1449,7 +1717,15 @@ class SafeMakerStrategy implements Strategy {
 
     // Place DOWN bid
     if (!w.downBidOrderId && downBidSize > 0) {
-      const roundedBid = Math.floor(dnBid * 100) / 100;
+      let roundedBid = Math.floor(dnBid * 100) / 100;
+      // Spread guard: never cross the spread
+      const dnBook = await this.getBookCached(ctx, w.market.downTokenId);
+      const dnBestAsk = this.getBestAsk(dnBook);
+      if (dnBestAsk !== null && roundedBid >= dnBestAsk) {
+        const clamped = Math.max(0.01, dnBestAsk - 0.01);
+        ctx.log(`SPREAD GUARD DN: clamped bid ${roundedBid.toFixed(2)} -> ${clamped.toFixed(2)} (ask=${dnBestAsk.toFixed(2)})`);
+        roundedBid = clamped;
+      }
       const result = await ctx.api.placeOrder({
         token_id: w.market.downTokenId,
         side: "BUY",
@@ -1502,6 +1778,22 @@ class SafeMakerStrategy implements Strategy {
       }
     }
 
+    // Set tickAction based on current quoting state
+    {
+      const up = w.upInventory, dn = w.downInventory;
+      const pc = (up > 0 && dn > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+      const str = (signal.signalStrength * 100).toFixed(0);
+      const decay = (timeDecay * 100).toFixed(0);
+      const upBidStr = w.upBidOrderId ? `▲${w.upBidPrice.toFixed(2)}` : "";
+      const dnBidStr = w.downBidOrderId ? `▼${w.downBidPrice.toFixed(2)}` : "";
+      const bids = [upBidStr, dnBidStr].filter(Boolean).join(" ");
+      const flipSellStatus = directionChanged && !combined.sellApproved ? " sell blocked" : "";
+      const discStr = `${(regimeDiscount * 100).toFixed(0)}%@${regime.slice(0, 4)}`;
+      w.tickAction = directionChanged
+        ? `FLIP→${signal.direction} ${str}% ${bkStr} disc=${discStr} → ${bids} decay=${decay}%${pc}${flipSellStatus}`
+        : `${signal.direction} ${str}% ${bkStr} disc=${discStr} → ${bids} decay=${decay}%${pc}`;
+    }
+
     // Update quote tracking
     w.lastSignalDirection = signal.direction;
     w.lastQuotedAt = now;
@@ -1530,7 +1822,7 @@ class SafeMakerStrategy implements Strategy {
 
     const signal = computeSignal(
       w.cryptoSymbol,
-      w.priceAtWindowOpen,
+      w.oracleStrike ?? w.priceAtWindowOpen,
       currentSnap.price,
       Date.now() - w.enteredAt,
       history.filter((s) => s.timestamp >= w.enteredAt)
@@ -1556,12 +1848,13 @@ class SafeMakerStrategy implements Strategy {
     const bestBid = book.bids.length > 0
       ? Math.max(...book.bids.map(l => l.price))
       : null;
-    // Fall back to signal-derived price if book is empty
-    const dirSign = signal.direction === "UP" ? 1 : -1;
-    const fairVal = Math.max(0.02, Math.min(0.98,
-      0.50 + signal.signalStrength * 0.40 * dirSign
-    ));
-    const signalPrice = losingSide === "UP" ? fairVal : (1.0 - fairVal);
+    // Fall back to P_true if book is empty
+    const sellHistory = this.custom.priceHistory[w.cryptoSymbol] || [];
+    const sellVol = estimateVolatility5min(sellHistory);
+    const sellTimeRemaining = w.windowEndTime - Date.now();
+    const sellEffectiveStrike = w.oracleStrike ?? w.priceAtWindowOpen;
+    const pTrueUp = calculatePTrue(currentSnap.price, sellEffectiveStrike, "above", sellTimeRemaining, sellVol);
+    const signalPrice = losingSide === "UP" ? pTrueUp : (1.0 - pTrueUp);
     const sellPrice = Math.max(0.01, bestBid ?? signalPrice);
 
     // Don't place a new sell if one is already pending
@@ -1733,7 +2026,28 @@ class SafeMakerStrategy implements Strategy {
         flipCount: w.flipCount,
       };
 
+      // Flush tick snapshots to D1 for offline replay
+      if (params.record_snapshots && w.tickSnapshots?.length) {
+        try {
+          const openDate = new Date(w.windowOpenTime);
+          await ctx.db.prepare(
+            `INSERT OR IGNORE INTO strategy_snapshots (id, strategy_id, window_title, crypto_symbol, window_open_time, window_end_time, window_duration_ms, oracle_strike, price_at_open, hour_utc, day_of_week, up_token_id, down_token_id, outcome, ticks)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            `snap-${crypto.randomUUID()}`, ctx.config.id, w.market.title, w.cryptoSymbol,
+            w.windowOpenTime, w.windowEndTime, w.windowEndTime - w.windowOpenTime,
+            w.oracleStrike ?? null, w.priceAtWindowOpen,
+            openDate.getUTCHours(), openDate.getUTCDay(),
+            w.market.upTokenId, w.market.downTokenId,
+            outcome, JSON.stringify(w.tickSnapshots)
+          ).run();
+        } catch (e) {
+          ctx.log(`SNAPSHOT SAVE ERROR: ${e}`, { level: "error", phase: "snapshot" } as never);
+        }
+      }
+
       this.custom.completedWindows.push(completed);
+      this.onWindowResolved(completed, params, ctx);
       if (this.custom.completedWindows.length > 20) {
         this.custom.completedWindows =
           this.custom.completedWindows.slice(-50);
@@ -1786,8 +2100,8 @@ class SafeMakerStrategy implements Strategy {
       toRemove.push(i);
     }
 
-    // Auto-redeem resolved conditions in real mode
-    if (ctx.config.mode === "real" && toRemove.length > 0) {
+    // Auto-redeem resolved conditions (PaperStrategyAPI.redeemConditions is a no-op)
+    if (toRemove.length > 0) {
       const conditionIds = toRemove
         .map((i) => this.custom.activeWindows[i]?.market.conditionId)
         .filter((cid): cid is string => !!cid);

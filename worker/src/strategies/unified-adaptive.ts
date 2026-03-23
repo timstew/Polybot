@@ -12,7 +12,7 @@
  */
 
 import type { Strategy, StrategyContext, OrderBook, ActivityTrade } from "../strategy";
-import { registerStrategy } from "../strategy";
+import { registerStrategy, safeCancelOrder } from "../strategy";
 import { calcFeePerShare, CRYPTO_FEES, type FeeParams } from "../categories";
 import {
   type CryptoMarket,
@@ -28,10 +28,8 @@ import {
   enableOrderFlow,
   disableOrderFlow,
   CRYPTO_SYMBOL_MAP,
-  type TradeTapeEntry,
-  fetchTradeTape,
-  checkTapeFill,
 } from "./price-feed";
+import { tryMerge } from "./merge";
 
 // ── Interfaces ────────────────────────────────────────────────────────
 
@@ -88,6 +86,7 @@ interface UnifiedParams {
   upgrade_after_ticks: number;       // min ticks before considering upgrade
   upgrade_signal_threshold: number;  // signal strength needed to upgrade
   grounded_fills: boolean; // use trade tape instead of probabilistic model (default true)
+  merge_enabled?: boolean;
 }
 
 const DEFAULT_PARAMS: UnifiedParams = {
@@ -123,6 +122,7 @@ const DEFAULT_PARAMS: UnifiedParams = {
   upgrade_after_ticks: 3,
   upgrade_signal_threshold: 0.55,
   grounded_fills: true,
+  merge_enabled: true,
 };
 
 interface AdaptiveState {
@@ -187,6 +187,9 @@ interface UnifiedWindowPosition {
   // Deferred upgrade tracking
   ticksInWindow: number;
   upgradedFromSniper: boolean;
+
+  // Human-readable tick action for UI
+  tickAction: string;
 }
 
 interface CompletedUnifiedWindow {
@@ -536,7 +539,7 @@ class UnifiedAdaptiveStrategy implements Strategy {
     // Reconcile totalPnl from D1 (source of truth) to fix drift
     try {
       const row = await ctx.db
-        .prepare("SELECT COALESCE(SUM(pnl), 0) as total FROM strategy_trades WHERE strategy_id = ? AND side = 'RESOLVE'")
+        .prepare("SELECT COALESCE(SUM(pnl), 0) as total FROM strategy_trades WHERE strategy_id = ? AND side IN ('RESOLVE', 'MERGE', 'SELL')")
         .bind(ctx.config.id)
         .first<{ total: number }>();
       if (row && Math.abs((row.total || 0) - this.custom.stats.totalPnl) > 0.01) {
@@ -616,7 +619,7 @@ class UnifiedAdaptiveStrategy implements Strategy {
     // 7. Persist
     ctx.state.custom = this.custom as unknown as Record<string, unknown>;
     ctx.state.capital_deployed = this.custom.activeWindows.reduce(
-      (sum, w) => sum + w.totalBuyCost, 0
+      (sum, w) => sum + w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost, 0
     );
     ctx.state.total_pnl = this.custom.stats.totalPnl;
   }
@@ -640,18 +643,22 @@ class UnifiedAdaptiveStrategy implements Strategy {
     const now = Date.now();
     const activeConditions = new Set(this.custom.activeWindows.map((w) => w.market.conditionId));
 
-    // Capital at risk = total cost minus guaranteed matched pair returns ($1 per pair).
-    // Matched pairs are structurally profitable — they free up capital for new windows.
-    const capitalAtRisk = this.custom.activeWindows.reduce(
-      (sum, w) => sum + Math.max(0, w.upInventory - w.downInventory) * w.upAvgCost + Math.max(0, w.downInventory - w.upInventory) * w.downAvgCost, 0
+    // Total deployed capital: inventory + pending bids (worst case if all fill)
+    const capitalCommitted = this.custom.activeWindows.reduce(
+      (sum, w) => {
+        const inv = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
+        const pending = (w.upBidOrderId ? w.upBidSize * w.upBidPrice : 0)
+          + (w.downBidOrderId ? w.downBidSize * w.downBidPrice : 0);
+        return sum + inv + pending;
+      }, 0
     );
     const maxCapital = ctx.config.max_capital_usd;
-    const available = maxCapital - capitalAtRisk;
+    const available = maxCapital - capitalCommitted;
 
     // Minimum capital to enter a window: bid_size * 0.46 * 2 sides
     const minCost = params.min_bid_size * 0.46 * 2;
     if (available < minCost) {
-      this.custom.scanStatus = `Capital limit reached ($${capitalAtRisk.toFixed(0)}/$${maxCapital} at risk)`;
+      this.custom.scanStatus = `Capital limit reached ($${capitalCommitted.toFixed(0)}/$${maxCapital} deployed)`;
       return;
     }
 
@@ -814,6 +821,7 @@ class UnifiedAdaptiveStrategy implements Strategy {
         // Deferred upgrade
         ticksInWindow: 0,
         upgradedFromSniper: false,
+        tickAction: `${mode} → entered`,
       };
 
       this.custom.activeWindows.push(window);
@@ -861,32 +869,49 @@ class UnifiedAdaptiveStrategy implements Strategy {
       const timeToEnd = w.windowEndTime - now;
       const windowDurationMs = w.windowEndTime - w.windowOpenTime;
 
-      if (now > w.windowEndTime + 30_000) continue;
+      if (now > w.windowEndTime + 30_000) {
+        w.tickAction = "Awaiting resolution";
+        continue;
+      }
 
       const stopQuotingMs = Math.min(params.stop_quoting_before_end_ms, windowDurationMs * 0.05);
       const exitMs = Math.min(params.exit_inventory_before_end_ms, windowDurationMs * 0.017);
 
       // Exit phase
       if (timeToEnd < exitMs) {
-        if (w.upBidOrderId) { await ctx.api.cancelOrder(w.upBidOrderId); w.upBidOrderId = null; }
-        if (w.downBidOrderId) { await ctx.api.cancelOrder(w.downBidOrderId); w.downBidOrderId = null; }
+        if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price); w.upBidOrderId = null; } }
+        if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price); w.downBidOrderId = null; } }
         if (w.mode === "sniper") {
           // Real mode: hold to resolution. Paper mode: sell excess.
           if (ctx.config.mode !== "real") await this.sniperSellExcess(ctx, w, params, "EXIT");
         } else {
           await this.makerSellLosing(ctx, w, params, "DUMP");
         }
+        w.tickAction = `Exiting: sell excess before close`;
         continue;
       }
 
       // Wind-down phase
       if (timeToEnd < stopQuotingMs) {
-        if (w.upBidOrderId) { await ctx.api.cancelOrder(w.upBidOrderId); w.upBidOrderId = null; }
-        if (w.downBidOrderId) { await ctx.api.cancelOrder(w.downBidOrderId); w.downBidOrderId = null; }
+        if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price); w.upBidOrderId = null; } }
+        if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price); w.downBidOrderId = null; } }
+        // Merge matched pairs during wind-down — free capital before resolution
+        if (params.merge_enabled !== false) {
+          const mergeResult = await tryMerge(ctx, w);
+          if (mergeResult) {
+            w.realizedSellPnl += mergeResult.pnl;
+            this.custom.stats.totalPnl = (this.custom.stats.totalPnl || 0) + mergeResult.pnl;
+          }
+        }
         if (w.mode === "sniper") {
           if (ctx.config.mode !== "real") await this.sniperSellExcess(ctx, w, params, "WIND DOWN");
         } else {
           await this.makerSellLosing(ctx, w, params, "WIND DOWN");
+        }
+        {
+          const up = w.upInventory, dn = w.downInventory;
+          const pc = (up > 0 && dn > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+          w.tickAction = `Stop: holding ${up}↑/${dn}↓${pc}`;
         }
         continue;
       }
@@ -919,6 +944,7 @@ class UnifiedAdaptiveStrategy implements Strategy {
       if (w.mode === "sniper" && w.rebalanceSold) {
         if (w.upBidOrderId) { await ctx.api.cancelOrder(w.upBidOrderId); w.upBidOrderId = null; }
         if (w.downBidOrderId) { await ctx.api.cancelOrder(w.downBidOrderId); w.downBidOrderId = null; }
+        w.tickAction = "Poisoned: market too one-sided";
         continue;
       }
 
@@ -954,6 +980,7 @@ class UnifiedAdaptiveStrategy implements Strategy {
         if (favorability.regime === "trending") {
           if (w.upBidOrderId) { await ctx.api.cancelOrder(w.upBidOrderId); w.upBidOrderId = null; }
           if (w.downBidOrderId) { await ctx.api.cancelOrder(w.downBidOrderId); w.downBidOrderId = null; }
+          w.tickAction = `Paused: trending (chop=${favorability.choppiness.toFixed(2)})`;
           if (ctx.state.ticks % 10 === 0) {
             ctx.log(
               `PAUSED: ${w.market.title.slice(0, 25)} ${w.cryptoSymbol} trending (chop=${favorability.choppiness.toFixed(2)}) inv=${w.upInventory}/${w.downInventory}`,
@@ -1009,8 +1036,46 @@ class UnifiedAdaptiveStrategy implements Strategy {
   ): Promise<void> {
     if (ctx.config.mode === "real") {
       await this.sniperCheckFillsReal(ctx, w);
-    } else {
-      await this.sniperCheckFillsPaper(ctx, w);
+      return;
+    }
+    // Paper mode: unified fill detection via PaperStrategyAPI
+    if (w.upBidOrderId) {
+      const status = await ctx.api.getOrderStatus(w.upBidOrderId);
+      if (status.status === "MATCHED") {
+        const costBasis = status.price;
+        const filledSize = status.size_matched;
+        if (w.upInventory > 0) {
+          const tc = w.upAvgCost * w.upInventory + costBasis * filledSize;
+          w.upInventory += filledSize; w.upAvgCost = tc / w.upInventory;
+        } else { w.upInventory = filledSize; w.upAvgCost = costBasis; }
+        w.fillCount++;
+        w.totalBuyCost += costBasis * filledSize;
+        ctx.log(`FILL UP [sniper]: ${w.market.title.slice(0, 25)} ${filledSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory}`);
+        await ctx.db.prepare(
+          `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
+           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
+        ).bind(`ua-sup-${crypto.randomUUID()}`, ctx.config.id, w.market.upTokenId, w.market.slug, `${w.market.title} [UA SNIPER UP]`, costBasis, filledSize, calcFeePerShare(costBasis, params.fee_params) * filledSize).run();
+        w.upBidOrderId = null;
+      } else if (status.status === "CANCELLED") { w.upBidOrderId = null; }
+    }
+    if (w.downBidOrderId) {
+      const status = await ctx.api.getOrderStatus(w.downBidOrderId);
+      if (status.status === "MATCHED") {
+        const costBasis = status.price;
+        const filledSize = status.size_matched;
+        if (w.downInventory > 0) {
+          const tc = w.downAvgCost * w.downInventory + costBasis * filledSize;
+          w.downInventory += filledSize; w.downAvgCost = tc / w.downInventory;
+        } else { w.downInventory = filledSize; w.downAvgCost = costBasis; }
+        w.fillCount++;
+        w.totalBuyCost += costBasis * filledSize;
+        ctx.log(`FILL DN [sniper]: ${w.market.title.slice(0, 25)} ${filledSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory}`);
+        await ctx.db.prepare(
+          `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
+           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
+        ).bind(`ua-sdn-${crypto.randomUUID()}`, ctx.config.id, w.market.downTokenId, w.market.slug, `${w.market.title} [UA SNIPER DN]`, costBasis, filledSize, calcFeePerShare(costBasis, params.fee_params) * filledSize).run();
+        w.downBidOrderId = null;
+      } else if (status.status === "CANCELLED") { w.downBidOrderId = null; }
     }
   }
 
@@ -1108,70 +1173,32 @@ class UnifiedAdaptiveStrategy implements Strategy {
     }
   }
 
-  private simulatePaperFill(
-    bidPrice: number, bidSize: number, book: OrderBook, tokenId: string, tape: TradeTapeEntry[], grounded: boolean
-  ): { filled: boolean; fillPrice: number } {
-    const bestAsk = this.getBestAsk(book);
-    if (bestAsk !== null && bidPrice >= bestAsk) return { filled: true, fillPrice: bestAsk };
-    if (grounded) return checkTapeFill(tape, tokenId, bidPrice, bidSize);
-    // Legacy probabilistic model
-    if (bestAsk === null) return { filled: false, fillPrice: 0 };
-    const distance = bestAsk - bidPrice;
-    let depthBonus = 0;
-    const totalAskDepth = book.asks.reduce((s, l) => s + l.size, 0);
-    if (totalAskDepth > 100) depthBonus = 0.05;
-    if (totalAskDepth > 500) depthBonus = 0.10;
-    const fillProb = Math.min(0.6, 0.30 * Math.exp(-distance * 20) + depthBonus);
-    if (Math.random() <= fillProb) return { filled: true, fillPrice: bidPrice };
-    return { filled: false, fillPrice: 0 };
-  }
-
-  private async sniperCheckFillsPaper(
-    ctx: StrategyContext, w: UnifiedWindowPosition
+  /** Record a fill detected during safeCancelOrder (mode-agnostic) */
+  private async recordFillFromCancel(
+    ctx: StrategyContext, w: UnifiedWindowPosition,
+    side: "UP" | "DOWN", size: number, price: number
   ): Promise<void> {
     const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as UnifiedParams;
-    const tape = await fetchTradeTape();
-    if (w.upBidOrderId) {
-      const upBook = await this.getBookCached(ctx, w.market.upTokenId);
-      const result = this.simulatePaperFill(w.upBidPrice, w.upBidSize, upBook, w.market.upTokenId, tape, params.grounded_fills);
-      if (result.filled) {
-        const costBasis = result.fillPrice;
-        if (w.upInventory > 0) {
-          const tc = w.upAvgCost * w.upInventory + costBasis * w.upBidSize;
-          w.upInventory += w.upBidSize;
-          w.upAvgCost = tc / w.upInventory;
-        } else { w.upInventory = w.upBidSize; w.upAvgCost = costBasis; }
-        w.fillCount++;
-        w.totalBuyCost += costBasis * w.upBidSize;
-        ctx.log(`FILL UP [sniper]: ${w.market.title.slice(0, 25)} ${w.upBidSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory} ask=${this.getBestAsk(upBook)?.toFixed(3) ?? "?"}`);
-        await ctx.db.prepare(
-          `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
-           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
-        ).bind(`ua-sup-${crypto.randomUUID()}`, ctx.config.id, w.market.upTokenId, w.market.slug, `${w.market.title} [UA SNIPER UP]`, costBasis, w.upBidSize, calcFeePerShare(costBasis, params.fee_params) * w.upBidSize).run();
-        w.upBidOrderId = null;
-      }
+    if (side === "UP") {
+      if (w.upInventory > 0) {
+        const tc = w.upAvgCost * w.upInventory + price * size;
+        w.upInventory += size; w.upAvgCost = tc / w.upInventory;
+      } else { w.upInventory = size; w.upAvgCost = price; }
+    } else {
+      if (w.downInventory > 0) {
+        const tc = w.downAvgCost * w.downInventory + price * size;
+        w.downInventory += size; w.downAvgCost = tc / w.downInventory;
+      } else { w.downInventory = size; w.downAvgCost = price; }
     }
-
-    if (w.downBidOrderId) {
-      const dnBook = await this.getBookCached(ctx, w.market.downTokenId);
-      const result = this.simulatePaperFill(w.downBidPrice, w.downBidSize, dnBook, w.market.downTokenId, tape, params.grounded_fills);
-      if (result.filled) {
-        const costBasis = result.fillPrice;
-        if (w.downInventory > 0) {
-          const tc = w.downAvgCost * w.downInventory + costBasis * w.downBidSize;
-          w.downInventory += w.downBidSize;
-          w.downAvgCost = tc / w.downInventory;
-        } else { w.downInventory = w.downBidSize; w.downAvgCost = costBasis; }
-        w.fillCount++;
-        w.totalBuyCost += costBasis * w.downBidSize;
-        ctx.log(`FILL DN [sniper]: ${w.market.title.slice(0, 25)} ${w.downBidSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory} ask=${this.getBestAsk(dnBook)?.toFixed(3) ?? "?"}`);
-        await ctx.db.prepare(
-          `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
-           VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
-        ).bind(`ua-sdn-${crypto.randomUUID()}`, ctx.config.id, w.market.downTokenId, w.market.slug, `${w.market.title} [UA SNIPER DN]`, costBasis, w.downBidSize, calcFeePerShare(costBasis, params.fee_params) * w.downBidSize).run();
-        w.downBidOrderId = null;
-      }
-    }
+    w.fillCount++;
+    w.totalBuyCost += price * size;
+    const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
+    const tag = w.mode === "sniper" ? "SNIPER" : "MAKER";
+    ctx.log(`FILL ${side} [${w.mode} cancel]: ${w.market.title.slice(0, 25)} ${size}@${price.toFixed(3)} inv=${w.upInventory}/${w.downInventory}`);
+    await ctx.db.prepare(
+      `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
+       VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
+    ).bind(`ua-cancel-${crypto.randomUUID()}`, ctx.config.id, tokenId, w.market.slug, `${w.market.title} [UA ${tag} ${side}]`, price, size, calcFeePerShare(price, params.fee_params) * size).run();
   }
 
   // ── Sniper rebalance ───────────────────────────────────────────────
@@ -1340,20 +1367,33 @@ class UnifiedAdaptiveStrategy implements Strategy {
   private async sniperUpdateQuotes(
     ctx: StrategyContext, w: UnifiedWindowPosition, params: UnifiedParams, signal: WindowSignal
   ): Promise<void> {
-    // Per-window capital-at-risk: only unmatched inventory is at risk.
-    // Matched pairs are locked-in profit — no cap on accumulation.
-    const matched = Math.min(w.upInventory, w.downInventory);
-    const unmatchedCost = w.totalBuyCost - matched;
-    if (unmatchedCost > w.lockedCapital * 1.5) return;
+    // Per-window capital check: total deployed in this window
+    const windowCapital = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
+    if (windowCapital > w.lockedCapital * 1.5) {
+      w.tickAction = `Window capital limit`;
+      return;
+    }
 
-    // Total capital-at-risk check: cost minus matched pair returns
-    const capitalAtRisk = this.custom.activeWindows.reduce(
-      (sum, aw) => sum + Math.max(0, aw.upInventory - aw.downInventory) * aw.upAvgCost + Math.max(0, aw.downInventory - aw.upInventory) * aw.downAvgCost, 0
+    // Total deployed capital + pending bids (worst case if all fill)
+    const capitalCommitted = this.custom.activeWindows.reduce(
+      (sum, aw) => {
+        const inv = aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost;
+        const pending = aw !== w
+          ? (aw.upBidOrderId ? aw.upBidSize * aw.upBidPrice : 0)
+            + (aw.downBidOrderId ? aw.downBidSize * aw.downBidPrice : 0)
+          : 0;
+        return sum + inv + pending;
+      }, 0
     );
-    if (capitalAtRisk > ctx.config.max_capital_usd) return;
+    if (capitalCommitted > ctx.config.max_capital_usd) {
+      w.tickAction = `Capital limit: $${capitalCommitted.toFixed(0)}/$${ctx.config.max_capital_usd}`;
+      return;
+    }
 
-    // Cap bid size at 10 units (same as spread-sniper: limits one-sided fill risk)
-    const effectiveBidSize = 10;
+    // Duration-scaled bid size (same formula as maker path)
+    const wDurMs = w.windowEndTime - w.windowOpenTime;
+    const sniperDurationScale = Math.min(1.0, (wDurMs / 60_000) / 15);
+    const effectiveBidSize = Math.max(params.min_bid_size, Math.round(w.bidSize * sniperDurationScale));
 
     let upBidSize = effectiveBidSize;
     let downBidSize = effectiveBidSize;
@@ -1369,11 +1409,14 @@ class UnifiedAdaptiveStrategy implements Strategy {
     let upBid = computedUpBid;
     let dnBid = computedDnBid;
 
-    // Ask imbalance gate: stop bidding on BOTH sides when asks are lopsided
-    const askImbalance = Math.abs(w.lastUpBestAsk - w.lastDnBestAsk);
-    if (w.lastUpBestAsk > 0 && w.lastDnBestAsk > 0 && askImbalance > 0.15) {
-      upBidSize = 0;
-      downBidSize = 0;
+    // Ask imbalance gate: stop the expensive (likely loser) side, keep bidding the cheap side
+    if (w.lastUpBestAsk > 0 && w.lastDnBestAsk > 0) {
+      const askImbalance = Math.abs(w.lastUpBestAsk - w.lastDnBestAsk);
+      if (askImbalance > 0.15) {
+        // Higher ask = more expensive = likely loser → stop that side
+        if (w.lastUpBestAsk > w.lastDnBestAsk) upBidSize = 0;
+        else downBidSize = 0;
+      }
     }
 
     // Skip bids too low or that would cross the spread
@@ -1385,7 +1428,8 @@ class UnifiedAdaptiveStrategy implements Strategy {
     // Place UP bid
     if (upBidSize > 0) {
       if (w.upBidOrderId && Math.abs(w.upBidPrice - upBid) > 0.005) {
-        await ctx.api.cancelOrder(w.upBidOrderId); w.upBidOrderId = null;
+        const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
+        if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price); w.upBidOrderId = null; }
       }
       if (!w.upBidOrderId) {
         const result = await ctx.api.placeOrder({ token_id: w.market.upTokenId, side: "BUY", price: upBid, size: upBidSize });
@@ -1396,7 +1440,8 @@ class UnifiedAdaptiveStrategy implements Strategy {
     // Place DN bid
     if (downBidSize > 0) {
       if (w.downBidOrderId && Math.abs(w.downBidPrice - dnBid) > 0.005) {
-        await ctx.api.cancelOrder(w.downBidOrderId); w.downBidOrderId = null;
+        const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
+        if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price); w.downBidOrderId = null; }
       }
       if (!w.downBidOrderId) {
         const result = await ctx.api.placeOrder({ token_id: w.market.downTokenId, side: "BUY", price: dnBid, size: downBidSize });
@@ -1413,63 +1458,63 @@ class UnifiedAdaptiveStrategy implements Strategy {
         { level: "signal", symbol: w.cryptoSymbol, signalStrength: signal.signalStrength, upInventory: w.upInventory, downInventory: w.downInventory, phase: "manage" }
       );
     }
+
+    // Set tickAction
+    {
+      const up = w.upInventory, dn = w.downInventory;
+      const pc = (up > 0 && dn > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+      const upB = w.upBidOrderId ? `▲${w.upBidPrice.toFixed(2)}` : "";
+      const dnB = w.downBidOrderId ? `▼${w.downBidPrice.toFixed(2)}` : "";
+      const bids = [upB, dnB].filter(Boolean).join(" ");
+      w.tickAction = bids ? `bid ${bids}${pc} inv=${up}/${dn}` : `no bids${pc} inv=${up}/${dn}`;
+    }
   }
 
   // ── Maker fill checking ────────────────────────────────────────────
 
-  /**
-   * Book-based maker fill checking.
-   * Uses real CLOB book data instead of signal-derived fair value.
-   * The signal should drive pricing decisions (where to bid), not fill simulation.
-   */
+  /** Maker fill checking — unified via StrategyAPI (works paper + real). */
   private async makerCheckFills(
     ctx: StrategyContext, w: UnifiedWindowPosition, params: UnifiedParams, _signal: WindowSignal
   ): Promise<void> {
-    const tape = await fetchTradeTape();
-    // UP fill using real book
+    // UP fill
     if (w.upBidOrderId) {
-      const upBook = await this.getBookCached(ctx, w.market.upTokenId);
-      const result = this.simulatePaperFill(w.upBidPrice, w.upBidSize, upBook, w.market.upTokenId, tape, params.grounded_fills);
-      if (result.filled) {
-        const costBasis = result.fillPrice;
+      const status = await ctx.api.getOrderStatus(w.upBidOrderId);
+      if (status.status === "MATCHED") {
+        const costBasis = status.price;
+        const filledSize = status.size_matched;
         if (w.upInventory > 0) {
-          const tc = w.upAvgCost * w.upInventory + costBasis * w.upBidSize;
-          w.upInventory += w.upBidSize;
-          w.upAvgCost = tc / w.upInventory;
-        } else { w.upInventory = w.upBidSize; w.upAvgCost = costBasis; }
+          const tc = w.upAvgCost * w.upInventory + costBasis * filledSize;
+          w.upInventory += filledSize; w.upAvgCost = tc / w.upInventory;
+        } else { w.upInventory = filledSize; w.upAvgCost = costBasis; }
         w.fillCount++;
-        w.totalBuyCost += costBasis * w.upBidSize;
-        const bestAsk = this.getBestAsk(upBook);
-        ctx.log(`FILL UP [maker]: ${w.market.title.slice(0, 25)} ${w.upBidSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory} ask=${bestAsk?.toFixed(3) ?? "?"}`);
+        w.totalBuyCost += costBasis * filledSize;
+        ctx.log(`FILL UP [maker]: ${w.market.title.slice(0, 25)} ${filledSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory}`);
         await ctx.db.prepare(
           `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
            VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
-        ).bind(`ua-mup-${crypto.randomUUID()}`, ctx.config.id, w.market.upTokenId, w.market.slug, `${w.market.title} [UA MAKER UP]`, costBasis, w.upBidSize, calcFeePerShare(costBasis, params.fee_params) * w.upBidSize).run();
+        ).bind(`ua-mup-${crypto.randomUUID()}`, ctx.config.id, w.market.upTokenId, w.market.slug, `${w.market.title} [UA MAKER UP]`, costBasis, filledSize, calcFeePerShare(costBasis, params.fee_params) * filledSize).run();
         w.upBidOrderId = null;
-      }
+      } else if (status.status === "CANCELLED") { w.upBidOrderId = null; }
     }
-
-    // DN fill using real book
+    // DN fill
     if (w.downBidOrderId) {
-      const dnBook = await this.getBookCached(ctx, w.market.downTokenId);
-      const result = this.simulatePaperFill(w.downBidPrice, w.downBidSize, dnBook, w.market.downTokenId, tape, params.grounded_fills);
-      if (result.filled) {
-        const costBasis = result.fillPrice;
+      const status = await ctx.api.getOrderStatus(w.downBidOrderId);
+      if (status.status === "MATCHED") {
+        const costBasis = status.price;
+        const filledSize = status.size_matched;
         if (w.downInventory > 0) {
-          const tc = w.downAvgCost * w.downInventory + costBasis * w.downBidSize;
-          w.downInventory += w.downBidSize;
-          w.downAvgCost = tc / w.downInventory;
-        } else { w.downInventory = w.downBidSize; w.downAvgCost = costBasis; }
+          const tc = w.downAvgCost * w.downInventory + costBasis * filledSize;
+          w.downInventory += filledSize; w.downAvgCost = tc / w.downInventory;
+        } else { w.downInventory = filledSize; w.downAvgCost = costBasis; }
         w.fillCount++;
-        w.totalBuyCost += costBasis * w.downBidSize;
-        const bestAsk = this.getBestAsk(dnBook);
-        ctx.log(`FILL DN [maker]: ${w.market.title.slice(0, 25)} ${w.downBidSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory} ask=${bestAsk?.toFixed(3) ?? "?"}`);
+        w.totalBuyCost += costBasis * filledSize;
+        ctx.log(`FILL DN [maker]: ${w.market.title.slice(0, 25)} ${filledSize}@${costBasis.toFixed(3)} inv=${w.upInventory}/${w.downInventory}`);
         await ctx.db.prepare(
           `INSERT OR IGNORE INTO strategy_trades (id, strategy_id, token_id, market, title, side, price, size, fee_amount, timestamp, pnl)
            VALUES (?, ?, ?, ?, ?, 'BUY', ?, ?, ?, datetime('now'), 0)`
-        ).bind(`ua-mdn-${crypto.randomUUID()}`, ctx.config.id, w.market.downTokenId, w.market.slug, `${w.market.title} [UA MAKER DN]`, costBasis, w.downBidSize, calcFeePerShare(costBasis, params.fee_params) * w.downBidSize).run();
+        ).bind(`ua-mdn-${crypto.randomUUID()}`, ctx.config.id, w.market.downTokenId, w.market.slug, `${w.market.title} [UA MAKER DN]`, costBasis, filledSize, calcFeePerShare(costBasis, params.fee_params) * filledSize).run();
         w.downBidOrderId = null;
-      }
+      } else if (status.status === "CANCELLED") { w.downBidOrderId = null; }
     }
   }
 
@@ -1478,11 +1523,21 @@ class UnifiedAdaptiveStrategy implements Strategy {
   private async makerUpdateQuotes(
     ctx: StrategyContext, w: UnifiedWindowPosition, params: UnifiedParams, signal: WindowSignal
   ): Promise<void> {
-    // Total capital-at-risk check: cost minus matched pair returns
-    const capitalAtRisk = this.custom.activeWindows.reduce(
-      (sum, aw) => sum + Math.max(0, aw.upInventory - aw.downInventory) * aw.upAvgCost + Math.max(0, aw.downInventory - aw.upInventory) * aw.downAvgCost, 0
+    // Total deployed capital + pending bids (worst case if all fill)
+    const capitalCommitted = this.custom.activeWindows.reduce(
+      (sum, aw) => {
+        const inv = aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost;
+        const pending = aw !== w
+          ? (aw.upBidOrderId ? aw.upBidSize * aw.upBidPrice : 0)
+            + (aw.downBidOrderId ? aw.downBidSize * aw.downBidPrice : 0)
+          : 0;
+        return sum + inv + pending;
+      }, 0
     );
-    if (capitalAtRisk > ctx.config.max_capital_usd) return;
+    if (capitalCommitted > ctx.config.max_capital_usd) {
+      w.tickAction = `Capital limit: $${capitalCommitted.toFixed(0)}/$${ctx.config.max_capital_usd}`;
+      return;
+    }
 
     const now = Date.now();
     const pairCost = params.maker_max_pair_cost;
@@ -1504,7 +1559,7 @@ class UnifiedAdaptiveStrategy implements Strategy {
     // Periodic signal log
     if (ctx.state.ticks % 5 === 0) {
       const dirSign = signal.direction === "UP" ? 1 : -1;
-      const fairUp = 0.50 + signal.signalStrength * 0.40 * dirSign;
+      const fairUp = 0.50 + signal.signalStrength * 0.20 * dirSign;
       const fairDown = 1.0 - fairUp;
       ctx.log(
         `MAKER: ${w.market.title.slice(0, 25)} ${signal.direction} str=${(signal.signalStrength * 100).toFixed(0)}% fv=${fairUp.toFixed(2)}/${fairDown.toFixed(2)} UP=${w.upInventory} DN=${w.downInventory} flips=${w.flipCount} bidSize=${w.bidSize}`,
@@ -1514,19 +1569,25 @@ class UnifiedAdaptiveStrategy implements Strategy {
 
     // Max flips: stop quoting
     if (w.flipCount > params.max_flips_per_window) {
-      if (w.upBidOrderId) { await ctx.api.cancelOrder(w.upBidOrderId); w.upBidOrderId = null; }
-      if (w.downBidOrderId) { await ctx.api.cancelOrder(w.downBidOrderId); w.downBidOrderId = null; }
+      if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price); w.upBidOrderId = null; } }
+      if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price); w.downBidOrderId = null; } }
+      w.tickAction = `Sat out: choppy (${w.flipCount} flips)`;
       return;
     }
 
     // Check if requote needed
     const directionChanged = confirmedFlip;
     const priceMoved = Math.abs(signal.priceChangePct - w.lastQuotedPriceChangePct) > params.requote_threshold_pct;
-    if (!directionChanged && !priceMoved && w.lastQuotedAt !== 0) return;
+    if (!directionChanged && !priceMoved && w.lastQuotedAt !== 0) {
+      const up = w.upInventory, dn = w.downInventory;
+      const pc = (up > 0 && dn > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+      w.tickAction = `${signal.direction} ${(signal.signalStrength * 100).toFixed(0)}% → no requote${pc}`;
+      return;
+    }
 
-    // Cancel existing bids
-    if (w.upBidOrderId) { await ctx.api.cancelOrder(w.upBidOrderId); w.upBidOrderId = null; }
-    if (w.downBidOrderId) { await ctx.api.cancelOrder(w.downBidOrderId); w.downBidOrderId = null; }
+    // Cancel existing bids (safe cancel to catch fills)
+    if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price); w.upBidOrderId = null; } }
+    if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price); w.downBidOrderId = null; } }
 
     // On flip, sell losing side
     if (directionChanged && signal.signalStrength >= params.min_signal_strength) {
@@ -1582,11 +1643,14 @@ class UnifiedAdaptiveStrategy implements Strategy {
     // Capital-at-risk check: matched pairs are locked-in profit, only limit unmatched
     const makerMatched = Math.min(w.upInventory, w.downInventory);
     const makerUnmatchedCost = w.totalBuyCost - makerMatched;
-    if (makerUnmatchedCost > w.lockedCapital * 1.5) return;
+    if (makerUnmatchedCost > w.lockedCapital * 1.5) {
+      w.tickAction = `Window capital limit`;
+      return;
+    }
 
     // Signal-derived pricing
     const dirSign = signal.direction === "UP" ? 1 : -1;
-    const fairUp = Math.max(0.05, Math.min(0.95, 0.50 + signal.signalStrength * 0.40 * dirSign));
+    const fairUp = Math.max(0.05, Math.min(0.95, 0.50 + signal.signalStrength * 0.20 * dirSign));
     const fairDown = 1.0 - fairUp;
 
     const rawUpBid = Math.max(0.01, fairUp - params.maker_bid_offset);
@@ -1666,6 +1730,17 @@ class UnifiedAdaptiveStrategy implements Strategy {
     w.lastQuotedAt = now;
     w.lastQuotedPriceChangePct = signal.priceChangePct;
     w.convictionSide = convictionSide;
+
+    // Set tickAction
+    {
+      const up = w.upInventory, dn = w.downInventory;
+      const pc = (up > 0 && dn > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
+      const str = (signal.signalStrength * 100).toFixed(0);
+      const upB = w.upBidOrderId ? `▲${w.upBidPrice.toFixed(2)}` : "";
+      const dnB = w.downBidOrderId ? `▼${w.downBidPrice.toFixed(2)}` : "";
+      const bids = [upB, dnB].filter(Boolean).join(" ");
+      w.tickAction = `${directionChanged ? "FLIP→" : ""}${signal.direction} ${str}% → ${bids}${pc}`;
+    }
   }
 
   // ── Maker sell losing inventory ────────────────────────────────────
@@ -1696,7 +1771,7 @@ class UnifiedAdaptiveStrategy implements Strategy {
       : null;
     // Fall back to signal-derived price if book is empty
     const dirSign = signal.direction === "UP" ? 1 : -1;
-    const fairVal = Math.max(0.02, Math.min(0.98, 0.50 + signal.signalStrength * 0.40 * dirSign));
+    const fairVal = Math.max(0.02, Math.min(0.98, 0.50 + signal.signalStrength * 0.20 * dirSign));
     const signalPrice = losingSide === "UP" ? fairVal : (1.0 - fairVal);
     const sellPrice = Math.max(0.01, bestBid ?? signalPrice);
 
