@@ -28,33 +28,16 @@ import {
   type StrategyTrade,
   type WalletOverview,
 } from "@/lib/api";
+import {
+  fmt, fmtInv, timeAgo,
+  Tip, InventoryBar, SingleSideInventoryBar, PairPnl,
+  ActiveWindowRow, SingleSideActiveRow,
+  ResolvingWindowRow, SingleSideResolvingRow,
+  CompletedWindowRow, SingleSideCompletedRow,
+  WindowSection,
+} from "@/components/strategy-windows";
 
-function fmt(n: number | undefined | null) {
-  if (n == null || isNaN(n)) return "$0.00";
-  return `$${n.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
-/** Format inventory: integers as-is, fractional to 1-2dp, dust as <0.1 */
-function fmtInv(n: number): string {
-  if (n === 0) return "0";
-  if (n < 0.1) return "<0.1";
-  if (Number.isInteger(n)) return String(n);
-  return n.toFixed(n < 10 ? 2 : 1);
-}
-
-function timeAgo(ts: string | number) {
-  if (!ts) return "never";
-  const t = typeof ts === "number" ? ts : new Date(ts).getTime();
-  const diff = Date.now() - t;
-  if (diff < 0) return "just now";
-  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
-  if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h ago`;
-  return `${Math.floor(diff / 86400_000)}d ago`;
-}
+// fmt, fmtInv, timeAgo imported from strategy-windows
 
 function fmtTime(ts: string) {
   if (!ts) return "";
@@ -107,11 +90,11 @@ function fmtDuration(ms: number): string {
   return `${Math.floor(min / 60)}h${min % 60}m`;
 }
 
-function fmtRunTime(createdAt: string, lastTickAt: string, isRunning: boolean): string {
-  if (!createdAt) return "";
-  const start = new Date(createdAt.endsWith("Z") ? createdAt : createdAt + "Z").getTime();
-  const end = isRunning ? Date.now() : (lastTickAt ? new Date(lastTickAt.endsWith("Z") ? lastTickAt : lastTickAt + "Z").getTime() : start);
-  const ms = end - start;
+// PairPnl imported from strategy-windows
+
+/** Format cumulative active runtime from tick count × interval (immune to laptop suspend) */
+function fmtRunTime(ticks: number, tickIntervalMs: number): string {
+  const ms = ticks * tickIntervalMs;
   if (ms <= 0) return "0m";
   const min = Math.floor(ms / 60_000);
   if (min < 60) return `${min}m`;
@@ -130,34 +113,107 @@ const STRATEGY_TYPES = [
   { value: "safe-maker", label: "Safe Maker" },
   { value: "conviction-maker", label: "Conviction Maker" },
   { value: "unified-adaptive", label: "Unified Adaptive" },
+  { value: "certainty-taker", label: "Certainty Taker" },
+  { value: "avellaneda-maker", label: "Avellaneda Maker" },
+  { value: "enhanced-maker", label: "Enhanced Maker" },
+  { value: "orchestrator", label: "Orchestrator" },
+  { value: "scaling-safe-maker", label: "Scaling Safe Maker" },
 ];
 
-/** Inline tooltip wrapper — keeps JSX compact. Children are the trigger element. */
-function Tip({ tip, children }: { tip: string; children: React.ReactNode }) {
+// Tip, InventoryBar imported from strategy-windows
+
+/** Annotate known abbreviations in tickAction strings with tooltips. */
+function TickAction({ text }: { text: string }) {
+  if (!text) return null;
+
+  const ABBREVS: [RegExp, string][] = [
+    [/\bsig=(\d+)%/g, "Signal strength: model confidence in direction (0-100%)"],
+    [/(UP|DOWN|DN)\s+(\d+)%/g, "Signal direction and strength"],
+    [/\bvol=(low|normal|high)/g, "Volatility regime: low=calm, tighter bids; high=volatile, wider bids"],
+    [/\boff=([0-9.]+)/g, "Bid offset: how far below fair value we bid ($)"],
+    [/\bdecay=(\d+)%/g, "Time decay: offset shrinks near close (100%=full, 0%=at fair value)"],
+    [/\bll([+-][0-9.]+)/g, "Lead-lag bonus: BTC price confirms this alt's direction"],
+    [/\bpc=([0-9.]+)/g, "Pair cost: UP avg + DN avg. Below $1.00 = structurally profitable"],
+    [/[▲▼][0-9.]+/g, "Resting bid price on CLOB"],
+    [/\bsz=(\d+)/g, "Bid size in tokens"],
+    [/\binv=(\d+)\/(\d+)/g, "Inventory: UP tokens / DOWN tokens held"],
+    [/\bchop=([0-9.]+)/g, "Choppiness: how noisy/directionless the price action is (0-1)"],
+    [/(\d+)\s*flips?\s*>\s*(\d+)\s*max/g, "Signal changed direction too many times (choppy market)"],
+  ];
+
+  // Check if any abbreviation exists
+  const hasAbbrev = ABBREVS.some(([re]) => { re.lastIndex = 0; return re.test(text); });
+  if (!hasAbbrev) return <span>{text}</span>;
+
+  // Build annotated segments
+  type Segment = { text: string; tip?: string };
+  const segments: Segment[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    let earliest: { idx: number; len: number; tip: string } | null = null;
+    for (const [re, tip] of ABBREVS) {
+      re.lastIndex = 0;
+      const m = re.exec(remaining);
+      if (m && (!earliest || m.index < earliest.idx)) {
+        earliest = { idx: m.index, len: m[0].length, tip };
+      }
+    }
+    if (!earliest) {
+      segments.push({ text: remaining });
+      break;
+    }
+    if (earliest.idx > 0) segments.push({ text: remaining.slice(0, earliest.idx) });
+    segments.push({ text: remaining.slice(earliest.idx, earliest.idx + earliest.len), tip: earliest.tip });
+    remaining = remaining.slice(earliest.idx + earliest.len);
+  }
+
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>{children}</TooltipTrigger>
-      <TooltipContent side="top" className="max-w-xs">{tip}</TooltipContent>
-    </Tooltip>
+    <span>
+      {segments.map((s, i) =>
+        s.tip ? (
+          <Tip key={i} tip={s.tip}><span className="cursor-help underline decoration-dotted decoration-muted-foreground/50">{s.text}</span></Tip>
+        ) : (
+          <span key={i}>{s.text}</span>
+        )
+      )}
+    </span>
   );
 }
 
-function InventoryBar({ up, down, scale }: { up: number; down: number; scale: number }) {
-  const total = Math.max(up + down, scale, 1);
-  const W = 80, H = 14;
-  const upW = (up / total) * W;
-  const dnW = (down / total) * W;
-  const redX = W - dnW;
-  const overlapX = Math.max(redX, 0);
-  const overlapW = Math.max(Math.min(upW, W) - overlapX, 0);
+// SingleSideInventoryBar imported from strategy-windows
+
+/** Collapsible legend of tickAction abbreviations. */
+function TickActionLegend() {
+  const items = [
+    ["UP/DOWN 72%", "Signal direction and strength (0-100%)"],
+    ["vol=low/normal/high", "Volatility regime: low=calm, tighter bids; high=volatile, wider bids"],
+    ["off=0.01", "Bid offset: how far below fair value we bid ($)"],
+    ["decay=80%", "Time decay: offset shrinks near window close"],
+    ["ll+0.08", "Lead-lag bonus: BTC price confirms this alt's direction"],
+    ["pc=0.91", "Pair cost: UP avg + DN avg. Below $1.00 = structurally profitable"],
+    ["▲0.48 ▼0.49", "Resting bid prices: ▲=UP side, ▼=DOWN side"],
+    ["sz=36", "Bid size in tokens"],
+    ["inv=20/15", "Inventory: UP tokens / DOWN tokens held"],
+    ["chop=0.3", "Choppiness: how noisy the price action is (0-1)"],
+    ["bk=0.62/0.38", "Polymarket book mids: UP/DOWN token. Market consensus on outcome"],
+    ["disc=12%@calm", "Bid discount below book mid, varies by regime (osci/trend/calm/vol)"],
+    ["FLIP→", "Signal direction changed — requoting"],
+  ];
   return (
-    <Tip tip="Green = UP tokens, Red = DOWN tokens. Purple overlap = matched pairs. Fully matched inventory profits when pair cost < $1. One-sided (no overlap) loses full cost if that side loses.">
-      <svg width={W} height={H} className="cursor-help inline-block align-middle" style={{ borderRadius: 2, background: "#e5e7eb" }}>
-        {upW > 0 && <rect x={0} y={0} width={upW} height={H} fill="#22c55e" />}
-        {dnW > 0 && <rect x={redX} y={0} width={dnW} height={H} fill="#ef4444" />}
-        {overlapW > 0 && <rect x={overlapX} y={0} width={overlapW} height={H} fill="#a855f7" />}
-      </svg>
-    </Tip>
+    <details className="group mt-2">
+      <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
+        Legend
+      </summary>
+      <div className="mt-1.5 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-0.5 text-xs">
+        {items.map(([abbr, desc]) => (
+          <div key={abbr} className="flex gap-2">
+            <code className="shrink-0 font-mono text-[10px] bg-muted px-1 rounded">{abbr}</code>
+            <span className="text-muted-foreground">{desc}</span>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -266,16 +322,18 @@ function PieChart({ wins, losses, size = 48 }: { wins: number; losses: number; s
 
 // ── Extract overview stats from any strategy type ─────────────────────
 
-function extractOverviewStats(custom: Record<string, unknown> | undefined, strategyType: string, pnl: number) {
+function extractOverviewStats(custom: Record<string, unknown> | undefined, strategyType: string, pnl: number, riskCapital: number) {
   const isUnified = strategyType === "unified-adaptive";
+  const isOrchestrator = strategyType === "orchestrator";
 
-  // Sum totalBuyCost across all windows (active + completed) for capital efficiency
+  // Sum totalBuyCost across all windows for the tooltip (capital cycled)
   const allWindows = [
     ...((custom?.activeWindows as Array<{ totalBuyCost?: number }>) ?? []),
     ...((custom?.completedWindows as Array<{ totalBuyCost?: number }>) ?? []),
   ];
-  const totalCapitalUsed = allWindows.reduce((s, w) => s + (w.totalBuyCost ?? 0), 0);
-  const capitalEfficiency = totalCapitalUsed > 0 ? pnl / totalCapitalUsed : 0;
+  const totalCapitalCycled = allWindows.reduce((s, w) => s + (w.totalBuyCost ?? 0), 0);
+  // Return on risk: P&L vs capital allocated to the strategy
+  const returnOnRisk = riskCapital > 0 ? pnl / riskCapital : 0;
 
   if (isUnified) {
     const stats = custom?.stats as { windowsTraded?: number; sniperWins?: number; makerWins?: number; totalPnl?: number } | undefined;
@@ -283,14 +341,22 @@ function extractOverviewStats(custom: Record<string, unknown> | undefined, strat
     const wins = (stats?.sniperWins ?? 0) + (stats?.makerWins ?? 0);
     const losses = traded - wins;
     const winRate = traded > 0 ? wins / traded : 0;
-    return { traded, wins, losses, winRate, capitalEfficiency, totalCapitalUsed };
+    return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled };
+  }
+  if (isOrchestrator) {
+    const stats = custom?.stats as { windowsTraded?: number; perTactic?: Record<string, { wins?: number }> } | undefined;
+    const traded = stats?.windowsTraded ?? 0;
+    const wins = stats?.perTactic ? Object.values(stats.perTactic).reduce((s, t) => s + (t.wins ?? 0), 0) : 0;
+    const losses = traded - wins;
+    const winRate = traded > 0 ? wins / traded : 0;
+    return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled };
   }
   // Directional strategies
   const traded = (custom?.windowsTraded as number) ?? 0;
   const wins = (custom?.windowsWon as number) ?? 0;
   const losses = (custom?.windowsLost as number) ?? 0;
   const winRate = (custom?.directionalAccuracy as number) ?? (traded > 0 ? wins / traded : 0);
-  return { traded, wins, losses, winRate, capitalEfficiency, totalCapitalUsed };
+  return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled };
 }
 
 // ── Unified Adaptive detail section ───────────────────────────────────
@@ -301,6 +367,8 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
   isWindingDown?: boolean;
   config: StrategyConfig;
 }) {
+  const [mergingId, setMergingId] = useState<string | null>(null);
+  const [mergeMsg, setMergeMsg] = useState<string | null>(null);
   const stats = custom?.stats as {
     totalPnl: number; windowsTraded: number;
     sniperWindows: number; makerWindows: number;
@@ -314,7 +382,7 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
     globalAvgMatchRate: number; globalSampleCount: number;
   } | undefined;
   const allActiveWindows = (custom?.activeWindows as Array<{
-    market: { title: string }; cryptoSymbol: string; mode: string;
+    market: { title: string; conditionId?: string }; cryptoSymbol: string; mode: string;
     convictionSide: string | null; confirmedDirection: string | null;
     signalStrengthAtEntry: number; upInventory: number; downInventory: number;
     upAvgCost: number; downAvgCost: number;
@@ -326,6 +394,7 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
     lastUpBestAsk?: number; lastDnBestAsk?: number;
     rebalanceSold?: boolean;
     binancePrediction?: "UP" | "DOWN" | null;
+    tickAction?: string;
   }>) ?? [];
   const activeWindows = allActiveWindows.filter(w => w.windowEndTime > Date.now());
   const resolvingWindows = allActiveWindows.filter(w => w.windowEndTime <= Date.now());
@@ -439,182 +508,98 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
         );
       })()}
 
-      {/* Active windows */}
-      {activeWindows.length > 0 && (
-        <div>
-          <Tip tip="Binary prediction windows currently being traded. Each window is a crypto up-or-down market with a fixed time range">
-            <h4 className="mb-2 text-sm font-medium cursor-help">Active Windows</h4>
-          </Tip>
-          <div className="space-y-1.5">
-            {activeWindows.map((w, i) => {
-              const timeLeft = Math.max(0, w.windowEndTime - Date.now());
-              const mins = Math.floor(timeLeft / 60000);
-              const secs = Math.floor((timeLeft % 60000) / 1000);
-              const compact = compactTitle(w.market?.title ?? "") || w.cryptoSymbol;
-              const up = w.upInventory ?? 0;
-              const dn = w.downInventory ?? 0;
-              const matched = Math.min(up, dn);
-              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
-              return (
-                <div key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1.5 text-xs">
-                  <Tip tip={w.market?.title ?? "Crypto symbol being traded"}>
-                    <span className="font-medium cursor-help">{compact}</span>
-                  </Tip>
-                  <Tip tip="sniper = direction-agnostic spread capture. maker = signal-biased directional fills">
-                    <span><Badge variant="outline" className="text-[10px] px-1 py-0 cursor-help">{w.mode}</Badge></span>
-                  </Tip>
-                  <InventoryBar up={up} down={dn} scale={w.bidSize ?? 1} />
-                  <Tip tip="UP tokens / DOWN tokens held. Matched = min(UP,DOWN) — structurally profitable when pair cost < $1">
-                    <span className="tabular-nums cursor-help">
-                      <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                      {matched > 0 && <span className="text-purple-600 ml-0.5">({fmtInv(matched)}pr)</span>}
+      <WindowSection
+        sectionTitle="Active Windows"
+        sectionTip="Binary prediction windows currently being traded. Each window is a crypto up-or-down market with a fixed time range"
+        active={activeWindows.map((w, i) => {
+          const up = w.upInventory ?? 0;
+          const dn = w.downInventory ?? 0;
+          const matched = Math.min(up, dn);
+          const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+          return (
+            <ActiveWindowRow key={i}
+              title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+              chips={<>
+                <Tip tip="sniper = direction-agnostic spread capture. maker = signal-biased directional fills">
+                  <span><Badge variant="outline" className="text-[10px] px-1 py-0 cursor-help">{w.mode}</Badge></span>
+                </Tip>
+                {w.mode === "maker" && w.confirmedDirection && (
+                  <Tip tip={`Maker conviction: betting on ${w.confirmedDirection}. Strength at entry: ${((w.signalStrengthAtEntry ?? 0) * 100).toFixed(0)}%`}>
+                    <span className={`text-[10px] font-medium cursor-help ${w.confirmedDirection === "UP" ? "text-green-700" : "text-red-700"}`}>
+                      {w.confirmedDirection === "UP" ? "BULL" : "BEAR"}
                     </span>
                   </Tip>
-                  {pairCost !== null ? (
-                    <Tip tip="Average cost of one UP + one DOWN token. Below $1.00 = profit regardless of outcome. Target: 0.92">
-                      <span className={`tabular-nums font-medium cursor-help rounded px-1 py-0 text-[10px] ${
-                        pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                      }`}>pc={pairCost.toFixed(2)}</span>
-                    </Tip>
-                  ) : (
-                    <span className="tabular-nums text-[10px] text-muted-foreground rounded px-1 py-0 bg-gray-100">pc=—</span>
-                  )}
-                  {w.rebalanceSold && (
-                    <Tip tip="Window poisoned — rebalance sell triggered, quoting stopped to prevent churn">
-                      <span className="text-[10px] font-medium rounded px-1 py-0 bg-orange-100 text-orange-800 cursor-help">POISON</span>
-                    </Tip>
-                  )}
-                  <Tip tip="▲ = UP bid resting on CLOB, ▼ = DOWN bid resting. Dim = no active order (filled or cancelled for balance)">
-                    <span className="cursor-help">
-                      <span className={w.upBidOrderId ? "text-green-600" : "text-gray-300"}>▲</span>
-                      <span className={w.downBidOrderId ? "text-red-600" : "text-gray-300"}>▼</span>
-                    </span>
+                )}
+                {w.rebalanceSold && (
+                  <Tip tip="Window poisoned — rebalance sell triggered, quoting stopped to prevent churn">
+                    <span className="text-[10px] font-medium rounded px-1 py-0 bg-orange-100 text-orange-800 cursor-help">POISON</span>
                   </Tip>
-                  {w.mode === "maker" && w.confirmedDirection && (
-                    <Tip tip={`Maker conviction: betting on ${w.confirmedDirection}. Strength at entry: ${((w.signalStrengthAtEntry ?? 0) * 100).toFixed(0)}%`}>
-                      <span className={`text-[10px] font-medium cursor-help ${w.confirmedDirection === "UP" ? "text-green-700" : "text-red-700"}`}>
-                        {w.confirmedDirection === "UP" ? "BULL" : "BEAR"}
-                      </span>
-                    </Tip>
-                  )}
-                  {w.fillCount > 0 && <Tip tip="Number of maker fills"><span className="tabular-nums cursor-help">{w.fillCount}f</span></Tip>}
-                  <span className="ml-auto text-[11px] text-muted-foreground italic truncate max-w-[50%]" title={windowNarrative(w, { windingDown: isWindingDown })}>
-                    {windowNarrative(w, { windingDown: isWindingDown })}
-                  </span>
-                  <Tip tip={timeLeft === 0 ? "Window expired — waiting for Polymarket to confirm outcome" : "Time remaining until window closes and resolves"}>
-                    <span className={`tabular-nums cursor-help ${timeLeft === 0 ? "text-amber-500 animate-pulse" : "text-muted-foreground"}`}>
-                      {timeLeft === 0 ? "resolving…" : `${mins}:${secs.toString().padStart(2, "0")}`}
-                    </span>
-                  </Tip>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* Completed windows (resolving at top) */}
-      {(resolvingWindows.length > 0 || completedWindows.length > 0) && (
-        <div>
-          <h4 className="mb-2 text-sm font-medium">
-            Completed
-            <span className="ml-2 text-xs font-normal text-muted-foreground">
-              ({resolvingWindows.length > 0 ? `${resolvingWindows.length} resolving, ` : ""}last {Math.min(completedWindows.length, 20)})
-            </span>
-          </h4>
-          <div className="space-y-1">
-            {/* Resolving windows (past end time, awaiting Polymarket) */}
-            {resolvingWindows.map((w, i) => {
-              const up = w.upInventory ?? 0;
-              const dn = w.downInventory ?? 0;
-              const matched = Math.min(up, dn);
-              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
-              const compact = compactTitle(w.market?.title ?? "") || w.cryptoSymbol;
-              const prediction = w.binancePrediction ?? w.confirmedDirection;
-              const betSide = w.convictionSide || (up > dn ? "UP" : dn > up ? "DOWN" : null);
-              const willWin = prediction && betSide ? prediction === betSide : null;
-              // Estimate P&L if prediction is correct
-              const estPnl = prediction ? (() => {
-                const winSide = prediction === "UP" ? up : dn;
-                const loseSide = prediction === "UP" ? dn : up;
-                const winCost = prediction === "UP" ? (w.upAvgCost ?? 0) : (w.downAvgCost ?? 0);
-                const loseCost = prediction === "UP" ? (w.downAvgCost ?? 0) : (w.upAvgCost ?? 0);
-                return winSide * (1.0 - winCost) - loseSide * loseCost - (w.realizedSellPnl ? -w.realizedSellPnl : 0);
-              })() : null;
-              return (
-                <div key={`r-${i}`} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border border-amber-300 bg-amber-50/50 px-2 py-1 text-xs">
-                  <Tip tip={w.market?.title ?? ""}><span className="font-medium cursor-help">{compact}</span></Tip>
-                  <span className="rounded px-1 py-0 text-[10px] font-medium bg-amber-100 text-amber-800 animate-pulse">resolving</span>
-                  <InventoryBar up={up} down={dn} scale={w.bidSize ?? 1} />
-                  <span className="tabular-nums">
-                    <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                    {matched > 0 && <span className="text-purple-600 ml-0.5">({fmtInv(matched)}pr)</span>}
-                  </span>
-                  {pairCost !== null && (
-                    <span className={`tabular-nums font-medium rounded px-1 py-0 text-[10px] ${
-                      pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                    }`}>pc={pairCost.toFixed(2)}</span>
-                  )}
-                  <span className="ml-auto text-[11px] text-muted-foreground italic">
-                    {prediction
-                      ? <>
-                          {willWin === true ? `Binance predicts win (${prediction})`
-                            : willWin === false ? `Binance predicts loss (${prediction})`
-                            : `Binance says ${prediction}`}
-                          {estPnl !== null && <span className={`ml-1 font-medium ${estPnl >= 0 ? "text-green-600" : "text-red-600"}`}>≈{estPnl >= 0 ? "+" : ""}{fmt(estPnl)}</span>}
-                        </>
-                      : "awaiting Polymarket…"}
-                  </span>
-                </div>
-              );
-            })}
-            {completedWindows.slice(-20).reverse().map((w, i) => {
-              const up = w.upInventory ?? 0;
-              const dn = w.downInventory ?? 0;
-              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
-              return (
-                <div key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1 text-xs">
-                  <Tip tip={w.title}><span className="font-medium cursor-help">{compactTitle(w.title) || w.cryptoSymbol}</span></Tip>
-                  <Tip tip="Mode used for this window (sniper or maker)">
-                    <span><Badge variant="outline" className="text-[10px] px-1 py-0 cursor-help">{w.mode}</Badge></span>
-                  </Tip>
-                  <Tip tip="Market resolution outcome — which side won">
-                    <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${
-                      w.outcome === "UP" ? "bg-green-100 text-green-800" : w.outcome === "DOWN" ? "bg-red-100 text-red-800" : "bg-gray-100"
-                    }`}>{w.outcome}</span>
-                  </Tip>
-                  <InventoryBar up={up} down={dn} scale={w.bidSize ?? 1} />
-                  <Tip tip="UP tokens / DOWN tokens held. Matched = min(UP,DOWN) — structurally profitable when pair cost < $1">
-                    <span className="tabular-nums cursor-help">
-                      <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                      <span className="text-purple-600 ml-0.5">({w.matchedPairs}pr)</span>
-                    </span>
-                  </Tip>
-                  {pairCost !== null ? (
-                    <Tip tip="Average cost of one UP + one DOWN token. Below $1.00 = profit regardless of outcome. Target: 0.92">
-                      <span className={`tabular-nums font-medium cursor-help rounded px-1 py-0 text-[10px] ${
-                        pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                      }`}>pc={pairCost.toFixed(2)}</span>
-                    </Tip>
-                  ) : (
-                    <span className="tabular-nums text-[10px] text-muted-foreground rounded px-1 py-0 bg-gray-100">pc=—</span>
-                  )}
-                  <Tip tip="Net P&L for this window after resolution, costs, and fees">
-                    <span className={`font-medium tabular-nums cursor-help ${w.netPnl >= 0 ? "text-green-600" : "text-red-600"}`}>
-                      {fmt(w.netPnl)}
-                    </span>
-                  </Tip>
-                  <Tip tip="Total maker fills in this window"><span className="tabular-nums text-muted-foreground cursor-help">{w.fillCount}f</span></Tip>
-                  {w.windowDurationMs > 0 && (
-                    <Tip tip="Duration of the prediction window"><span className="text-muted-foreground cursor-help">{fmtDuration(w.windowDurationMs)}</span></Tip>
-                  )}
-                  <Tip tip="When this window was resolved"><span className="ml-auto text-muted-foreground cursor-help">{timeAgo(w.completedAt)}</span></Tip>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+                )}
+              </>}
+              up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+              scale={w.bidSize ?? 1} pairCost={pairCost}
+              upBidActive={!!w.upBidOrderId} dnBidActive={!!w.downBidOrderId}
+              fillCount={w.fillCount ?? 0}
+              onMerge={isActive && matched > 0 && pairCost !== null && pairCost < 1 && w.market.conditionId ? async () => {
+                const cid = w.market.conditionId!;
+                setMergingId(cid);
+                setMergeMsg(null);
+                try {
+                  const res = await api.strategyMerge(config.id, cid, matched);
+                  setMergeMsg(res.status === "merged"
+                    ? `Merged ${res.merged} pairs → +$${res.pnl?.toFixed(2)}${res.duration_ms ? ` (${res.duration_ms}ms)` : ""}`
+                    : `Failed: ${(res as Record<string, unknown>).error || "unknown"}`);
+                } catch (e) { setMergeMsg(`Error: ${e}`); }
+                finally { setMergingId(null); }
+              } : undefined}
+              merging={mergingId === w.market.conditionId}
+              tickAction={w.tickAction ? <TickAction text={w.tickAction} /> : undefined}
+              narrative={windowNarrative(w, { windingDown: isWindingDown })}
+              timeLeftMs={Math.max(0, w.windowEndTime - Date.now())}
+            />
+          );
+        })}
+        resolving={resolvingWindows.map((w, i) => {
+          const up = w.upInventory ?? 0;
+          const dn = w.downInventory ?? 0;
+          const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+          const prediction = (w.binancePrediction ?? w.confirmedDirection) as "UP" | "DOWN" | null;
+          const betSide = w.convictionSide || (up > dn ? "UP" : dn > up ? "DOWN" : null);
+          const willWin = prediction && betSide ? prediction === betSide : null;
+          const estPnl = prediction ? (() => {
+            const winSide = prediction === "UP" ? up : dn;
+            const loseSide = prediction === "UP" ? dn : up;
+            const winCost = prediction === "UP" ? (w.upAvgCost ?? 0) : (w.downAvgCost ?? 0);
+            const loseCost = prediction === "UP" ? (w.downAvgCost ?? 0) : (w.upAvgCost ?? 0);
+            return winSide * (1.0 - winCost) - loseSide * loseCost - (w.realizedSellPnl ? -w.realizedSellPnl : 0);
+          })() : null;
+          return (
+            <ResolvingWindowRow key={`r-${i}`}
+              title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+              up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+              scale={w.bidSize ?? 1} pairCost={pairCost}
+              prediction={prediction} estPnl={estPnl}
+              predictionText={prediction ? (willWin === true ? `Binance predicts win (${prediction})` : willWin === false ? `Binance predicts loss (${prediction})` : undefined) : undefined}
+            />
+          );
+        })}
+        completed={completedWindows.slice(-20).reverse().map((w, i) => {
+          const up = w.upInventory ?? 0;
+          const dn = w.downInventory ?? 0;
+          const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+          return (
+            <CompletedWindowRow key={i}
+              title={w.title} compact={compactTitle(w.title) || w.cryptoSymbol}
+              outcome={w.outcome}
+              chips={<Tip tip="Mode used for this window (sniper or maker)"><span><Badge variant="outline" className="text-[10px] px-1 py-0 cursor-help">{w.mode}</Badge></span></Tip>}
+              up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+              scale={w.bidSize ?? 1} pairCost={pairCost}
+              netPnl={w.netPnl} fillCount={w.fillCount}
+              durationMs={w.windowDurationMs} completedAt={w.completedAt}
+            />
+          );
+        })}
+      />
 
       {/* Liquidity buckets */}
       {bucketEntries.length > 0 && (
@@ -641,6 +626,215 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
   );
 }
 
+// ── Params editor ────────────────────────────────────────────────────
+
+function ParamsEditor({
+  config,
+  isActive,
+  isWindingDown,
+  hasTicks,
+  onSave,
+  onClone,
+  onReset,
+}: {
+  config: StrategyConfig;
+  isActive: boolean;
+  isWindingDown?: boolean;
+  hasTicks: boolean;
+  onSave: (updates: Partial<StrategyConfig>) => Promise<void>;
+  onClone: (config: Partial<StrategyConfig>) => Promise<void>;
+  onReset?: () => void;
+}) {
+  const parseParams = (p: string | Record<string, unknown>) => {
+    try { return typeof p === "string" ? JSON.parse(p || "{}") : (p ?? {}); }
+    catch { return {}; }
+  };
+
+  const [fields, setFields] = useState({
+    name: config.name,
+    mode: config.mode,
+    tick_interval_ms: config.tick_interval_ms,
+    max_capital_usd: config.max_capital_usd,
+    balance_usd: config.balance_usd,
+  });
+  const [params, setParams] = useState<Record<string, unknown>>(parseParams(config.params));
+  const [newKey, setNewKey] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const origParams = parseParams(config.params);
+  const hasChanges =
+    fields.name !== config.name ||
+    fields.mode !== config.mode ||
+    fields.tick_interval_ms !== config.tick_interval_ms ||
+    fields.max_capital_usd !== config.max_capital_usd ||
+    fields.balance_usd !== config.balance_usd ||
+    JSON.stringify(params) !== JSON.stringify(origParams);
+
+  const handleSave = async (resetStats = false) => {
+    setSaving(true);
+    try {
+      await onSave({
+        name: fields.name, mode: fields.mode,
+        tick_interval_ms: fields.tick_interval_ms,
+        max_capital_usd: fields.max_capital_usd,
+        balance_usd: fields.balance_usd,
+        params: JSON.stringify(params),
+      });
+      if (resetStats && onReset) await onReset();
+    } finally { setSaving(false); }
+  };
+
+  const handleClone = async () => {
+    setSaving(true);
+    try {
+      await onClone({
+        name: `${fields.name} (copy)`,
+        strategy_type: config.strategy_type,
+        mode: fields.mode,
+        max_capital_usd: fields.max_capital_usd,
+        balance_usd: fields.balance_usd,
+        params: JSON.stringify(params),
+      });
+    } finally { setSaving(false); }
+  };
+
+  const updateParam = (key: string, value: unknown) => setParams(prev => ({ ...prev, [key]: value }));
+  const removeParam = (key: string) => setParams(prev => { const n = { ...prev }; delete n[key]; return n; });
+  const addParam = () => { if (newKey.trim()) { updateParam(newKey.trim(), ""); setNewKey(""); } };
+
+  const renderInput = (key: string, value: unknown) => {
+    if (typeof value === "boolean") {
+      return <input type="checkbox" checked={value} onChange={(e) => updateParam(key, e.target.checked)} className="rounded border" />;
+    }
+    if (typeof value === "number") {
+      return (
+        <input type="number" value={value} step="any"
+          onChange={(e) => updateParam(key, e.target.value === "" ? 0 : parseFloat(e.target.value))}
+          className="h-7 w-full rounded border bg-background px-2 text-xs font-mono tabular-nums" />
+      );
+    }
+    if (typeof value === "string") {
+      return (
+        <input type="text" value={value}
+          onChange={(e) => updateParam(key, e.target.value)}
+          className="h-7 w-full rounded border bg-background px-2 text-xs font-mono" />
+      );
+    }
+    return (
+      <textarea value={JSON.stringify(value, null, 2)}
+        onChange={(e) => { try { updateParam(key, JSON.parse(e.target.value)); } catch { /* typing */ } }}
+        className="w-full rounded border bg-background px-2 py-1 text-xs font-mono min-h-[60px]" />
+    );
+  };
+
+  return (
+    <details className="group">
+      <summary className="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground">
+        Configuration Parameters
+        {hasChanges && <span className="ml-2 text-amber-500 text-xs">(unsaved changes)</span>}
+      </summary>
+      <div className="mt-2 space-y-3">
+        {/* Config-level fields */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          <div>
+            <label className="text-[10px] text-muted-foreground">Name</label>
+            <input type="text" value={fields.name}
+              onChange={(e) => setFields(f => ({ ...f, name: e.target.value }))}
+              className="h-7 w-full rounded border bg-background px-2 text-xs" />
+          </div>
+          <div>
+            <label className="text-[10px] text-muted-foreground">Mode</label>
+            <select value={fields.mode}
+              onChange={(e) => setFields(f => ({ ...f, mode: e.target.value as "paper" | "real" }))}
+              className="h-7 w-full rounded border bg-background px-2 text-xs">
+              <option value="paper">Paper</option>
+              <option value="real">Real</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-[10px] text-muted-foreground">Tick (ms)</label>
+            <input type="number" value={fields.tick_interval_ms}
+              onChange={(e) => setFields(f => ({ ...f, tick_interval_ms: parseInt(e.target.value) || 5000 }))}
+              className="h-7 w-full rounded border bg-background px-2 text-xs font-mono" />
+          </div>
+          <div>
+            <label className="text-[10px] text-muted-foreground">Max Capital ($)</label>
+            <input type="number" value={fields.max_capital_usd}
+              onChange={(e) => setFields(f => ({ ...f, max_capital_usd: parseFloat(e.target.value) || 0 }))}
+              className="h-7 w-full rounded border bg-background px-2 text-xs font-mono" />
+          </div>
+          <div>
+            <label className="text-[10px] text-muted-foreground">Balance ($)</label>
+            <input type="number" value={fields.balance_usd ?? ""} placeholder="—"
+              onChange={(e) => setFields(f => ({ ...f, balance_usd: e.target.value ? parseFloat(e.target.value) : null }))}
+              className="h-7 w-full rounded border bg-background px-2 text-xs font-mono" />
+          </div>
+          {fields.balance_usd != null && (
+            <>
+              <div>
+                <label className="text-[10px] text-muted-foreground">Reinvest %</label>
+                <input type="number" value={(params.profit_reinvest_pct as number) ?? 0} step="0.05" min="0" max="1"
+                  onChange={(e) => updateParam("profit_reinvest_pct", e.target.value === "" ? 0 : parseFloat(e.target.value))}
+                  className="h-7 w-full rounded border bg-background px-2 text-xs font-mono" />
+              </div>
+              <div>
+                <label className="text-[10px] text-muted-foreground">Capital Cap ($)</label>
+                <input type="number" value={(params.max_capital_cap_usd as number) || ""} placeholder="no limit"
+                  onChange={(e) => updateParam("max_capital_cap_usd", e.target.value === "" ? 0 : parseFloat(e.target.value))}
+                  className="h-7 w-full rounded border bg-background px-2 text-xs font-mono" />
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Strategy params */}
+        <div>
+          <div className="text-[10px] font-medium text-muted-foreground mb-1">Strategy Parameters</div>
+          <div className="space-y-1">
+            {Object.entries(params).filter(([key]) => key !== "profit_reinvest_pct" && key !== "max_capital_cap_usd").sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => (
+              <div key={key} className="flex items-start gap-2">
+                <label className="text-xs font-mono text-muted-foreground pt-1.5 min-w-[140px] truncate" title={key}>{key}</label>
+                <div className="flex-1 min-w-0">{renderInput(key, value)}</div>
+                <button onClick={() => removeParam(key)} className="text-xs text-muted-foreground hover:text-red-500 pt-1.5 shrink-0" title="Remove">&times;</button>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 mt-2">
+            <input type="text" value={newKey} onChange={(e) => setNewKey(e.target.value)}
+              placeholder="new_param_name" className="h-7 rounded border bg-background px-2 text-xs font-mono flex-1"
+              onKeyDown={(e) => e.key === "Enter" && addParam()} />
+            <Button size="sm" variant="outline" className="h-7 text-xs px-2" onClick={addParam} disabled={!newKey.trim()}>+ Add</Button>
+          </div>
+        </div>
+
+        {/* Actions */}
+        <div className="flex flex-wrap items-center gap-2 pt-2 border-t">
+          <Button size="sm" className="h-7 text-xs px-3" onClick={() => handleSave(false)} disabled={!hasChanges || saving}>
+            {saving ? "Saving..." : "Save"}
+          </Button>
+          {hasChanges && !isActive && !isWindingDown && onReset && (
+            <Button size="sm" variant="outline" className="h-7 text-xs px-3"
+              onClick={() => { if (confirm("Save changes AND reset all stats, trades, and logs?")) handleSave(true); }}
+              disabled={saving}>
+              Save &amp; Reset
+            </Button>
+          )}
+          <Button size="sm" variant="outline" className="h-7 text-xs px-3" onClick={handleClone} disabled={saving}>Clone</Button>
+          {!isActive && !isWindingDown && onReset && hasTicks && (
+            <button onClick={() => { if (confirm("Reset all stats, trades, and logs? Config will be kept.")) onReset(); }}
+              className="text-xs text-muted-foreground hover:text-red-600 underline ml-auto">
+              Reset stats &amp; trades
+            </button>
+          )}
+          {isActive && hasChanges && (
+            <span className="text-[10px] text-amber-500 ml-auto">Restart strategy to apply changes</span>
+          )}
+        </div>
+      </div>
+    </details>
+  );
+}
+
 // ── Strategy detail (all types) ───────────────────────────────────────
 
 function StrategyDetail({
@@ -650,6 +844,8 @@ function StrategyDetail({
   state,
   balanceProtection,
   onReset,
+  onSave,
+  onClone,
 }: {
   config: StrategyConfig;
   isActive: boolean;
@@ -657,12 +853,18 @@ function StrategyDetail({
   state: StrategyState | null;
   balanceProtection?: BalanceProtection | null;
   onReset?: () => void;
+  onSave: (updates: Partial<StrategyConfig>) => Promise<void>;
+  onClone: (config: Partial<StrategyConfig>) => Promise<void>;
 }) {
   const logs = state?.logs ?? [];
   const custom = state?.custom as Record<string, unknown> | undefined;
-  const isDirectional = config.strategy_type === "directional-taker" || config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "conviction-maker";
+  const isConviction = config.strategy_type === "conviction-maker";
+  const isDirectional = config.strategy_type === "directional-taker" || config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "enhanced-maker" || config.strategy_type === "scaling-safe-maker";
   const isUnified = config.strategy_type === "unified-adaptive";
-  const isMaker = config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "conviction-maker";
+  const isOrchestrator = config.strategy_type === "orchestrator";
+  const isMaker = config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "conviction-maker" || config.strategy_type === "enhanced-maker" || config.strategy_type === "scaling-safe-maker";
+  const isCertaintyTaker = config.strategy_type === "certainty-taker";
+  const isAvellaneda = config.strategy_type === "avellaneda-maker";
 
   const positions = (custom?.positions as Array<{
     market: { title: string };
@@ -685,11 +887,13 @@ function StrategyDetail({
     upBidOrderId: string | null; downBidOrderId: string | null;
     upBidPrice: number; downBidPrice: number;
     totalBuyCost: number; realizedSellPnl: number; windowEndTime: number;
-    buyCount: number; sellCount: number; phase: string;
-    fillCount?: number; flipCount: number; bidSize: number;
+    buyCount?: number; sellCount: number; phase?: string;
+    fillCount?: number; flipCount: number;
+    upBidSize?: number; downBidSize?: number; bidSize?: number;
     lastUpBestAsk?: number; lastDnBestAsk?: number;
     rebalanceSold?: boolean;
     binancePrediction?: "UP" | "DOWN" | null;
+    tickAction?: string;
   }>) ?? [];
   const activeWindows = allActiveWindows.filter(w => w.windowEndTime > Date.now());
   const resolvingWindows = allActiveWindows.filter(w => w.windowEndTime <= Date.now());
@@ -697,10 +901,10 @@ function StrategyDetail({
     title: string; convictionSide: string | null; outcome: string;
     winningPayout: number; losingLoss: number; realizedSellPnl: number;
     netPnl: number; totalBuyCost: number; signalStrength: number;
-    correct: boolean; buyCount: number; sellCount: number;
+    correct: boolean; buyCount?: number; sellCount: number;
     fillCount?: number; flipCount: number; completedAt: string;
     upInventory: number; downInventory: number;
-    upAvgCost: number; downAvgCost: number; bidSize: number;
+    upAvgCost: number; downAvgCost: number; bidSize?: number;
   }>) ?? [];
   const windowsTraded = (custom?.windowsTraded as number) ?? 0;
   const windowsWon = (custom?.windowsWon as number) ?? 0;
@@ -747,7 +951,7 @@ function StrategyDetail({
                 <div className="text-xs text-muted-foreground">Capital Deployed</div>
                 <div className="text-lg font-bold tabular-nums">{fmt(deployed)}</div>
                 <div className="text-xs text-muted-foreground">
-                  / {fmt(config.max_capital_usd)} max
+                  / {fmt(balanceProtection?.effective_max_capital ?? config.max_capital_usd)} max
                   {matchedCapital > 1 && <span className="text-green-600"> ({fmt(matchedCapital)} in pairs)</span>}
                 </div>
               </div>
@@ -782,8 +986,8 @@ function StrategyDetail({
               <div className="text-xs text-muted-foreground">Working Capital</div>
               <div className={`text-lg font-bold tabular-nums ${
                 balanceProtection.working_capital <= 0 ? "text-red-600" :
-                balanceProtection.working_capital < (config.lock_increment_usd ?? config.balance_usd) * 0.25 ? "text-red-500" :
-                balanceProtection.working_capital < (config.lock_increment_usd ?? config.balance_usd) * 0.5 ? "text-amber-500" :
+                balanceProtection.working_capital < (config.balance_usd ?? 0) * 0.25 ? "text-red-500" :
+                balanceProtection.working_capital < (config.balance_usd ?? 0) * 0.5 ? "text-amber-500" :
                 "text-green-600"
               }`}>
                 {fmt(balanceProtection.working_capital)}
@@ -839,11 +1043,467 @@ function StrategyDetail({
         );
       })()}
 
+      {/* Legend for tickAction abbreviations */}
+      <TickActionLegend />
+
       {/* Unified Adaptive detail */}
       {isUnified && <UnifiedDetail custom={custom} isActive={isActive} isWindingDown={isWindingDown} config={config} />}
 
-      {/* Sniper / generic active windows (not directional, not unified) */}
-      {!isDirectional && !isUnified && (() => {
+      {/* Orchestrator detail */}
+      {isOrchestrator && (() => {
+        const orchStats = custom?.stats as { totalPnl?: number; windowsTraded?: number; perTactic?: Record<string, { windows: number; pnl: number; wins: number }>; perRegime?: Record<string, { windows: number; pnl: number }> } | undefined;
+        const scanStatus = (custom?.scanStatus as string) ?? "";
+        const assetRegimes = custom?.assetRegimes as Record<string, { confirmedRegime: string; confidence: number; streak: number; emaScores?: Record<string, number> }> | undefined;
+        const orchActiveWindows = (custom?.activeWindows as Array<{
+          market: { title: string }; cryptoSymbol: string; tacticId: string;
+          confirmedDirection: string | null;
+          upInventory: number; downInventory: number;
+          upAvgCost: number; downAvgCost: number;
+          upBidOrderId: string | null; downBidOrderId: string | null;
+          upBidPrice: number; downBidPrice: number;
+          fillCount: number; sellCount: number; flipCount: number;
+          windowEndTime: number; windowOpenTime: number; tickAction?: string;
+          lastUpBestAsk?: number; lastDnBestAsk?: number;
+        }>) ?? [];
+        const orchCompletedWindows = (custom?.completedWindows as Array<{
+          title: string; cryptoSymbol: string; tacticId: string; regime: string;
+          outcome: string; matchedPairs: number; netPnl: number; fillCount: number;
+          completedAt: string; windowDurationMs: number;
+        }>) ?? [];
+        const activeWins = orchActiveWindows.filter(w => w.windowEndTime > Date.now());
+        const resolvingWins = orchActiveWindows.filter(w => w.windowEndTime <= Date.now());
+
+        return (
+          <div className="space-y-4">
+            {/* Per-tactic stats */}
+            {orchStats && orchStats.windowsTraded && orchStats.windowsTraded > 0 && (
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {Object.entries(orchStats.perTactic ?? {}).map(([tid, ts]) => (
+                  <div key={tid} className="rounded-lg border p-2">
+                    <div className="text-xs font-medium">{tid}</div>
+                    <div className="flex flex-wrap gap-x-2 text-[11px] text-muted-foreground">
+                      <span>{ts.windows}w</span>
+                      <span className={ts.pnl >= 0 ? "text-green-500" : "text-red-500"}>{fmt(ts.pnl)}</span>
+                      <span>{ts.windows > 0 ? ((ts.wins / ts.windows) * 100).toFixed(0) : 0}%</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Regime status */}
+            {assetRegimes && Object.keys(assetRegimes).length > 0 && (
+              <div>
+                <h4 className="text-xs font-medium text-muted-foreground mb-1">Regime Status</h4>
+                <div className="grid grid-cols-2 gap-1 sm:grid-cols-3">
+                  {Object.entries(assetRegimes).map(([key, rs]) => (
+                    <div key={key} className="rounded border px-2 py-1 text-[11px]">
+                      <span className="font-medium">{key}</span>{" "}
+                      <Badge variant="outline" className="text-[9px] ml-1">{rs.confirmedRegime}</Badge>
+                      <span className="text-muted-foreground ml-1">{(rs.confidence * 100).toFixed(0)}% s={rs.streak}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Scan status */}
+            {scanStatus && <div className="text-xs text-muted-foreground">{scanStatus}</div>}
+
+            {/* Active windows */}
+            {activeWins.length > 0 && (
+              <div>
+                <h4 className="text-xs font-medium text-muted-foreground mb-1">Active Windows ({activeWins.length})</h4>
+                <div className="rounded-lg border overflow-hidden">
+                  <Table>
+                    <TableHeader><TableRow>
+                      <TableHead className="text-[10px] py-1 px-2">Market</TableHead>
+                      <TableHead className="text-[10px] py-1 px-2">Tactic</TableHead>
+                      <TableHead className="text-[10px] py-1 px-2">Inv</TableHead>
+                      <TableHead className="text-[10px] py-1 px-2">Action</TableHead>
+                    </TableRow></TableHeader>
+                    <TableBody>
+                      {activeWins.map((w, i) => {
+                        const pairCost = w.upInventory > 0 && w.downInventory > 0 ? w.upAvgCost + w.downAvgCost : 0;
+                        return (
+                          <TableRow key={i}>
+                            <TableCell className="text-[11px] py-1 px-2">{compactTitle(w.market.title) || w.market.title.slice(0, 25)}</TableCell>
+                            <TableCell className="text-[11px] py-1 px-2">
+                              <Badge variant="outline" className="text-[9px]">{w.tacticId}</Badge>
+                            </TableCell>
+                            <TableCell className="text-[11px] py-1 px-2">
+                              {fmtInv(w.upInventory)}↑/{fmtInv(w.downInventory)}↓
+                              {pairCost > 0 && <span className={`ml-1 ${pairCost < 0.93 ? "text-green-500" : "text-red-500"}`}>pc={pairCost.toFixed(2)}</span>}
+                            </TableCell>
+                            <TableCell className="text-[11px] py-1 px-2 text-muted-foreground">{w.tickAction ?? ""}</TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+            )}
+
+            {/* Resolving */}
+            {resolvingWins.length > 0 && (
+              <div className="text-xs text-muted-foreground">{resolvingWins.length} window(s) awaiting resolution</div>
+            )}
+
+            {/* Completed windows (last 10) */}
+            {orchCompletedWindows.length > 0 && (
+              <div>
+                <h4 className="text-xs font-medium text-muted-foreground mb-1">Recent Completed ({orchCompletedWindows.length})</h4>
+                <div className="rounded-lg border overflow-hidden">
+                  <Table>
+                    <TableHeader><TableRow>
+                      <TableHead className="text-[10px] py-1 px-2">Market</TableHead>
+                      <TableHead className="text-[10px] py-1 px-2">Tactic</TableHead>
+                      <TableHead className="text-[10px] py-1 px-2">Regime</TableHead>
+                      <TableHead className="text-[10px] py-1 px-2">Result</TableHead>
+                      <TableHead className="text-[10px] py-1 px-2">P&L</TableHead>
+                    </TableRow></TableHeader>
+                    <TableBody>
+                      {orchCompletedWindows.slice(-10).reverse().map((w, i) => (
+                        <TableRow key={i}>
+                          <TableCell className="text-[11px] py-1 px-2">{compactTitle(w.title) || w.title.slice(0, 25)}</TableCell>
+                          <TableCell className="text-[11px] py-1 px-2"><Badge variant="outline" className="text-[9px]">{w.tacticId}</Badge></TableCell>
+                          <TableCell className="text-[11px] py-1 px-2"><Badge variant="outline" className="text-[9px]">{w.regime}</Badge></TableCell>
+                          <TableCell className="text-[11px] py-1 px-2">{w.outcome} ({w.matchedPairs}p)</TableCell>
+                          <TableCell className={`text-[11px] py-1 px-2 ${w.netPnl >= 0 ? "text-green-500" : "text-red-500"}`}>{fmt(w.netPnl)}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Conviction Maker — single-sided inventory windows */}
+      {isConviction && (() => {
+        const cvWindows = (custom?.activeWindows as Array<{
+          market: { title: string }; cryptoSymbol: string;
+          convictionDirection: string; confirmedDirection: string | null;
+          signalStrengthAtEntry: number;
+          upInventory: number; downInventory: number;
+          upAvgCost: number; downAvgCost: number;
+          bidOrderId: string | null; bidSide: string | null;
+          bidPrice: number; bidSize: number;
+          fillPhase: string;
+          totalBuyCost: number; windowEndTime: number;
+          fillCount: number; flipCount: number;
+          tickAction?: string;
+          binancePrediction?: "UP" | "DOWN" | null;
+        }>) ?? [];
+        const cvActive = cvWindows.filter(w => w.windowEndTime > Date.now());
+        const cvResolving = cvWindows.filter(w => w.windowEndTime <= Date.now());
+        const cvCompleted = (custom?.completedWindows as Array<{
+          title: string; convictionSide: string; outcome: string;
+          upInventory: number; downInventory: number;
+          upAvgCost: number; downAvgCost: number;
+          netPnl: number; signalStrength: number; fillCount: number;
+          correct: boolean; completedAt: string; flipCount: number;
+        }>) ?? [];
+        const maxFlips = ((typeof config.params === "object" ? config.params as Record<string, unknown> : {})?.max_flips_before_sit_out as number) ?? 2;
+
+        return (
+          <WindowSection
+            sectionTitle="Active Windows"
+            sectionTip="Conviction windows: single-sided bets on confident signals. Only bids on one side, holds to resolution."
+            active={cvActive.map((w, i) => {
+              const side = (w.convictionDirection ?? w.confirmedDirection) as "UP" | "DOWN" | null;
+              const inv = side === "UP" ? (w.upInventory ?? 0) : (w.downInventory ?? 0);
+              const cost = side === "UP" ? (w.upAvgCost ?? 0) : (w.downAvgCost ?? 0);
+              return (
+                <SingleSideActiveRow key={i}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  chips={side ? (
+                    <Tip tip={`Conviction: betting ${side} at ${((w.signalStrengthAtEntry ?? 0) * 100).toFixed(0)}% signal. Phase: ${w.fillPhase ?? "?"}`}>
+                      <span className={`rounded px-1.5 py-0 text-[10px] font-bold cursor-help ${
+                        side === "UP" ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"
+                      }`}>{side} {((w.signalStrengthAtEntry ?? 0) * 100).toFixed(0)}%</span>
+                    </Tip>
+                  ) : undefined}
+                  inventory={inv} inventorySide={side}
+                  avgCost={cost} scale={w.bidSize ?? 30}
+                  bidOrderId={w.bidOrderId} bidSide={w.bidSide} bidPrice={w.bidPrice ?? 0}
+                  fillCount={w.fillCount} flipCount={w.flipCount} maxFlips={maxFlips}
+                  tickAction={w.tickAction ? <TickAction text={w.tickAction} /> : undefined}
+                  timeLeftMs={Math.max(0, w.windowEndTime - Date.now())}
+                />
+              );
+            })}
+            resolving={cvResolving.map((w, i) => {
+              const side = (w.convictionDirection ?? w.confirmedDirection) as "UP" | "DOWN" | null;
+              const inv = side === "UP" ? (w.upInventory ?? 0) : (w.downInventory ?? 0);
+              const cost = side === "UP" ? (w.upAvgCost ?? 0) : (w.downAvgCost ?? 0);
+              const prediction = (w.binancePrediction ?? w.confirmedDirection) as "UP" | "DOWN" | null;
+              const willWin = prediction && side ? prediction === side : null;
+              const estPnl = prediction && inv > 0 ? (
+                prediction === side ? inv * (1.0 - cost) : -(inv * cost)
+              ) : null;
+              return (
+                <SingleSideResolvingRow key={`r-${i}`}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  chips={side ? (
+                    <span className={`font-medium ${side === "UP" ? "text-green-600" : "text-red-600"}`}>
+                      {side} {((w.signalStrengthAtEntry ?? 0) * 100).toFixed(0)}%
+                    </span>
+                  ) : undefined}
+                  inventory={inv} inventorySide={side}
+                  avgCost={cost} scale={w.bidSize ?? 30}
+                  prediction={prediction} estPnl={estPnl}
+                  predictionText={prediction ? (willWin === true ? `Predicts win (${prediction})` : willWin === false ? `Predicts loss (${prediction})` : undefined) : undefined}
+                />
+              );
+            })}
+            completed={cvCompleted.slice(-20).reverse().map((w, i) => {
+              const side = w.convictionSide as "UP" | "DOWN" | null;
+              const inv = side === "UP" ? (w.upInventory ?? 0) : (w.downInventory ?? 0);
+              const cost = side === "UP" ? (w.upAvgCost ?? 0) : (w.downAvgCost ?? 0);
+              return (
+                <SingleSideCompletedRow key={i}
+                  title={w.title} compact={compactTitle(w.title) || w.title?.slice(0, 25)}
+                  chips={side ? (
+                    <Tip tip={w.correct ? "Conviction matched outcome" : "Conviction was wrong"}>
+                      <span className={`cursor-help ${w.correct ? "text-green-600 font-medium" : "text-red-600 font-medium"}`}>
+                        {side}{w.correct ? " +" : " -"}
+                      </span>
+                    </Tip>
+                  ) : <span className="text-muted-foreground">--</span>}
+                  inventory={inv} inventorySide={side}
+                  avgCost={cost} scale={Math.max(inv, 1)}
+                  netPnl={w.netPnl ?? 0} fillCount={w.fillCount ?? 0} flipCount={w.flipCount}
+                  completedAt={w.completedAt}
+                />
+              );
+            })}
+          />
+        );
+      })()}
+
+      {/* Certainty Taker windows */}
+      {isCertaintyTaker && (() => {
+        const ctWindows = (custom?.activeWindows as Array<{
+          market: { title: string }; cryptoSymbol: string;
+          strikePrice: number | null; strikeDirection: string;
+          windowEndTime: number; windowDurationMs: number;
+          lastPTrue: number; lastDelta: number; lastSpotPrice: number;
+          winningSide: string | null;
+          inventory: number; avgCost: number; inventorySide: string | null;
+          totalCost: number; totalFees: number; fillCount: number;
+          tickAction?: string;
+          binancePrediction?: "UP" | "DOWN" | null;
+        }>) ?? [];
+        const ctActive = ctWindows.filter(w => w.windowEndTime > Date.now());
+        const ctResolving = ctWindows.filter(w => w.windowEndTime <= Date.now());
+        const ctCompleted = (custom?.completedWindows as Array<{
+          title: string; cryptoSymbol: string; outcome: string; winningSide: string | null;
+          inventory: number; avgCost: number; totalCost: number; totalFees: number;
+          netPnl: number; fillCount: number; correct: boolean; completedAt: string;
+          lastPTrue: number;
+        }>) ?? [];
+        const minPTrue = ((typeof config.params === "object" ? config.params as Record<string, unknown> : {})?.min_p_true as number) ?? 0.95;
+        return (
+          <WindowSection
+            sectionTitle="Active Windows"
+            sectionTip="Certainty taker: waits for P_true > threshold, sweeps winning side with FAK orders."
+            active={ctActive.map((w, i) => {
+              const pTrueReady = w.lastPTrue >= minPTrue;
+              return (
+                <SingleSideActiveRow key={i}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  chips={<>
+                    <Tip tip={`P_true = ${w.lastPTrue.toFixed(3)} (threshold: ${minPTrue}). ${pTrueReady ? "Ready to sweep!" : "Waiting for certainty"}`}>
+                      <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${
+                        pTrueReady ? "bg-green-100 text-green-800" : w.lastPTrue > 0.80 ? "bg-amber-100 text-amber-800" : "bg-gray-100 text-gray-600"
+                      }`}>P={w.lastPTrue.toFixed(3)}</span>
+                    </Tip>
+                    {w.winningSide && (
+                      <Tip tip={`Predicted winner: ${w.winningSide} (spot ${w.strikeDirection} strike)`}>
+                        <span className={`text-[10px] font-bold cursor-help ${w.winningSide === "UP" ? "text-green-700" : "text-red-700"}`}>{w.winningSide}</span>
+                      </Tip>
+                    )}
+                    <Tip tip={`Strike: ${w.strikePrice != null ? `$${w.strikePrice.toLocaleString()}` : "pending"} (${w.strikeDirection}). Spot: $${w.lastSpotPrice?.toLocaleString() ?? "?"}`}>
+                      <span className="tabular-nums cursor-help text-muted-foreground">{w.strikePrice != null ? `K=$${w.strikePrice.toLocaleString()}` : "K=?"}</span>
+                    </Tip>
+                    {w.totalCost > 0 && (
+                      <Tip tip={`Total capital deployed: $${w.totalCost.toFixed(2)}`}>
+                        <span className="tabular-nums cursor-help text-muted-foreground">{fmt(w.totalCost)}</span>
+                      </Tip>
+                    )}
+                  </>}
+                  inventory={w.inventory ?? 0} inventorySide={w.inventorySide as "UP" | "DOWN" | null}
+                  avgCost={w.avgCost ?? 0} costDp={3} scale={50}
+                  bidOrderId={null} bidSide={null} bidPrice={0}
+                  fillCount={w.fillCount}
+                  tickAction={w.tickAction ? <TickAction text={w.tickAction} /> : undefined}
+                  narrative={pTrueReady ? "Sweeping..." : "Watching for certainty"}
+                  timeLeftMs={Math.max(0, w.windowEndTime - Date.now())}
+                />
+              );
+            })}
+            resolving={ctResolving.map((w, i) => {
+              const prediction = (w.binancePrediction ?? w.winningSide) as "UP" | "DOWN" | null;
+              const willWin = prediction && w.inventorySide ? prediction === w.inventorySide : null;
+              const estPnl = prediction && w.inventory > 0 ? (
+                prediction === w.inventorySide ? w.inventory * (1.0 - (w.avgCost ?? 0)) : -(w.inventory * (w.avgCost ?? 0))
+              ) : null;
+              return (
+                <SingleSideResolvingRow key={`r-${i}`}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  chips={w.winningSide ? (
+                    <span className={`font-medium ${w.winningSide === "UP" ? "text-green-600" : "text-red-600"}`}>{w.winningSide}</span>
+                  ) : undefined}
+                  inventory={w.inventory ?? 0} inventorySide={w.inventorySide as "UP" | "DOWN" | null}
+                  avgCost={w.avgCost ?? 0} costDp={3} scale={50}
+                  prediction={prediction} estPnl={estPnl}
+                  predictionText={prediction ? (willWin === true ? `Predicts win (${prediction})` : willWin === false ? `Predicts loss (${prediction})` : undefined) : undefined}
+                />
+              );
+            })}
+            completed={ctCompleted.slice(-20).reverse().map((w, i) => (
+              <SingleSideCompletedRow key={i}
+                title={w.title} compact={compactTitle(w.title) || w.cryptoSymbol || w.title?.slice(0, 25)}
+                chips={<>
+                  <Tip tip={w.correct ? "Correct prediction" : "Wrong prediction"}>
+                    <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${
+                      w.outcome === "UP" ? "bg-green-100 text-green-800" : w.outcome === "DOWN" ? "bg-red-100 text-red-800" : "bg-gray-100"
+                    }`}>{w.outcome}</span>
+                  </Tip>
+                  <span className="tabular-nums text-muted-foreground">P={w.lastPTrue?.toFixed(3) ?? "?"}</span>
+                </>}
+                inventory={w.inventory ?? 0} inventorySide={w.winningSide as "UP" | "DOWN" | null}
+                avgCost={w.avgCost ?? 0} costDp={3} scale={Math.max(w.inventory ?? 1, 1)}
+                netPnl={w.netPnl ?? 0} fillCount={w.fillCount ?? 0}
+                completedAt={w.completedAt}
+              />
+            ))}
+          />
+        );
+      })()}
+
+      {/* Avellaneda Maker windows */}
+      {isAvellaneda && (() => {
+        const amWindows = (custom?.activeWindows as Array<{
+          market: { title: string }; cryptoSymbol: string;
+          strikePrice: number | null; strikeDirection: string;
+          windowEndTime: number; windowDurationMs: number;
+          lastPTrue: number; lastDelta: number; lastSpotPrice: number;
+          lastReservationPrice: number; lastEffectiveSpread: number;
+          lastRealizedVol: number;
+          upInventory: number; downInventory: number;
+          upAvgCost: number; downAvgCost: number;
+          upBidOrderId: string | null; upBidPrice: number; upBidSize: number;
+          downBidOrderId: string | null; downBidPrice: number; downBidSize: number;
+          totalMerged: number; mergedPnl: number;
+          totalBuyCost: number; realizedPnl: number;
+          fillCount: number; sellCount: number; takerFills: number;
+          regime: string; tickAction?: string;
+          binancePrediction?: "UP" | "DOWN" | null;
+        }>) ?? [];
+        const amActive = amWindows.filter(w => w.windowEndTime > Date.now());
+        const amResolving = amWindows.filter(w => w.windowEndTime <= Date.now());
+        const amCompleted = (custom?.completedWindows as Array<{
+          title: string; cryptoSymbol: string; outcome: string;
+          upInventory: number; downInventory: number;
+          upAvgCost: number; downAvgCost: number;
+          pairCost: number | null; matchedPairs: number;
+          totalMerged: number; mergedPnl: number;
+          netPnl: number; fillCount: number; takerFills: number;
+          completedAt: string;
+        }>) ?? [];
+        const REGIME_TIPS: Record<string, string> = {
+          maker: "Quoting both sides with AS inventory shading",
+          taker: "P_true at extreme -- sweeping winning side with FAK orders",
+          transition: "Approaching regime boundary -- reduced bid size",
+          danger_zone: "Near expiry -- widened spread, reduced size",
+          delta_kill: "Delta too high -- quotes cancelled, spot near strike",
+          time_kill: "Exit buffer -- flattening inventory before resolution",
+        };
+        const regimeColor = (r: string) =>
+          r === "maker" ? "bg-green-100 text-green-800" :
+          r === "taker" ? "bg-orange-100 text-orange-800" :
+          r === "transition" ? "bg-yellow-100 text-yellow-800" :
+          r === "danger_zone" ? "bg-amber-100 text-amber-800" :
+          "bg-red-100 text-red-800";
+        return (
+          <WindowSection
+            sectionTitle="Active Windows"
+            sectionTip="Avellaneda-Stoikov market maker: quotes both sides using P_true from Chainlink oracle, Delta-based spread, inventory shading."
+            active={amActive.map((w, i) => {
+              const up = w.upInventory ?? 0;
+              const dn = w.downInventory ?? 0;
+              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+              return (
+                <ActiveWindowRow key={i}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  chips={<>
+                    <Tip tip={REGIME_TIPS[w.regime] ?? w.regime}>
+                      <span className={`rounded px-1.5 py-0 text-[10px] font-bold cursor-help ${regimeColor(w.regime)}`}>{w.regime?.replace("_", " ")}</span>
+                    </Tip>
+                    <Tip tip={`V = P_true: ${(w.lastPTrue ?? 0).toFixed(3)}, Vr = reservation: ${(w.lastReservationPrice ?? 0).toFixed(3)}`}>
+                      <span className="tabular-nums cursor-help text-muted-foreground">V={w.lastPTrue?.toFixed(3) ?? "?"} Vr={w.lastReservationPrice?.toFixed(3) ?? "?"}</span>
+                    </Tip>
+                    <Tip tip={`Spread = ${(w.lastEffectiveSpread ?? 0).toFixed(3)}, Vol = ${(w.lastRealizedVol ?? 0).toFixed(3)}%`}>
+                      <span className="tabular-nums cursor-help text-muted-foreground">s={w.lastEffectiveSpread?.toFixed(3) ?? "?"}</span>
+                    </Tip>
+                  </>}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={w.upBidSize ?? w.downBidSize ?? 1} pairCost={pairCost}
+                  upBidActive={!!w.upBidOrderId} dnBidActive={!!w.downBidOrderId}
+                  fillCount={w.fillCount} takerFills={w.takerFills}
+                  totalMerged={w.totalMerged} mergedPnl={w.mergedPnl}
+                  tickAction={w.tickAction ? <TickAction text={w.tickAction} /> : undefined}
+                  narrative={`${w.regime === "maker" ? "Quoting" : w.regime?.replace("_", " ")} K=${w.strikePrice != null ? `$${w.strikePrice.toLocaleString()}` : "?"}`}
+                  timeLeftMs={Math.max(0, w.windowEndTime - Date.now())}
+                />
+              );
+            })}
+            resolving={amResolving.map((w, i) => {
+              const up = w.upInventory ?? 0;
+              const dn = w.downInventory ?? 0;
+              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+              const prediction = w.binancePrediction;
+              const estPnl = prediction && (up > 0 || dn > 0) ? (() => {
+                const winPayout = prediction === "UP" ? up * (1 - (w.upAvgCost ?? 0)) : dn * (1 - (w.downAvgCost ?? 0));
+                const loseLoss = prediction === "UP" ? dn * (w.downAvgCost ?? 0) : up * (w.upAvgCost ?? 0);
+                return winPayout - loseLoss;
+              })() : null;
+              return (
+                <ResolvingWindowRow key={`r-${i}`}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  chips={<span className={`rounded px-1 py-0 text-[10px] font-medium ${regimeColor(w.regime)}`}>{w.regime?.replace("_", " ")}</span>}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={1} pairCost={pairCost}
+                  prediction={prediction} estPnl={estPnl}
+                />
+              );
+            })}
+            completed={amCompleted.slice(-20).reverse().map((w, i) => {
+              const up = w.upInventory ?? 0;
+              const dn = w.downInventory ?? 0;
+              const pairCost = w.pairCost ?? ((up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null);
+              return (
+                <CompletedWindowRow key={i}
+                  title={w.title} compact={compactTitle(w.title) || w.cryptoSymbol || w.title?.slice(0, 25)}
+                  outcome={w.outcome}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={Math.max(up + dn, 1)} pairCost={pairCost}
+                  netPnl={w.netPnl ?? 0} fillCount={w.fillCount} takerFills={w.takerFills}
+                  totalMerged={w.totalMerged} completedAt={w.completedAt}
+                />
+              );
+            })}
+          />
+        );
+      })()}
+
+      {/* Sniper / generic windows (not directional, not unified, not conviction, not new strategies) */}
+      {!isDirectional && !isUnified && !isConviction && !isCertaintyTaker && !isAvellaneda && (() => {
         const sniperWindows = (custom?.activeWindows as Array<{
           market: { title: string }; cryptoSymbol: string;
           windowEndTime: number; upInventory: number; downInventory: number;
@@ -851,128 +1511,52 @@ function StrategyDetail({
           upBidOrderId: string | null; downBidOrderId: string | null;
           upBidPrice: number; downBidPrice: number;
           upBidSize: number; downBidSize: number;
-          fillCount: number; sellCount: number; totalBuyCost: number;
-          lastUpBestAsk?: number; lastDnBestAsk?: number;
-          rebalanceSold?: boolean;
+          fillCount: number; sellCount: number; tickAction?: string;
         }>) ?? [];
         const sniperCompleted = (custom?.completedWindows as Array<{
           title: string; cryptoSymbol: string; outcome: string;
           upInventory: number; downInventory: number;
           upAvgCost: number; downAvgCost: number; pairCost: number;
-          matchedPairs: number; netPnl: number; fillCount: number; sellCount: number;
-          completedAt: string; priceMovePct: number;
+          matchedPairs: number; netPnl: number; fillCount: number;
+          completedAt: string;
         }>) ?? [];
         return (
-          <>
-            {sniperWindows.length > 0 && (
-              <div>
-                <Tip tip="Binary prediction windows currently being traded. Each window is a crypto up-or-down market with a fixed time range">
-                  <h4 className="mb-2 text-sm font-medium cursor-help">Active Windows</h4>
-                </Tip>
-                <div className="space-y-1.5">
-                  {sniperWindows.map((w, i) => {
-                    const timeLeft = Math.max(0, w.windowEndTime - Date.now());
-                    const mins = Math.floor(timeLeft / 60000);
-                    const secs = Math.floor((timeLeft % 60000) / 1000);
-                    const compact = compactTitle(w.market?.title ?? "") || w.cryptoSymbol;
-                    const up = w.upInventory ?? 0;
-                    const dn = w.downInventory ?? 0;
-                    const matched = Math.min(up, dn);
-                    const bidSize = w.upBidSize ?? w.downBidSize ?? 1;
-                    const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
-                    return (
-                      <div key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1.5 text-xs">
-                        <Tip tip={w.market?.title ?? "Crypto symbol being traded"}>
-                          <span className="font-medium cursor-help">{compact}</span>
-                        </Tip>
-                        <InventoryBar up={up} down={dn} scale={bidSize} />
-                        <Tip tip="UP tokens / DOWN tokens held. Matched = min(UP,DOWN) — structurally profitable when pair cost < $1">
-                          <span className="tabular-nums cursor-help">
-                            <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                            {matched > 0 && <span className="text-purple-600 ml-0.5">({fmtInv(matched)}pr)</span>}
-                          </span>
-                        </Tip>
-                        {pairCost !== null ? (
-                          <Tip tip="Average cost of one UP + one DOWN token. Below $1.00 = profit regardless of outcome. Target: 0.92">
-                            <span className={`tabular-nums font-medium cursor-help rounded px-1 py-0 text-[10px] ${
-                              pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                            }`}>pc={pairCost.toFixed(2)}</span>
-                          </Tip>
-                        ) : (
-                          <span className="tabular-nums text-[10px] text-muted-foreground rounded px-1 py-0 bg-gray-100">pc=—</span>
-                        )}
-                        <Tip tip="▲ = UP bid resting on CLOB, ▼ = DOWN bid resting. Dim = no active order (filled or cancelled for balance)">
-                          <span className="cursor-help">
-                            <span className={w.upBidOrderId ? "text-green-600" : "text-gray-300"}>▲</span>
-                            <span className={w.downBidOrderId ? "text-red-600" : "text-gray-300"}>▼</span>
-                          </span>
-                        </Tip>
-                        {w.fillCount > 0 && <Tip tip="Number of maker fills (resting bids that got hit)"><span className="tabular-nums cursor-help">{w.fillCount}f</span></Tip>}
-                        <span className="ml-auto text-[11px] text-muted-foreground italic truncate max-w-[260px]">
-                          {windowNarrative(w, { windingDown: isWindingDown })}
-                        </span>
-                        <Tip tip={timeLeft === 0 ? "Window expired — waiting for Polymarket to confirm outcome" : "Time remaining until window closes and resolves"}>
-                          <span className={`tabular-nums cursor-help ${timeLeft === 0 ? "text-amber-500 animate-pulse" : "text-muted-foreground"}`}>
-                            {timeLeft === 0 ? "resolving…" : `${mins}:${secs.toString().padStart(2, "0")}`}
-                          </span>
-                        </Tip>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-            {sniperCompleted.length > 0 && (
-              <div>
-                <h4 className="mb-2 text-sm font-medium">
-                  Completed
-                  <span className="ml-2 text-xs font-normal text-muted-foreground">
-                    (last {Math.min(sniperCompleted.length, 20)})
-                  </span>
-                </h4>
-                <div className="space-y-1">
-                  {sniperCompleted.slice(-20).reverse().map((w, i) => {
-                    const up = w.upInventory ?? 0;
-                    const dn = w.downInventory ?? 0;
-                    const pairCost = w.pairCost ?? ((up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null);
-                    return (
-                      <div key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1 text-xs">
-                        <Tip tip={w.title}><span className="font-medium cursor-help">{compactTitle(w.title) || w.cryptoSymbol}</span></Tip>
-                        <Tip tip="Market resolution outcome — which side won">
-                          <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${
-                            w.outcome === "UP" ? "bg-green-100 text-green-800" : w.outcome === "DOWN" ? "bg-red-100 text-red-800" : "bg-gray-100"
-                          }`}>{w.outcome}</span>
-                        </Tip>
-                        <InventoryBar up={up} down={dn} scale={Math.max(up + dn, 1)} />
-                        <Tip tip="UP tokens / DOWN tokens held. Matched = min(UP,DOWN) — structurally profitable when pair cost < $1">
-                          <span className="tabular-nums cursor-help">
-                            <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                            <span className="text-purple-600 ml-0.5">({w.matchedPairs}pr)</span>
-                          </span>
-                        </Tip>
-                        {pairCost !== null && pairCost > 0 ? (
-                          <Tip tip="Average cost of one UP + one DOWN token. Below $1.00 = profit regardless of outcome. Target: 0.92">
-                            <span className={`tabular-nums font-medium cursor-help rounded px-1 py-0 text-[10px] ${
-                              pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                            }`}>pc={pairCost.toFixed(2)}</span>
-                          </Tip>
-                        ) : (
-                          <span className="tabular-nums text-[10px] text-muted-foreground rounded px-1 py-0 bg-gray-100">pc=—</span>
-                        )}
-                        <Tip tip="Net P&L for this window after resolution, costs, and fees">
-                          <span className={`font-medium tabular-nums cursor-help ${w.netPnl >= 0 ? "text-green-600" : "text-red-600"}`}>
-                            {fmt(w.netPnl)}
-                          </span>
-                        </Tip>
-                        <Tip tip="Total maker fills in this window"><span className="tabular-nums text-muted-foreground cursor-help">{w.fillCount}f</span></Tip>
-                        <Tip tip="When this window was resolved"><span className="ml-auto text-muted-foreground cursor-help">{timeAgo(w.completedAt)}</span></Tip>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </>
+          <WindowSection
+            sectionTip="Binary prediction windows currently being traded. Each window is a crypto up-or-down market with a fixed time range"
+            active={sniperWindows.map((w, i) => {
+              const up = w.upInventory ?? 0;
+              const dn = w.downInventory ?? 0;
+              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+              return (
+                <ActiveWindowRow key={i}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={w.upBidSize ?? w.downBidSize ?? 1} pairCost={pairCost}
+                  upBidActive={!!w.upBidOrderId} dnBidActive={!!w.downBidOrderId}
+                  fillCount={w.fillCount ?? 0}
+                  tickAction={w.tickAction ? <TickAction text={w.tickAction} /> : undefined}
+                  narrative={!w.tickAction ? windowNarrative(w, { windingDown: isWindingDown }) : undefined}
+                  timeLeftMs={Math.max(0, w.windowEndTime - Date.now())}
+                />
+              );
+            })}
+            resolving={[]}
+            completed={sniperCompleted.slice(-20).reverse().map((w, i) => {
+              const up = w.upInventory ?? 0;
+              const dn = w.downInventory ?? 0;
+              const pairCost = w.pairCost ?? ((up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null);
+              return (
+                <CompletedWindowRow key={i}
+                  title={w.title} compact={compactTitle(w.title) || w.cryptoSymbol}
+                  outcome={w.outcome}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={Math.max(up + dn, 1)} pairCost={pairCost}
+                  netPnl={w.netPnl ?? 0} fillCount={w.fillCount}
+                  completedAt={w.completedAt}
+                />
+              );
+            })}
+          />
         );
       })()}
 
@@ -1027,8 +1611,8 @@ function StrategyDetail({
         </div>
       )}
 
-      {/* Directional strategy stats */}
-      {isDirectional && windowsTraded > 0 && (
+      {/* Directional / conviction strategy stats */}
+      {(isDirectional || isConviction) && windowsTraded > 0 && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <Tip tip="Total prediction windows traded, with wins (positive P&L) and losses">
             <div className="rounded-lg border p-3 cursor-help">
@@ -1070,216 +1654,114 @@ function StrategyDetail({
         </div>
       )}
 
-      {/* Active directional windows */}
-      {isDirectional && activeWindows.length > 0 && (
-        <div>
-          <Tip tip="Binary prediction windows currently being traded. Each window is a crypto up-or-down market with a fixed time range">
-            <h4 className="mb-2 text-sm font-medium cursor-help">Active Windows</h4>
-          </Tip>
-          <div className="space-y-1.5">
-            {activeWindows.map((w, i) => {
-              const timeLeft = Math.max(0, w.windowEndTime - Date.now());
-              const mins = Math.floor(timeLeft / 60000);
-              const secs = Math.floor((timeLeft % 60000) / 1000);
-              const title = w.market?.title ?? "";
-              const compact = compactTitle(title) || w.cryptoSymbol;
-              const maxFlips = ((typeof config.params === "object" ? config.params as Record<string, unknown> : {})?.max_flips_per_window as number) ?? 3;
-              const phase = w.phase || "active";
-              const phaseColors: Record<string, string> = {
-                observing: "bg-yellow-100 text-yellow-800",
-                active: "bg-blue-100 text-blue-800",
-                winding_down: "bg-orange-100 text-orange-800",
-              };
-              const phaseDesc: Record<string, string> = {
-                observing: "Gathering price data before placing bids",
-                active: "Actively quoting and filling orders",
-                winding_down: "Cancelling bids and selling excess inventory before window closes",
-              };
+      {/* Directional windows */}
+      {isDirectional && (() => {
+        const maxFlips = ((typeof config.params === "object" ? config.params as Record<string, unknown> : {})?.max_flips_per_window as number) ?? 3;
+        const phaseColors: Record<string, string> = {
+          observing: "bg-yellow-100 text-yellow-800",
+          active: "bg-blue-100 text-blue-800",
+          winding_down: "bg-orange-100 text-orange-800",
+        };
+        const phaseDesc: Record<string, string> = {
+          observing: "Gathering price data before placing bids",
+          active: "Actively quoting and filling orders",
+          winding_down: "Cancelling bids and selling excess inventory before window closes",
+        };
+        return (
+          <WindowSection
+            sectionTip="Binary prediction windows currently being traded. Each window is a crypto up-or-down market with a fixed time range"
+            active={activeWindows.map((w, i) => {
               const up = w.upInventory ?? 0;
               const dn = w.downInventory ?? 0;
-              const matched = Math.min(up, dn);
               const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+              const phase = w.phase || "active";
               return (
-                <div key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1.5 text-xs">
-                  <Tip tip={title}><span className="font-medium cursor-help">{compact}</span></Tip>
-                  <Tip tip={phaseDesc[phase] || "Current trading phase"}>
-                    <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${phaseColors[phase] || ""}`}>
-                      {phase === "winding_down" ? "wind" : phase}
-                    </span>
-                  </Tip>
-                  {w.convictionSide && (
-                    <Tip tip="Signal direction and strength at entry. Higher % = stronger directional conviction for biasing bid sizes">
-                      <span className={`cursor-help ${w.convictionSide === "UP" ? "text-green-600 font-medium" : "text-red-600 font-medium"}`}>
-                        {w.convictionSide} {(w.signalStrengthAtEntry * 100).toFixed(0)}%
+                <ActiveWindowRow key={i}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || w.cryptoSymbol}
+                  chips={<>
+                    <Tip tip={phaseDesc[phase] || "Current trading phase"}>
+                      <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${phaseColors[phase] || ""}`}>
+                        {phase === "winding_down" ? "wind" : phase}
                       </span>
                     </Tip>
-                  )}
-                  {w.confirmedDirection && (
-                    <Tip tip="Confirmed signal direction after hysteresis — survives the dead zone filter to avoid false flips">
-                      <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${w.confirmedDirection === "UP" ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}`}>
-                        {w.confirmedDirection}
-                      </span>
-                    </Tip>
-                  )}
-                  <InventoryBar up={up} down={dn} scale={w.bidSize ?? 1} />
-                  <Tip tip="UP tokens / DOWN tokens held. Matched = min(UP,DOWN) — structurally profitable when pair cost < $1">
-                    <span className="tabular-nums cursor-help">
-                      <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                      {matched > 0 && <span className="text-purple-600 ml-0.5">({fmtInv(matched)}pr)</span>}
-                    </span>
-                  </Tip>
-                  {pairCost !== null ? (
-                    <Tip tip="Average cost of one UP + one DOWN token. Below $1.00 = profit regardless of outcome. Target: 0.92">
-                      <span className={`tabular-nums font-medium cursor-help rounded px-1 py-0 text-[10px] ${
-                        pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                      }`}>pc={pairCost.toFixed(2)}</span>
-                    </Tip>
-                  ) : (
-                    <span className="tabular-nums text-[10px] text-muted-foreground rounded px-1 py-0 bg-gray-100">pc=—</span>
-                  )}
-                  <Tip tip="▲ = UP bid resting on CLOB, ▼ = DOWN bid resting. Dim = no active order (filled or cancelled for balance)">
-                    <span className="cursor-help">
-                      <span className={w.upBidOrderId ? "text-green-600" : "text-gray-300"}>▲</span>
-                      <span className={w.downBidOrderId ? "text-red-600" : "text-gray-300"}>▼</span>
-                    </span>
-                  </Tip>
-                  {(w.flipCount ?? 0) > 0 && (
-                    <Tip tip={`Direction flips (${w.flipCount}/${maxFlips} max). Exceeding max stops quoting — choppy market protection`}>
-                      <span className={`tabular-nums cursor-help ${(w.flipCount ?? 0) > maxFlips ? "text-red-600 font-medium" : "text-amber-600"}`}>
-                        {w.flipCount}fl
-                      </span>
-                    </Tip>
-                  )}
-                  <span className="ml-auto text-[11px] text-muted-foreground italic truncate max-w-[50%]" title={windowNarrative({ ...w, fillCount: w.fillCount ?? 0, sellCount: w.sellCount ?? 0, upBidPrice: w.upBidPrice ?? 0, downBidPrice: w.downBidPrice ?? 0 }, { windingDown: isWindingDown })}>
-                    {windowNarrative({ ...w, fillCount: w.fillCount ?? 0, sellCount: w.sellCount ?? 0, upBidPrice: w.upBidPrice ?? 0, downBidPrice: w.downBidPrice ?? 0 }, { windingDown: isWindingDown })}
-                  </span>
-                  <Tip tip={timeLeft === 0 ? "Window expired — waiting for Polymarket to confirm outcome" : "Time remaining until window closes and resolves"}>
-                    <span className={`tabular-nums cursor-help ${timeLeft === 0 ? "text-amber-500 animate-pulse" : "text-muted-foreground"}`}>
-                      {timeLeft === 0 ? "resolving…" : `${mins}:${secs.toString().padStart(2, "0")}`}
-                    </span>
-                  </Tip>
-                </div>
+                    {w.convictionSide && (
+                      <Tip tip="Signal direction and strength at entry. Higher % = stronger directional conviction for biasing bid sizes">
+                        <span className={`cursor-help ${w.convictionSide === "UP" ? "text-green-600 font-medium" : "text-red-600 font-medium"}`}>
+                          {w.convictionSide} {(w.signalStrengthAtEntry * 100).toFixed(0)}%
+                        </span>
+                      </Tip>
+                    )}
+                    {w.confirmedDirection && (
+                      <Tip tip="Confirmed signal direction after hysteresis — survives the dead zone filter to avoid false flips">
+                        <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${w.confirmedDirection === "UP" ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}`}>
+                          {w.confirmedDirection}
+                        </span>
+                      </Tip>
+                    )}
+                  </>}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={w.upBidSize ?? w.downBidSize ?? w.bidSize ?? 30} pairCost={pairCost}
+                  upBidActive={!!w.upBidOrderId} dnBidActive={!!w.downBidOrderId}
+                  fillCount={w.fillCount ?? 0}
+                  flipCount={w.flipCount} maxFlips={maxFlips}
+                  tickAction={w.tickAction ? <TickAction text={w.tickAction} /> : undefined}
+                  narrative={!w.tickAction ? windowNarrative({ ...w, fillCount: w.fillCount ?? 0, sellCount: w.sellCount ?? 0, upBidPrice: w.upBidPrice ?? 0, downBidPrice: w.downBidPrice ?? 0 }, { windingDown: isWindingDown }) : undefined}
+                  timeLeftMs={Math.max(0, w.windowEndTime - Date.now())}
+                />
               );
             })}
-          </div>
-        </div>
-      )}
-
-      {/* Completed directional windows (resolving at top) */}
-      {isDirectional && (resolvingWindows.length > 0 || completedWindows.length > 0) && (
-        <div>
-          <h4 className="mb-2 text-sm font-medium">
-            Completed
-            <span className="ml-2 text-xs font-normal text-muted-foreground">
-              ({resolvingWindows.length > 0 ? `${resolvingWindows.length} resolving, ` : ""}last {Math.min(completedWindows.length, 20)})
-            </span>
-          </h4>
-          <div className="space-y-1">
-            {/* Resolving windows (past end time, awaiting Polymarket) */}
-            {resolvingWindows.map((w, i) => {
+            resolving={resolvingWindows.map((w, i) => {
               const up = w.upInventory ?? 0;
               const dn = w.downInventory ?? 0;
-              const matched = Math.min(up, dn);
               const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
-              const compact = compactTitle(w.market?.title ?? "") || (w.market?.title ?? "").slice(0, 25);
               const prediction = w.binancePrediction ?? w.confirmedDirection;
-              const betSide = w.convictionSide || (up > dn ? "UP" : dn > up ? "DOWN" : null);
-              const willWin = prediction && betSide ? prediction === betSide : null;
-              const estPnl = prediction ? (() => {
-                const winSide = prediction === "UP" ? up : dn;
-                const loseSide = prediction === "UP" ? dn : up;
-                const winCost = prediction === "UP" ? (w.upAvgCost ?? 0) : (w.downAvgCost ?? 0);
-                const loseCost = prediction === "UP" ? (w.downAvgCost ?? 0) : (w.upAvgCost ?? 0);
-                return winSide * (1.0 - winCost) - loseSide * loseCost;
-              })() : null;
               return (
-                <div key={`r-${i}`} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border border-amber-300 bg-amber-50/50 px-2 py-1 text-xs">
-                  <Tip tip={w.market?.title ?? ""}><span className="font-medium cursor-help">{compact}</span></Tip>
-                  <span className="rounded px-1 py-0 text-[10px] font-medium bg-amber-100 text-amber-800 animate-pulse">resolving</span>
-                  {w.convictionSide && (
+                <ResolvingWindowRow key={`r-${i}`}
+                  title={w.market?.title ?? ""} compact={compactTitle(w.market?.title ?? "") || (w.market?.title ?? "").slice(0, 25)}
+                  chips={w.convictionSide ? (
                     <span className={`${w.convictionSide === "UP" ? "text-green-600" : "text-red-600"} font-medium`}>
                       {w.convictionSide} {(w.signalStrengthAtEntry * 100).toFixed(0)}%
                     </span>
-                  )}
-                  <InventoryBar up={up} down={dn} scale={w.bidSize ?? 1} />
-                  <span className="tabular-nums">
-                    <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                    {matched > 0 && <span className="text-purple-600 ml-0.5">({fmtInv(matched)}pr)</span>}
-                  </span>
-                  {pairCost !== null && (
-                    <span className={`tabular-nums font-medium rounded px-1 py-0 text-[10px] ${
-                      pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                    }`}>pc={pairCost.toFixed(2)}</span>
-                  )}
-                  <span className="ml-auto text-[11px] text-muted-foreground italic">
-                    {prediction
-                      ? <>
-                          {willWin === true ? `Binance predicts win (${prediction})`
-                            : willWin === false ? `Binance predicts loss (${prediction})`
-                            : `Binance says ${prediction}`}
-                          {estPnl !== null && <span className={`ml-1 font-medium ${estPnl >= 0 ? "text-green-600" : "text-red-600"}`}>≈{estPnl >= 0 ? "+" : ""}{fmt(estPnl)}</span>}
-                        </>
-                      : "awaiting Polymarket…"}
-                  </span>
-                </div>
+                  ) : undefined}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={w.upBidSize ?? w.downBidSize ?? w.bidSize ?? 30} pairCost={pairCost}
+                  prediction={prediction as "UP" | "DOWN" | undefined}
+                  estPnl={prediction ? (() => {
+                    const winSide = prediction === "UP" ? up : dn;
+                    const loseSide = prediction === "UP" ? dn : up;
+                    const winCost = prediction === "UP" ? (w.upAvgCost ?? 0) : (w.downAvgCost ?? 0);
+                    const loseCost = prediction === "UP" ? (w.downAvgCost ?? 0) : (w.upAvgCost ?? 0);
+                    return winSide * (1.0 - winCost) - loseSide * loseCost;
+                  })() : undefined}
+                />
               );
             })}
-            {completedWindows.slice(-20).reverse().map((w, i) => {
-              const maxFlips = ((typeof config.params === "object" ? config.params as Record<string, unknown> : {})?.max_flips_per_window as number) ?? 3;
+            completed={completedWindows.slice(-20).reverse().map((w, i) => {
               const up = w.upInventory ?? 0;
               const dn = w.downInventory ?? 0;
-              const matched = Math.min(up, dn);
               const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
               return (
-                <div key={i} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1 text-xs">
-                  <Tip tip={w.title}><span className="font-medium cursor-help">{compactTitle(w.title) || w.title.slice(0, 25)}</span></Tip>
-                  {w.convictionSide ? (
+                <CompletedWindowRow key={i}
+                  title={w.title} compact={compactTitle(w.title) || w.title?.slice(0, 25)}
+                  outcome={w.outcome}
+                  chips={w.convictionSide ? (
                     <Tip tip={w.correct ? "Conviction direction matched the outcome (+)" : "Conviction direction was wrong (-)"}>
                       <span className={`cursor-help ${w.correct ? "text-green-600 font-medium" : "text-red-600 font-medium"}`}>
                         {w.convictionSide}{w.correct ? " +" : " -"}
                       </span>
                     </Tip>
-                  ) : <span className="text-muted-foreground">—</span>}
-                  <InventoryBar up={up} down={dn} scale={w.bidSize ?? 1} />
-                  {(up > 0 || dn > 0) && (
-                    <Tip tip="UP tokens / DOWN tokens held. Matched = min(UP,DOWN) — structurally profitable when pair cost < $1">
-                      <span className="tabular-nums cursor-help">
-                        <span className="text-green-600">{fmtInv(up)}</span>↑/<span className="text-red-600">{fmtInv(dn)}</span>↓
-                        {matched > 0 && <span className="text-purple-600 ml-0.5">({fmtInv(matched)}pr)</span>}
-                      </span>
-                    </Tip>
-                  )}
-                  {pairCost !== null && (
-                    <Tip tip="Average cost of one UP + one DOWN token. Below $1.00 = profit regardless of outcome">
-                      <span className={`tabular-nums font-medium cursor-help rounded px-1 py-0 text-[10px] ${
-                        pairCost < 0.90 ? "bg-green-100 text-green-800" : pairCost <= 0.95 ? "bg-yellow-100 text-yellow-800" : "bg-red-100 text-red-800"
-                      }`}>pc={pairCost.toFixed(2)}</span>
-                    </Tip>
-                  )}
-                  <Tip tip="Net P&L = winning payout - losing loss + sell P&L - fees">
-                    <span className={`font-medium tabular-nums cursor-help ${(w.netPnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}`}>
-                      ={fmt(w.netPnl)}
-                    </span>
-                  </Tip>
-                  <Tip tip={isMaker ? "Maker fills in this window" : "Buy and sell orders executed"}>
-                    <span className="tabular-nums cursor-help">
-                      {isMaker ? `${w.fillCount ?? 0}f` : `${w.buyCount ?? 0}b/${w.sellCount ?? 0}s`}
-                    </span>
-                  </Tip>
-                  {(w.flipCount ?? 0) > 0 && (
-                    <Tip tip={`Direction flips in this window (${w.flipCount}/${maxFlips} max)`}>
-                      <span className={`tabular-nums cursor-help ${(w.flipCount ?? 0) > maxFlips ? "text-red-600 font-medium" : ""}`}>
-                        {w.flipCount}fl
-                      </span>
-                    </Tip>
-                  )}
-                  <Tip tip="When this window resolved"><span className="ml-auto text-muted-foreground cursor-help">{timeAgo(w.completedAt)}</span></Tip>
-                </div>
+                  ) : undefined}
+                  up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
+                  scale={w.bidSize ?? Math.max(up + dn, 1)} pairCost={pairCost}
+                  netPnl={w.netPnl ?? 0} fillCount={w.fillCount ?? 0}
+                  flipCount={w.flipCount} maxFlips={maxFlips}
+                  completedAt={w.completedAt}
+                />
               );
             })}
-          </div>
-        </div>
-      )}
+          />
+        );
+      })()}
 
       {/* Activity log */}
       <div>
@@ -1325,48 +1807,16 @@ function StrategyDetail({
         </div>
       </div>
 
-      {/* Config params */}
-      <details className="group">
-        <summary className="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground">
-          Configuration Parameters
-        </summary>
-        <pre className="mt-2 rounded-md border bg-muted/30 p-3 text-xs whitespace-pre-wrap break-all">
-          {(() => {
-            try {
-              const params = typeof config.params === "string"
-                ? JSON.parse(config.params || "{}")
-                : config.params;
-              return JSON.stringify(
-                {
-                  strategy_type: config.strategy_type,
-                  mode: config.mode,
-                  tick_interval_ms: config.tick_interval_ms,
-                  max_capital_usd: config.max_capital_usd,
-                  ...params,
-                },
-                null,
-                2
-              );
-            } catch {
-              return String(config.params);
-            }
-          })()}
-        </pre>
-      </details>
-
-      {/* Reset stats button — only when stopped */}
-      {!isActive && !isWindingDown && onReset && (state?.ticks ?? 0) > 0 && (
-        <button
-          onClick={() => {
-            if (confirm("Reset all stats, trades, and logs for this strategy? Config will be kept.")) {
-              onReset();
-            }
-          }}
-          className="text-xs text-muted-foreground hover:text-red-600 underline"
-        >
-          Reset stats &amp; trades
-        </button>
-      )}
+      {/* Config params editor */}
+      <ParamsEditor
+        config={config}
+        isActive={isActive}
+        isWindingDown={isWindingDown}
+        hasTicks={(state?.ticks ?? 0) > 0}
+        onSave={onSave}
+        onClone={onClone}
+        onReset={onReset}
+      />
     </div>
   );
 }
@@ -1425,7 +1875,7 @@ export default function StrategyPage() {
         mode: newMode,
         max_capital_usd: parseFloat(newMaxCapital) || 200,
         ...(newBalance ? { balance_usd: parseFloat(newBalance) } : {}),
-        ...((newType === "spread-sniper" || newType === "directional-maker" || newType === "unified-adaptive") && newMode === "paper"
+        ...((newType === "spread-sniper" || newType === "directional-maker" || newType === "unified-adaptive" || newType === "orchestrator" || newType === "scaling-safe-maker") && newMode === "paper"
           ? { params: { grounded_fills: newGroundedFills } as unknown as string }
           : {}),
       });
@@ -1468,6 +1918,24 @@ export default function StrategyPage() {
   const resetStrategy = async (id: string) => {
     try {
       await api.strategyReset(id);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const updateStrategy = async (id: string, updates: Partial<StrategyConfig>) => {
+    try {
+      await api.strategyUpdateConfig(id, updates);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const cloneStrategy = async (config: Partial<StrategyConfig>) => {
+    try {
+      await api.strategyCreateConfig(config);
       refresh();
     } catch (e) {
       setError(String(e));
@@ -1594,7 +2062,7 @@ export default function StrategyPage() {
                 <th className="text-right py-1 px-1"><Tip tip="Total realized profit/loss across all completed windows"><span className="cursor-help">P&L</span></Tip></th>
                 <th className="text-right py-1 px-1"><Tip tip="Windows won / windows lost"><span className="cursor-help">W/L</span></Tip></th>
                 <th className="text-right py-1 px-1"><Tip tip="Win rate"><span className="cursor-help">Win%</span></Tip></th>
-                <th className="text-right py-1 px-1"><Tip tip="Capital efficiency (P&L / capital cycled). Shows balance when protection is enabled"><span className="cursor-help">Eff%</span></Tip></th>
+                <th className="text-right py-1 px-1"><Tip tip="Return on risk (P&L / allocated capital)"><span className="cursor-help">RoR%</span></Tip></th>
                 <th className="text-left py-1 px-1">Status</th>
                 <th className="text-right py-1">Actions</th>
               </tr>
@@ -1609,9 +2077,10 @@ export default function StrategyPage() {
                 const custom = state?.custom as Record<string, unknown> | undefined;
                 const pnl = (state?.total_pnl ?? 0) as number;
                 const activeWins = ((custom?.activeWindows as unknown[]) ?? []).length;
-                const { traded, wins, losses, winRate, capitalEfficiency, totalCapitalUsed } = extractOverviewStats(custom, c.strategy_type, pnl);
+                const riskCapital = c.balance_usd ?? c.max_capital_usd;
+                const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
                 const bp = st?.balance_protection;
-                const runTime = fmtRunTime(state?.started_at ?? c.created_at, state?.last_tick_at ?? "", isRunning);
+                const runTime = fmtRunTime(state?.ticks ?? 0, c.tick_interval_ms ?? 5000);
                 return (
                   <React.Fragment key={c.id}>
                     <tr
@@ -1635,18 +2104,11 @@ export default function StrategyPage() {
                       </td>
                       <td className="py-2 px-1 text-right font-mono tabular-nums">
                         <Tip tip={bp
-                          ? `Eff ${totalCapitalUsed > 0 ? (capitalEfficiency * 100).toFixed(1) + "%" : "—"} | Bal ${fmt(bp.current_balance)} | Locked ${fmt(bp.locked_amount)} | Working ${fmt(bp.working_capital)}`
-                          : `P&L ${fmt(pnl)} on ${fmt(totalCapitalUsed)} capital cycled`
+                          ? `${fmt(pnl)} on ${fmt(riskCapital)} risked (${fmt(totalCapitalCycled)} cycled) | Bal ${fmt(bp.current_balance)} | Working ${fmt(bp.working_capital)}`
+                          : `${fmt(pnl)} on ${fmt(riskCapital)} risked (${fmt(totalCapitalCycled)} cycled)`
                         }>
-                          <span className={`cursor-help ${capitalEfficiency >= 0 ? "text-green-600" : "text-red-600"}`}>
-                            {bp
-                              ? <span className={
-                                  bp.working_capital <= 0 ? "text-red-600" :
-                                  bp.working_capital < (c.lock_increment_usd ?? c.balance_usd ?? 0) * 0.5 ? "text-amber-500" :
-                                  "text-green-600"
-                                }>{fmt(bp.current_balance)}</span>
-                              : totalCapitalUsed > 0 ? `${(capitalEfficiency * 100).toFixed(1)}%` : "—"
-                            }
+                          <span className={`cursor-help ${returnOnRisk >= 0 ? "text-green-600" : "text-red-600"}`}>
+                            {traded > 0 ? `${(returnOnRisk * 100).toFixed(1)}%` : "—"}
                           </span>
                         </Tip>
                       </td>
@@ -1687,7 +2149,7 @@ export default function StrategyPage() {
                     {isExpanded && (
                       <tr>
                         <td colSpan={10} className="p-2 bg-muted/20">
-                          <StrategyDetail config={c} isActive={isRunning} isWindingDown={isWindingDown} state={state} balanceProtection={st?.balance_protection} onReset={() => resetStrategy(c.id)} />
+                          <StrategyDetail config={c} isActive={isRunning} isWindingDown={isWindingDown} state={state} balanceProtection={st?.balance_protection} onReset={() => resetStrategy(c.id)} onSave={(updates) => updateStrategy(c.id, updates)} onClone={cloneStrategy} />
                         </td>
                       </tr>
                     )}
@@ -1711,9 +2173,10 @@ export default function StrategyPage() {
               const custom = state?.custom as Record<string, unknown> | undefined;
               const pnl = (state?.total_pnl ?? 0) as number;
               const activeWins = ((custom?.activeWindows as unknown[]) ?? []).length;
-              const { traded, wins, losses, winRate, capitalEfficiency, totalCapitalUsed } = extractOverviewStats(custom, c.strategy_type, pnl);
+              const riskCapital = c.balance_usd ?? c.max_capital_usd;
+              const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
               const bp = st?.balance_protection;
-              const runTime = fmtRunTime(state?.started_at ?? c.created_at, state?.last_tick_at ?? "", isRunning);
+              const runTime = fmtRunTime(state?.ticks ?? 0, c.tick_interval_ms ?? 5000);
               return (
                 <React.Fragment key={c.id}>
                   <div
@@ -1735,9 +2198,9 @@ export default function StrategyPage() {
                           <span className="text-xs font-mono tabular-nums shrink-0">
                             <span className="text-green-600">{wins}W</span>/<span className="text-red-600">{losses}L</span>
                             <span className="ml-1 text-muted-foreground">{(winRate * 100).toFixed(0)}%</span>
-                            {totalCapitalUsed > 0 && (
-                              <span className={`ml-1 ${capitalEfficiency >= 0 ? "text-green-600" : "text-red-600"}`}>
-                                eff {(capitalEfficiency * 100).toFixed(1)}%
+                            {traded > 0 && (
+                              <span className={`ml-1 ${returnOnRisk >= 0 ? "text-green-600" : "text-red-600"}`}>
+                                RoR {(returnOnRisk * 100).toFixed(1)}%
                               </span>
                             )}
                           </span>
@@ -1746,8 +2209,8 @@ export default function StrategyPage() {
                           <Tip tip={`Balance: ${fmt(bp.current_balance)} | Locked: ${fmt(bp.locked_amount)} | Working: ${fmt(bp.working_capital)} | HWM: ${fmt(bp.high_water_balance)}`}>
                             <span className={`text-xs font-mono tabular-nums cursor-help truncate ${
                               bp.working_capital <= 0 ? "text-red-600" :
-                              bp.working_capital < (c.lock_increment_usd ?? c.balance_usd ?? 0) * 0.25 ? "text-red-500" :
-                              bp.working_capital < (c.lock_increment_usd ?? c.balance_usd ?? 0) * 0.5 ? "text-amber-500" :
+                              bp.working_capital < (c.balance_usd ?? 0) * 0.25 ? "text-red-500" :
+                              bp.working_capital < (c.balance_usd ?? 0) * 0.5 ? "text-amber-500" :
                               "text-green-600"
                             }`}>
                               {fmt(bp.current_balance)}{bp.locked_amount > 0 ? ` / ${fmt(bp.locked_amount)} locked` : ""}
@@ -1781,7 +2244,7 @@ export default function StrategyPage() {
                   </div>
                   {isExpanded && (
                     <div className="rounded border bg-muted/20 p-2">
-                      <StrategyDetail config={c} isActive={isRunning} isWindingDown={isWindingDown} state={state} balanceProtection={st?.balance_protection} onReset={() => resetStrategy(c.id)} />
+                      <StrategyDetail config={c} isActive={isRunning} isWindingDown={isWindingDown} state={state} balanceProtection={st?.balance_protection} onReset={() => resetStrategy(c.id)} onSave={(updates) => updateStrategy(c.id, updates)} onClone={cloneStrategy} />
                     </div>
                   )}
                 </React.Fragment>
@@ -1826,7 +2289,7 @@ export default function StrategyPage() {
                 <option value="real">Real</option>
               </select>
             </div>
-            {(newType === "spread-sniper" || newType === "directional-maker" || newType === "unified-adaptive") && newMode === "paper" && (
+            {(newType === "spread-sniper" || newType === "directional-maker" || newType === "unified-adaptive" || newType === "orchestrator" || newType === "scaling-safe-maker") && newMode === "paper" && (
               <div className="flex items-end pb-0.5">
                 <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground cursor-pointer">
                   <input

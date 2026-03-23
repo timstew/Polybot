@@ -1,9 +1,14 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 async function fetchJSON<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
-  return res.json();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+    if (res.ok) return res.json();
+    // Retry on 5xx (worker DO warmup), but not on 4xx
+    if (res.status < 500 || attempt === 2) throw new Error(`API error: ${res.status}`);
+    await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+  }
+  throw new Error("unreachable");
 }
 
 async function postJSON<T>(path: string, body?: unknown): Promise<T> {
@@ -579,6 +584,13 @@ export const api = {
       walletsChecked: number;
     }>("/api/watchlist/status"),
 
+  // Orchestrator
+  tactics: () => fetchJSON<TacticInfo[]>("/api/strategy/tactics"),
+  regimePerformance: (id: string) =>
+    fetchJSON<RegimePerformanceRow[]>(`/api/strategy/regime-performance/${id}`),
+  tacticScores: (id: string) =>
+    fetchJSON<TacticScore[]>(`/api/strategy/tactic-scores/${id}`),
+
   // Strategy execution
   strategyWalletOverview: () =>
     fetchJSON<WalletOverview>("/api/strategy/wallet-overview"),
@@ -605,6 +617,10 @@ export const api = {
     fetch(`${API_BASE}/api/strategy/configs/${configId}`, {
       method: "DELETE",
     }).then((r) => r.json()) as Promise<{ status: string }>,
+  strategyMerge: (configId: string, conditionId: string, amount: number) =>
+    postJSON<{ status: string; merged?: number; pnl?: number; pairCost?: number; duration_ms?: number; tx_hash?: string }>(
+      `/api/strategy/merge/${configId}`, { conditionId, amount }
+    ),
   strategyStatuses: () =>
     fetchJSON<
       Record<
@@ -619,6 +635,36 @@ export const api = {
         : "/api/strategy/trades"
     ),
 };
+
+// ── Orchestrator types ──────────────────────────────────────────────
+
+export interface TacticInfo {
+  id: string;
+  displayName: string;
+  description: string;
+  naturalRegimes: string[];
+  defaultParams: Record<string, unknown>;
+}
+
+export interface RegimePerformanceRow {
+  regime: string;
+  tactic_id: string;
+  windows: number;
+  total_pnl: number;
+  wins: number;
+}
+
+export interface TacticScore {
+  regime: string;
+  tactic_id: string;
+  n: number;
+  total_pnl: number;
+  avg_pnl: number;
+  variance: number;
+  wins: number;
+  losses: number;
+  last_updated_at?: string;
+}
 
 // ── Strategy types ──────────────────────────────────────────────────
 
@@ -661,7 +707,9 @@ export interface BalanceProtection {
   locked_amount: number;
   working_capital: number;
   high_water_balance: number;
+  effective_max_capital?: number;
   drawdown_scale?: number;
+  capital_status?: "ok" | "low" | "exhausted";
 }
 
 export interface StrategyTrade {

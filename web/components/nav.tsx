@@ -9,6 +9,7 @@ const links = [
   { href: "/watchlist", label: "Watchlist" },
   { href: "/copy", label: "Copy Trading" },
   { href: "/strategy", label: "Strategies" },
+  { href: "/orchestrator", label: "Orchestrator" },
 ];
 
 export function Nav() {
