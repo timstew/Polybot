@@ -15,6 +15,8 @@ export interface CryptoMarket {
   endDate: string;
   upTokenId: string;
   downTokenId: string;
+  strikePrice: number | null;
+  strikeDirection: "above" | "below" | null;
 }
 
 export interface PriceSnapshot {
@@ -57,6 +59,13 @@ export const CRYPTO_SYMBOL_MAP: Record<string, string> = {
   sol: "SOLUSDT",
   xrp: "XRPUSDT",
 };
+
+// Reverse map: "BTCUSDT" → ["bitcoin", "btc"] for matching Binance symbols to market titles
+const SYMBOL_TO_KEYWORDS: Record<string, string[]> = {};
+for (const [keyword, symbol] of Object.entries(CRYPTO_SYMBOL_MAP)) {
+  if (!SYMBOL_TO_KEYWORDS[symbol]) SYMBOL_TO_KEYWORDS[symbol] = [];
+  SYMBOL_TO_KEYWORDS[symbol].push(keyword);
+}
 
 // Signal thresholds per asset (% move for full conviction)
 export const SIGNAL_THRESHOLDS: Record<string, number> = {
@@ -362,6 +371,7 @@ export interface TradeTapeEntry {
   price: number;
   size: number;
   timestamp: number; // epoch ms
+  taker?: string;   // wallet address, for unique wallet counting
 }
 
 let tradeTapeCache: TradeTapeEntry[] = [];
@@ -380,6 +390,7 @@ export async function fetchTradeTape(): Promise<TradeTapeEntry[]> {
     if (!resp.ok) return tradeTapeCache;
     const raw = await resp.json() as Array<{
       asset?: string; price?: number; size?: number; timestamp?: number;
+      taker?: string; proxyWallet?: string;
     }>;
     tradeTapeCache = raw
       .filter(t => t.asset && t.price != null && t.size != null && t.timestamp)
@@ -388,6 +399,7 @@ export async function fetchTradeTape(): Promise<TradeTapeEntry[]> {
         price: t.price!,
         size: t.size!,
         timestamp: t.timestamp! < 1e12 ? t.timestamp! * 1000 : t.timestamp!,
+        taker: t.proxyWallet || t.taker,
       }));
     tradeTapeLastFetch = now;
   } catch { /* keep stale cache */ }
@@ -405,12 +417,16 @@ export function checkTapeFill(
   tokenId: string,
   bidPrice: number,
   bidSize: number,
+  placedAtMs?: number,    // only count trades after this timestamp
+  queueAhead?: number,    // volume ahead of us in the queue (from CLOB book)
 ): { filled: boolean; fillPrice: number } {
+  const minTime = placedAtMs ?? 0;
+  const totalNeeded = bidSize + (queueAhead ?? 0);
   let volumeAtOrBelow = 0;
   for (const t of tape) {
-    if (t.asset === tokenId && t.price <= bidPrice) {
+    if (t.asset === tokenId && t.price <= bidPrice && t.timestamp > minTime) {
       volumeAtOrBelow += t.size;
-      if (volumeAtOrBelow >= bidSize) {
+      if (volumeAtOrBelow >= totalNeeded) {
         return { filled: true, fillPrice: bidPrice };
       }
     }
@@ -446,10 +462,23 @@ export async function discoverCryptoMarkets(
       const title = t.title || "";
       const eventSlug = t.eventSlug || "";
       if (!eventSlug) continue;
-      if (!title.toLowerCase().includes("up or down")) continue;
-      const matchesCrypto = cryptos.some((c) =>
-        title.toLowerCase().includes(c.toLowerCase())
-      );
+      const lower = title.toLowerCase();
+      // Match both "Up or Down" and "above/below" strike-price markets
+      const isCryptoMarket =
+        lower.includes("up or down") ||
+        lower.includes("above") ||
+        lower.includes("below");
+      if (!isCryptoMarket) continue;
+      // Match crypto names: handle both keyword ("bitcoin") and Binance symbol ("BTCUSDT")
+      const matchesCrypto = cryptos.some((c) => {
+        const cl = c.toLowerCase();
+        // Direct keyword match (e.g., "bitcoin" in title)
+        if (lower.includes(cl)) return true;
+        // Binance symbol match: "BTCUSDT" → check for "bitcoin", "btc" in title
+        const keywords = SYMBOL_TO_KEYWORDS[c.toUpperCase()];
+        if (keywords) return keywords.some((kw) => lower.includes(kw));
+        return false;
+      });
       if (!matchesCrypto) continue;
       if (seen.has(eventSlug)) continue;
       seen.add(eventSlug);
@@ -505,6 +534,8 @@ export async function discoverCryptoMarkets(
             endDate: m.endDate,
             upTokenId: tokens[upIdx],
             downTokenId: tokens[downIdx],
+            strikePrice: parseStrikePrice(m.question),
+            strikeDirection: parseStrikeDirection(m.question),
           });
         }
       }
@@ -819,6 +850,316 @@ export function parseWindowDurationMs(title: string): number {
   const endMin = endH * 60 + endM;
   const diffMin = endMin - startMin;
 
-  if (diffMin > 0 && diffMin <= 60) return diffMin * 60_000;
+  if (diffMin > 0) return diffMin * 60_000;
   return 300_000; // default 5 min
+}
+
+// ── Strike Price Parsing ──────────────────────────────────────────────
+
+/**
+ * Extract strike price from a Polymarket market title.
+ * "Will the price of Bitcoin be above $97,250 at 2:45 PM on ..." → 97250
+ * "Will the price of Solana be above $142.50 at ..." → 142.50
+ */
+export function parseStrikePrice(title: string): number | null {
+  // Match "$X,XXX" or "$XXX.XX" or "$X,XXX.XX" patterns
+  const m = title.match(/\$([0-9,]+(?:\.\d+)?)/);
+  if (!m) return null;
+  const cleaned = m[1].replace(/,/g, "");
+  const price = parseFloat(cleaned);
+  return isNaN(price) || price <= 0 ? null : price;
+}
+
+/**
+ * Extract strike direction from a Polymarket market title.
+ * "Will the price of Bitcoin be above $97,250..." → "above"
+ * "Will the price of Bitcoin be below $97,250..." → "below"
+ */
+export function parseStrikeDirection(title: string): "above" | "below" | null {
+  const lower = title.toLowerCase();
+  if (lower.includes("above")) return "above";
+  if (lower.includes("below")) return "below";
+  return null;
+}
+
+// ── Oracle Strike Fetching ─────────────────────────────────────────────
+
+interface PastResultEntry {
+  startTime: string;
+  endTime: string;
+  openPrice: number;
+  closePrice: number | null;
+  outcome: string;
+  percentChange: number;
+}
+
+const oracleStrikeCache = new Map<string, { strike: number; ts: number }>();
+const ORACLE_CACHE_TTL_MS = 60_000; // cache for 1 minute
+
+/**
+ * Fetch the official oracle opening price for an "Up or Down" market window.
+ *
+ * Polymarket resolves these markets against the Chainlink (or Pyth) oracle price
+ * at the exact window boundary — NOT Binance spot. Using local spot as the strike
+ * creates oracle drift that latency arb bots exploit.
+ *
+ * Approach: query Polymarket's past-results API. The closePrice of the window
+ * ending at `eventStartTime` equals the openPrice of the current window — both
+ * are the same Chainlink price at that exact timestamp.
+ *
+ * @param symbol - Crypto symbol: "BTC", "ETH", "SOL", "XRP"
+ * @param variant - Window duration: "fiveminute" or "fifteenminute"
+ * @param eventStartTime - ISO timestamp of the current window's start
+ * @returns The official oracle strike price, or null if not yet available
+ */
+export async function fetchOracleStrike(
+  symbol: string,
+  variant: "fiveminute" | "fifteenminute",
+  eventStartTime: string,
+): Promise<number | null> {
+  const cacheKey = `${symbol}-${eventStartTime}`;
+  const cached = oracleStrikeCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < ORACLE_CACHE_TTL_MS) return cached.strike;
+
+  try {
+    const url = `https://polymarket.com/api/past-results?symbol=${symbol}&variant=${variant}&assetType=crypto&currentEventStartTime=${eventStartTime}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+
+    const body = (await resp.json()) as {
+      status: string;
+      data?: { results?: PastResultEntry[] };
+    };
+
+    if (body.status !== "success" || !body.data?.results?.length) return null;
+
+    // Find the entry whose endTime matches our window's start time.
+    // Its closePrice IS the official oracle price at that boundary.
+    const results = body.data.results;
+    const targetEnd = new Date(eventStartTime).getTime();
+
+    for (const entry of results) {
+      const entryEnd = new Date(entry.endTime).getTime();
+      if (Math.abs(entryEnd - targetEnd) < 5000 && entry.closePrice != null) {
+        oracleStrikeCache.set(cacheKey, { strike: entry.closePrice, ts: Date.now() });
+        return entry.closePrice;
+      }
+    }
+
+    // Fallback: the last completed entry's closePrice is the most recent oracle price
+    const lastComplete = [...results].reverse().find((r) => r.closePrice != null);
+    if (lastComplete) {
+      oracleStrikeCache.set(cacheKey, { strike: lastComplete.closePrice!, ts: Date.now() });
+      return lastComplete.closePrice;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map Binance symbol to short oracle symbol.
+ * "BTCUSDT" → "BTC", "ETHUSDT" → "ETH", etc.
+ */
+export function toOracleSymbol(binanceSymbol: string): string {
+  return binanceSymbol.replace("USDT", "");
+}
+
+/**
+ * Map window duration to past-results variant.
+ * 300_000 (5 min) → "fiveminute", 900_000 (15 min) → "fifteenminute"
+ */
+export function toVariant(durationMs: number): "fiveminute" | "fifteenminute" {
+  return durationMs >= 900_000 ? "fifteenminute" : "fiveminute";
+}
+
+// ── Math Utilities ────────────────────────────────────────────────────
+
+/**
+ * Standard normal CDF — Abramowitz & Stegun approximation.
+ * Accurate to ~1e-7 for all x.
+ */
+export function normalCDF(x: number): number {
+  const a1 = 0.254829592;
+  const a2 = -0.284496736;
+  const a3 = 1.421413741;
+  const a4 = -1.453152027;
+  const a5 = 1.061405429;
+  const p = 0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  const absX = Math.abs(x);
+  const t = 1.0 / (1.0 + p * absX);
+  const y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-absX * absX / 2);
+  return 0.5 * (1.0 + sign * y);
+}
+
+/**
+ * Standard normal PDF: φ(x) = exp(-x²/2) / √(2π)
+ */
+export function normalPDF(x: number): number {
+  return Math.exp(-x * x / 2) / Math.sqrt(2 * Math.PI);
+}
+
+// ── Probability Model ─────────────────────────────────────────────────
+
+/**
+ * Calculate P_true: probability that a binary "above $K" contract settles YES.
+ * Models the contract as a digital option on BTC/ETH/SOL spot price.
+ *
+ * z = ln(S/K) / (σ × √τ)   where τ = timeRemainingMs / 300_000 (in 5-min units)
+ * P_true = Φ(z)  for "above" strike,  Φ(-z)  for "below" strike
+ *
+ * At expiry (timeRemaining ≤ 0): returns deterministic 0 or 1.
+ */
+export function calculatePTrue(
+  spotPrice: number,
+  strikePrice: number,
+  strikeDirection: "above" | "below",
+  timeRemainingMs: number,
+  volatility5minPct: number, // e.g. 0.15 for 0.15% 5-min vol
+): number {
+  // At or past expiry — deterministic
+  if (timeRemainingMs <= 0) {
+    const isAbove = spotPrice > strikePrice;
+    return strikeDirection === "above" ? (isAbove ? 1 : 0) : (isAbove ? 0 : 1);
+  }
+
+  // Convert vol from % to decimal (0.15% → 0.0015)
+  const sigma = volatility5minPct / 100;
+  if (sigma <= 0) {
+    // Zero vol — deterministic
+    const isAbove = spotPrice > strikePrice;
+    return strikeDirection === "above" ? (isAbove ? 1 : 0) : (isAbove ? 0 : 1);
+  }
+
+  // τ in 5-minute units
+  const tau = timeRemainingMs / 300_000;
+  const z = Math.log(spotPrice / strikePrice) / (sigma * Math.sqrt(tau));
+
+  return strikeDirection === "above" ? normalCDF(z) : normalCDF(-z);
+}
+
+/**
+ * Calculate Delta: sensitivity of P_true to spot price changes.
+ * Delta = dP_true/dSpot = φ(z) / (S × σ × √τ)
+ *
+ * This is the binary option delta — tells us:
+ *   1. How fast quotes go stale when spot moves (adverse selection risk)
+ *   2. Dollar-risk per share of inventory: dollar_risk = q × δ × S
+ *   3. When to kill-switch (|δ| too high → any quote is instantly stale)
+ *
+ * Returns signed delta: positive for "above" (spot up → P up), negative for "below".
+ */
+export function calculateDelta(
+  spotPrice: number,
+  strikePrice: number,
+  strikeDirection: "above" | "below",
+  timeRemainingMs: number,
+  volatility5minPct: number,
+): number {
+  if (timeRemainingMs <= 0) return 0;
+
+  const sigma = volatility5minPct / 100;
+  if (sigma <= 0) return 0;
+
+  const tau = timeRemainingMs / 300_000;
+  const sqrtTau = Math.sqrt(tau);
+  const z = Math.log(spotPrice / strikePrice) / (sigma * sqrtTau);
+
+  const rawDelta = normalPDF(z) / (spotPrice * sigma * sqrtTau);
+  return strikeDirection === "above" ? rawDelta : -rawDelta;
+}
+
+// ── Volatility Estimation ─────────────────────────────────────────────
+
+/**
+ * Estimate 5-minute volatility from price history (simple method).
+ * Computes mean absolute log-return across adjacent samples.
+ * Returns a percentage (e.g. 0.15 for 0.15% 5-min vol).
+ * Falls back to 0.15% with < 5 samples.
+ */
+export function estimateVolatility5min(priceHistory: PriceSnapshot[]): number {
+  if (priceHistory.length < 5) return 0.15; // default 0.15%
+  let sumAbsReturn = 0;
+  let count = 0;
+  for (let i = 1; i < priceHistory.length; i++) {
+    const prev = priceHistory[i - 1].price;
+    const curr = priceHistory[i].price;
+    if (prev > 0 && curr > 0) {
+      sumAbsReturn += Math.abs(Math.log(curr / prev));
+      count++;
+    }
+  }
+  if (count === 0) return 0.15;
+
+  // Average absolute log-return per sample
+  const avgAbsReturn = sumAbsReturn / count;
+  // Scale to 5-minute window: if samples are ~1s apart, there are ~300 samples in 5min
+  const avgDtMs = (priceHistory[priceHistory.length - 1].timestamp - priceHistory[0].timestamp) / count;
+  const samplesPerWindow = 300_000 / Math.max(avgDtMs, 100);
+  // Volatility scales as √N for independent samples
+  const vol5min = avgAbsReturn * Math.sqrt(samplesPerWindow);
+  return vol5min * 100; // convert to percentage
+}
+
+/**
+ * Real-time realized volatility using EMA of squared log-returns.
+ * Spikes immediately on momentum events, decays exponentially when calm.
+ *
+ * Uses log-returns (not raw dollar returns) to prevent microscopic 1-second
+ * BTC ticks from collapsing E_move calculations.
+ *
+ * @param priceHistory Recent price snapshots (at least 10 needed)
+ * @param emaWindowS EMA half-life in seconds (default 60s)
+ * @returns Volatility as percentage (e.g. 0.20 for 0.20% 5-min vol)
+ */
+export function realtimeVolatility(priceHistory: PriceSnapshot[], emaWindowS = 60): number {
+  if (priceHistory.length < 10) return estimateVolatility5min(priceHistory);
+
+  // Compute EMA of squared log-returns
+  let emaSquaredReturn = 0;
+  let initialized = false;
+
+  for (let i = 1; i < priceHistory.length; i++) {
+    const prev = priceHistory[i - 1];
+    const curr = priceHistory[i];
+    if (prev.price <= 0 || curr.price <= 0) continue;
+
+    const logReturn = Math.log(curr.price / prev.price);
+    const squaredReturn = logReturn * logReturn;
+
+    const dtMs = curr.timestamp - prev.timestamp;
+    if (dtMs <= 0) continue;
+
+    // EMA decay factor based on actual time between samples
+    const alpha = 1 - Math.exp(-dtMs / (emaWindowS * 1000));
+
+    if (!initialized) {
+      emaSquaredReturn = squaredReturn;
+      initialized = true;
+    } else {
+      emaSquaredReturn = alpha * squaredReturn + (1 - alpha) * emaSquaredReturn;
+    }
+  }
+
+  if (!initialized) return estimateVolatility5min(priceHistory);
+
+  // Convert EMA of squared returns (per-sample variance) to 5-min vol
+  const avgDtMs = (priceHistory[priceHistory.length - 1].timestamp - priceHistory[0].timestamp) / (priceHistory.length - 1);
+  const samplesPerWindow = 300_000 / Math.max(avgDtMs, 100);
+  // σ_5min = √(variance_per_sample × samples_per_window)
+  const vol5min = Math.sqrt(emaSquaredReturn * samplesPerWindow);
+  return vol5min * 100; // percentage
+}
+
+// ── Dust Utility ──────────────────────────────────────────────────────
+
+/**
+ * Round shares to 6 decimal places to prevent floating-point dust.
+ * Call immediately after any fill is registered to inventory.
+ */
+export function roundShares(shares: number): number {
+  return Math.round(shares * 1_000_000) / 1_000_000;
 }
