@@ -22,4 +22,8 @@ web/.next/
 web/test-results
 wallet-delete-me-later.md
 wrangler-dev.log
+wrangler-data/
 worker/launchd-*.log
+worker/.dev.pid
+worker/python-api.log
+worker/next-dev.log
