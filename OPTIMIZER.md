@@ -95,7 +95,7 @@ interface ReplayResult {
 Standalone Node.js script that reads local D1 SQLite directly (no worker needed):
 
 ```bash
-cd worker && npx tsx src/optimizer/optimize.ts [--iterations 2000] [--holdout 0.20] [--db path]
+cd worker && npx tsx src/optimizer/optimize.ts [--iterations 2000] [--holdout 0.20] [--db path] [--objective sharpe|sortino]
 ```
 
 **Algorithm:** Tree of Parzen Estimators (TPE). Maintains two distributions — `l(x)` from top 20% (good params) and `g(x)` from bottom 80% (bad). Samples candidates from `l(x)`, evaluates, updates. Converges in ~2,000 iterations without exhaustive grid search.
@@ -117,18 +117,27 @@ cd worker && npx tsx src/optimizer/optimize.ts [--iterations 2000] [--holdout 0.
 | `dead_zone_pct` | 0–0.05 | continuous |
 | `sell_excess` | true/false | boolean |
 
-**Objective:** Sharpe ratio = `mean(window_pnls) / std(window_pnls)` — optimizes risk-adjusted returns, not just total P&L.
+**Objective functions** (`--objective` flag):
+- **Sharpe ratio** (default) — `mean(pnls) / std(pnls)`. Classic risk-adjusted return. Penalizes all volatility equally.
+- **Sortino ratio** — `mean(pnls) / downside_std(pnls)`. Only penalizes downside deviation — doesn't punish outsized wins. Better for strategies where upside variance is desirable.
 
-**Overfitting guard:** 20% holdout (deterministic seeded split). Reports in-sample and out-of-sample Sharpe separately. Flags divergence.
+Both objectives also report: profit factor (gross wins / gross losses), fill rate, and total P&L for additional context.
+
+**Overfitting guards:**
+- **Chronological holdout** (last 20% of windows by time). No temporal leakage — training data is always earlier than test data. Previous versions used random holdout which could interleave train/test windows in time.
+- **Minimum bucket size** (100 windows). Bucketed optimization skips any bucket with fewer windows to prevent overfitting on thin samples.
+- **Scaled bucket iterations** — `min(500, bucket_size × 3)`. Thin buckets get proportionally fewer search iterations, reducing the risk of finding spurious optima.
+- **Boundary warnings** — after optimization, flags any optimal params within 10% of their search bounds (suggests widening the range and re-running).
+- **Convergence curve** — logs best objective vs iteration count. Detects whether TPE has converged or needs more iterations.
 
 **Time-bucketed analysis** (runs after global optimization):
 - 4 time-of-day buckets (0-5, 6-11, 12-17, 18-23 UTC)
 - Weekday vs weekend
 - Per crypto symbol (BTC, ETH, SOL, XRP)
 - Per window duration (5min, 15min, 4hr)
-- 500 iterations per bucket, reports whether bucket-specific params outperform global
+- Iterations scaled to bucket size, reports whether bucket-specific params outperform global
 
-**Output:** Top 10 parameter sets by Sharpe + best params as JSON for direct use in strategy config.
+**Output:** Top 10 parameter sets with Sharpe, Sortino, profit factor, mean P&L. Convergence curve with recommendation on whether more iterations would help. Best params as JSON for direct use in strategy config.
 
 ## Schema
 
@@ -199,7 +208,8 @@ npx wrangler d1 execute polybot --command \
 
 ### Run optimizer
 ```bash
-cd worker && npx tsx src/optimizer/optimize.ts                    # default: 2000 iterations, 20% holdout
+cd worker && npx tsx src/optimizer/optimize.ts                    # default: 2000 iterations, sharpe, 20% holdout
+cd worker && npx tsx src/optimizer/optimize.ts --objective sortino # optimize sortino ratio (ignore upside variance)
 cd worker && npx tsx src/optimizer/optimize.ts --iterations 500   # quick test
 cd worker && npx tsx src/optimizer/optimize.ts --holdout 0.30     # larger holdout
 ```
@@ -235,12 +245,23 @@ cd worker && npx tsx src/optimizer/migrate-tape.ts
 - **Run first optimization** once 500+ windows accumulated (~2 days of recording). Compare optimized vs default params on holdout set.
 - **Deploy optimized params** to a second safe-maker instance running alongside the recorder, compare live performance.
 - **Reduce tick frequency for long windows** — record every 3rd tick for windows > 60min to keep snapshot size manageable.
+- **Parameter stability analysis** — after finding optimal params, perturb each ±10-20% and check how the objective changes. Sharp peaks (small perturbation → big drop) indicate fragile params unlikely to hold up live. Prefer broad, flat optima.
+- **Fill discount sensitivity** — add a `--fill-discount 0.7` flag that assumes only X% of simulated fills would occur live (accounts for our orders consuming liquidity that others would have taken). If Sharpe collapses with mild discounts, the params are overfitting to favorable fill assumptions.
 
 ### Medium-term
+- **Walk-forward validation** — replace or supplement chronological holdout with rolling walk-forward: train on weeks 1-3, test on week 4, then roll forward. More realistic for non-stationary markets. Requires 2+ weeks of data.
+- **CMA-ES or Optuna** — if TPE convergence is poor or misses parameter correlations (check convergence curve), switch to CMA-ES (handles correlated continuous params via covariance matrix) or Optuna (battle-tested TPE with pruning and multi-objective). TPE treats params somewhat independently.
+- **Multi-objective optimization** — Sharpe/Sortino alone can hide problems. A strategy with Sharpe 2.0 but 15 trades is different from Sharpe 1.5 with 200 trades. Optimize Sharpe + fill count jointly (Pareto frontier), pick from the frontier based on risk preferences. Optuna's `NSGAIISampler` handles this.
+- **Composite objective** — blend Sortino with profit factor (`0.6 * sortino + 0.4 * profit_factor`). Sortino can be gamed by one huge win + many small losses; profit factor catches that.
+- **Regularization** — add penalty for param sets far from defaults: `objective = sortino - λ × distance_from_defaults`. Prevents exotic combinations that work on historical data but are fragile.
+- **Expand search space to signal params** — currently signal computation, regime classification, and fair values are recorded and accepted as-is. The optimizer finds the best downstream response to a fixed signal. Expanding to include signal parameters (thresholds, layer weights) would optimize the full pipeline, but requires recomputing signals during replay (expensive).
 - **Add recording to other strategies** — the snapshot data is strategy-agnostic. Wire recording into orchestrator, avellaneda-maker, or any future strategy. Same `TickSnapshot` format, same replay engine.
 - **Multi-strategy replay** — build replay functions for other strategies (not just safe-maker). Replay the same recorded data through different strategy logic to compare approaches head-to-head.
 - **Automated optimization pipeline** — cron job that runs the optimizer nightly on new data, alerts if optimal params have shifted significantly.
 - **Parameter scheduling** — if time-bucketed analysis shows strong patterns (e.g., tighter params during low-liquidity hours), auto-switch params by time of day.
+- **Partial snapshot writes** — write in-progress snapshots to D1 every N ticks with a `complete` flag. Prevents data loss on DO eviction for long windows (4hr). Currently snapshots are memory-only until window resolves.
+- **Book conviction in search space** — 7-field bookConviction is recorded per tick but only a subset is used by the replay engine. Adding conviction-derived params (e.g., "ignore signal when book conviction disagrees") could improve results.
+- **Data retention** — at ~1.2GB/month, D1 will need rotation. Archive snapshots older than 2-3 months to external storage, keep only recent data for active optimization.
 
 ### Long-term
 - **Online learning** — lightweight param adjustment during live trading based on recent window outcomes (bandit-style, not full TPE).

@@ -152,14 +152,20 @@ See [OPTIMIZER.md](./OPTIMIZER.md) for full architecture, schema, operations, an
 - [x] Design `strategy_snapshots` schema (one row per resolved window, JSON ticks array)
 - [x] Add snapshot recording to safe-maker tick loop (behind `record_snapshots: true` param)
 - [x] Build pure-function replay engine (`optimizer/replay.ts`)
-- [x] Build TPE optimizer CLI (`optimizer/optimize.ts`) — 13-param search, Sharpe objective, 20% holdout
+- [x] Build TPE optimizer CLI (`optimizer/optimize.ts`) — 13-param search, Sharpe/Sortino objective, chronological holdout
 - [x] Compress tape data: raw trades → volume buckets (14KB/tick, ~40MB/day)
 - [x] Fix DO persistence crash (strip `tickSnapshots` from DO storage)
 - [x] Deploy recorder on always-on Mac mini, accumulating data 24/7
+- [x] Overfitting guards: min bucket size (100), scaled iterations, boundary warnings, convergence curve
 - [ ] Accumulate 500+ windows (~2 days) then run first optimization
+- [ ] Parameter stability analysis: perturb optimal params ±10-20%, check objective sensitivity
+- [ ] Fill discount sensitivity: test robustness under reduced fill assumptions
 - [ ] Deploy optimized params alongside default, compare live performance
+- [ ] Walk-forward validation (needs 2+ weeks of data)
 - [ ] Add recording to other strategies (orchestrator, avellaneda-maker)
 - [ ] Multi-strategy replay: test same data through different strategy logic
+- [ ] Evaluate CMA-ES or Optuna if TPE convergence is poor
+- [ ] Multi-objective optimization (Sharpe + fill count Pareto frontier)
 - [ ] Automated nightly optimization pipeline
 
 ---
