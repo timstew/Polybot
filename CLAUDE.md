@@ -136,6 +136,9 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 | `strategy_orders` | Open/filled/cancelled orders | id (PK), strategy_id, token_id, side, price, size, status |
 | `strategy_trades` | Executed strategy trades | id (PK), strategy_id, token_id, side, price, size, fee_amount, pnl |
 | `strategy_logs` | Structured strategy logs | id (auto), strategy_id, tick, level, message, symbol, direction, signal_strength, flip_count |
+| `strategy_snapshots` | Per-window tick recordings for offline replay | id (PK), strategy_id, crypto_symbol, window_duration_ms, outcome, ticks (JSON), hour_utc, day_of_week |
+| `strategy_regime_log` | Orchestrator regime performance log | id (auto), strategy_id, regime, tactic_id, outcome, pnl |
+| `tactic_scores` | Bandit tactic scores (Thompson Sampling) | (strategy_id, regime, tactic_id) PK, n, total_pnl, wins, losses |
 
 ### `polybot-firehose` database (worker/schema-firehose.sql)
 | Table | Purpose | Key columns |
@@ -177,9 +180,15 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 | `worker/src/strategies/unified-adaptive.ts` | Unified strategy: picks sniper/maker per window, adaptive bid sizing, wallet management |
 | `worker/src/strategies/split-arb.ts` | Split arbitrage strategy |
 | `worker/src/strategies/passive-mm.ts` | Passive market making strategy |
+| `worker/src/strategies/orchestrator.ts` | Meta-strategy: regime-based tactic selection with Thompson Sampling bandit |
+| `worker/src/strategies/regime.ts` | Regime classification (trending, oscillating, calm, volatile, near-strike, late-window) |
+| `worker/src/optimizer/types.ts` | Shared types for snapshot recording and replay (TickSnapshot, WindowSnapshot, TapeBucket) |
+| `worker/src/optimizer/replay.ts` | Pure replay engine: replayWindow(snapshot, params) → ReplayResult |
+| `worker/src/optimizer/optimize.ts` | TPE optimizer CLI: reads D1 SQLite, runs Bayesian param search, outputs best configs |
+| `worker/src/optimizer/migrate-tape.ts` | One-time migration: raw tape entries → volume buckets (ran March 23) |
 | `worker/src/categories.ts` | marketHasFees() + DEFAULT_FEE_RATE (0.0625) |
 | `worker/src/types.ts` | TypeScript interfaces: CopyTarget, CopyTrade, DataApiTrade, Env |
-| `worker/schema-ops.sql` | D1 schema: copy_targets, copy_trades, strategy_configs, strategy_orders, strategy_trades, strategy_logs |
+| `worker/schema-ops.sql` | D1 schema: copy_targets, copy_trades, strategy_configs, strategy_orders, strategy_trades, strategy_logs, strategy_snapshots |
 | `worker/wrangler.toml` | D1 bindings (DB, FIREHOSE_DB), DO bindings (4 DOs), PYTHON_API_URL, cron trigger |
 
 ### Frontend (Next.js on Cloudflare Pages)
@@ -205,6 +214,7 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 | File | Role |
 |------|------|
 | `ROADMAP.md` | Phased plan: cloud paper trading → GCE microservice → real trading → production |
+| `OPTIMIZER.md` | Offline replay and parameter optimization: snapshot recording, replay engine, TPE optimizer |
 | `STRATEGY-IMPROVEMENTS.md` | Top-10 improvement hitlist + per-strategy analysis + bid size test results |
 | `redemption-code.md` | EOA wallet setup + on-chain position redemption for real trading |
 
@@ -238,6 +248,13 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 - **Market discovery**: `discoverCryptoMarkets()` polls Data API `/trades` to find active "Up or Down" crypto markets. Extracts symbol, window timing, token IDs from market titles.
 - **Resolution verification**: `checkMarketResolution()` calls Gamma API to confirm Polymarket's outcome. Binance price is used for narrative prediction only (never for actual outcome). 30-min timeout if Gamma never resolves.
 - **Balance protection (ratchet lock)**: Per-strategy bankroll protection. Set `balance_usd` on a config to enable. `lock_increment_usd` (defaults to `balance_usd`) controls ratchet step size. The DO tracks `high_water_balance` in state and computes `locked_amount = max(0, floor(hwm / increment) - 1) * increment`. When `working_capital = current_balance - locked_amount <= 0`, the strategy auto-stops. Status endpoint returns `balance_protection` object with `current_balance`, `locked_amount`, `working_capital`, `high_water_balance`.
+
+### Offline Optimization (see [OPTIMIZER.md](./OPTIMIZER.md))
+- **Snapshot recording**: Safe-maker captures per-tick market state (signal, regime, fair values, book conviction, volume-bucketed trade tape) when `record_snapshots: true`. Data flushes to D1 `strategy_snapshots` on window resolution. ~14KB/tick, ~40MB/day.
+- **Replay engine**: Pure function `replayWindow(snapshot, params)` mirrors safe-maker tick loop. Deterministic, no API calls. Uses `checkBucketFill()` against recorded volume buckets for fill simulation.
+- **TPE optimizer**: Standalone CLI (`npx tsx src/optimizer/optimize.ts`) reads local D1 SQLite, runs 2,000-iteration Bayesian search over 13 parameters, maximizes Sharpe ratio with 20% holdout. Buckets by crypto symbol, window duration, time of day, weekday/weekend.
+- **DO persistence**: `persistState()` strips `tickSnapshots` before writing (avoids SQLITE_TOOBIG). Status endpoint also strips them (prevents dashboard timeout). Both re-initialize on hydration.
+- **Always-on recording**: Mac mini at `clawdia@100.70.186.4` runs safe-maker-recorder 24/7. `dev-remote.sh` health-checks every 10s, keep-alive pings active strategies every 60s.
 
 ### Infrastructure
 - **Fee detection**: `marketHasFees()` checks title for crypto keywords (Bitcoin, Ethereum, up or down, above). Default: assume fees when title is empty. Rate: 6.25%. Formula: `fee = exec_price * (1 - exec_price) * 0.0625 * size`.

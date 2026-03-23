@@ -112,6 +112,7 @@ curl -s localhost:8787/api/strategy/logs/<config-id>?limit=30
 
 **Local dev notes**:
 - Always use `./dev.sh` (never `npm exec wrangler dev` — it swallows flags). See `dev.sh` for details.
+- **`./dev.sh` kills and restarts all services** (worker, Python API, web) every time it's run. If a previous `dev.sh` is running, it kills that too. This is the correct way to pick up code changes — just re-run `./dev.sh`.
 - `--persist-to .wrangler/state` keeps DO state across wrangler restarts
 - `enable_order_flow: true` works because `wrangler dev` runs in Node.js (WebSocket connections persist via DO alarms)
 - DOs may lose state on eviction — strategy configs are in D1 (durable), but window state (active positions, inventory) is in-memory
@@ -138,6 +139,81 @@ tail -f worker/launchd-err.log
 ```
 
 If the Node.js path changes (e.g. nvm version update), edit the `PATH` in the plist to match `which npx`.
+
+### Remote Mac Mini (Always-On Dev Server)
+
+The Mac mini at `clawdia@100.70.186.4` (Tailscale) runs all three services 24/7 with auto-restart on crash/reboot.
+
+| Service | Port | URL from laptop |
+|---------|------|-----------------|
+| Worker (wrangler dev) | 8787 | `http://100.70.186.4:8787` |
+| Python API (uvicorn) | 8000 | `http://100.70.186.4:8000` |
+| Web (next dev) | 3000 | `http://100.70.186.4:3000` |
+
+```bash
+# SSH in
+ssh clawdia@100.70.186.4
+
+# Open the dashboard from your laptop
+open http://100.70.186.4:3000
+
+# Check strategy status from laptop
+curl -s http://100.70.186.4:8787/api/strategy/statuses | python3 -m json.tool
+```
+
+#### Managing the services
+
+All three services are managed by `worker/dev-remote.sh`, which binds to `0.0.0.0` and health-checks every 10s.
+
+```bash
+# Restart all services
+ssh clawdia@100.70.186.4 'cd ~/Projects/Polybot/worker && kill $(cat .dev-remote.pid) 2>/dev/null; sleep 2; nohup ./dev-remote.sh > /dev/null 2>&1 &'
+
+# Stop all services
+ssh clawdia@100.70.186.4 'cd ~/Projects/Polybot/worker && kill $(cat .dev-remote.pid) 2>/dev/null'
+
+# View logs
+ssh clawdia@100.70.186.4 'tail -50 ~/Projects/Polybot/worker/wrangler-dev.log'
+ssh clawdia@100.70.186.4 'tail -50 ~/Projects/Polybot/worker/python-api.log'
+ssh clawdia@100.70.186.4 'tail -50 ~/Projects/Polybot/worker/next-dev.log'
+```
+
+#### Syncing code changes from laptop
+
+```bash
+rsync -avz \
+  --exclude node_modules --exclude .wrangler --exclude wrangler-data \
+  --exclude .venv --exclude __pycache__ --exclude .next --exclude out \
+  ~/Projects/Polybot/ clawdia@100.70.186.4:~/Projects/Polybot/
+
+# Then restart services to pick up changes
+ssh clawdia@100.70.186.4 'cd ~/Projects/Polybot/worker && kill $(cat .dev-remote.pid) 2>/dev/null; sleep 2; nohup ./dev-remote.sh > /dev/null 2>&1 &'
+```
+
+#### Auto-start on boot (LaunchAgent)
+
+A LaunchAgent at `~/Library/LaunchAgents/com.polybot.worker.plist` runs `dev-remote.sh` on login with `KeepAlive=true`.
+
+```bash
+# Enable (already loaded)
+ssh clawdia@100.70.186.4 'launchctl load ~/Library/LaunchAgents/com.polybot.worker.plist'
+
+# Disable
+ssh clawdia@100.70.186.4 'launchctl unload ~/Library/LaunchAgents/com.polybot.worker.plist'
+
+# LaunchAgent logs
+ssh clawdia@100.70.186.4 'tail -30 ~/Projects/Polybot/worker/launchd-stdout.log'
+ssh clawdia@100.70.186.4 'tail -30 ~/Projects/Polybot/worker/launchd-stderr.log'
+```
+
+#### Environment on the Mac mini
+
+- **Bun** 1.3.11: `~/.bun/bin/bun` (package manager + script runner)
+- **Node.js** v22.16.0: `~/.local/node/bin/node` (required by wrangler)
+- **Python** 3.12: via Homebrew, venv at `~/Projects/Polybot/.venv`
+- **Homebrew**: `/opt/homebrew/bin/brew`
+- **Wrangler auth**: OAuth token at `~/Library/Preferences/.wrangler/config/default.toml` (auto-refreshes)
+- **Config**: `.env` and `worker/.dev.vars` copied from laptop
 
 ### Remote/Production Setup
 
@@ -189,10 +265,30 @@ curl -s $WORKER/api/strategy/statuses | python3 -m json.tool
 | `directional-maker` | `directional-maker.ts` | Aggressive signal-biased maker, sells ALL losing-side inventory on flip | Trending markets (higher variance) |
 | `safe-maker` | `safe-maker.ts` | Conservative signal-biased maker, protects paired inventory from sale | Lower risk directional |
 | `conviction-maker` | `conviction-maker.ts` | One-sided conviction bets, only bids when signal > 0.60, hold to resolution | Strong trends, BTC lead-lag |
+| `avellaneda-maker` | `avellaneda-maker.ts` | Avellaneda-Stoikov market maker with P_true + Delta pricing | Volatile markets |
+| `certainty-taker` | `certainty-taker.ts` | BoneReader-style taker, sweeps at P_true > 0.95 | High-conviction late-window |
 | `directional-taker` | `directional-taker.ts` | Market-takes based on signal | Not viable (ultra-wide spreads) |
 | `unified-adaptive` | `unified-adaptive.ts` | Picks sniper/maker per window, adaptive sizing | Mixed conditions |
+| `orchestrator` | `orchestrator.ts` | Meta-strategy: regime-based tactic selection with Thompson Sampling bandit | Adaptive regime switching |
 | `split-arb` | `split-arb.ts` | Complementary token arbitrage | Low-spread opportunities |
 | `passive-mm` | `passive-mm.ts` | Passive market making | General market making |
+
+### Snapshot Recording & Optimization
+
+See [OPTIMIZER.md](./OPTIMIZER.md) for full architecture and future plans.
+
+A safe-maker with `record_snapshots: true` runs 24/7 on the Mac mini, capturing per-tick market data for offline parameter optimization.
+
+```bash
+# Check recording status (on Mac mini)
+ssh clawdia@100.70.186.4 'export PATH="$HOME/.local/node/bin:$HOME/.bun/bin:$PATH"; cd ~/Projects/Polybot/worker && npx wrangler d1 execute polybot --command "SELECT count(*) as rows, round(sum(length(ticks))/1024.0/1024.0,1) as mb FROM strategy_snapshots"'
+
+# Breakdown by symbol and duration
+ssh clawdia@100.70.186.4 'export PATH="$HOME/.local/node/bin:$HOME/.bun/bin:$PATH"; cd ~/Projects/Polybot/worker && npx wrangler d1 execute polybot --command "SELECT crypto_symbol, window_duration_ms/60000 as min, count(*) as n FROM strategy_snapshots GROUP BY 1,2"'
+
+# Run optimizer (on Mac mini — reads local D1 SQLite directly)
+ssh clawdia@100.70.186.4 'export PATH="$HOME/.local/node/bin:$HOME/.bun/bin:$PATH"; cd ~/Projects/Polybot/worker && npx tsx src/optimizer/optimize.ts'
+```
 
 ### Monitoring Commands
 

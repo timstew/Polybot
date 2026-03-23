@@ -1,25 +1,57 @@
 # Strategy Improvements
 
-> Last updated: March 16, 2026. Reflects adaptive repricing (volatility offset, time-decay, reluctant requoting), tape fill protection, and maker rebate tracking.
+> Last updated: March 23, 2026. Added data-driven improvement estimates from 24h safe-maker analysis (424 windows, $200 capital). Previous speculative estimates replaced with measured $ values.
+
+> **Automated optimization**: The [offline parameter optimizer](./OPTIMIZER.md) can now replay recorded market data with different parameter sets to find optimal configurations by Sharpe ratio — bucketed by crypto symbol, window duration, and time of day. Use it to test improvements below against real data before deploying.
 
 ---
 
-## Top 10 Most Impactful Remaining Improvements
+## Data-Driven Improvement Priorities (March 23 Analysis)
 
-Ranked by expected impact. Focus on safe-maker + directional-maker since they run real+paper side-by-side.
+Based on 24.1 hours of safe-maker paper trading: 424 windows, +$23 net P&L, $200 capital.
 
-| # | Improvement | Expected Impact | Status |
-|---|------------|-----------------|--------|
-| 1 | **Inventory-aware asymmetric offsets** — widen heavy-side offset, tighten light-side offset instead of binary cancel | +$2.50/window | TODO |
-| 2 | **Fill rate feedback loop** — auto-tune offset to target ~60% fill rate per symbol/regime | +$2.00/window | TODO |
-| 3 | **Cross-asset momentum cascade** — use BTC lead-lag to pre-adjust ALT offsets before price catches up | +$1.50/window ALTs | TODO |
-| 4 | **Per-crypto bid sizing** — BTC=50, ETH=40, SOL=30, XRP=20 based on liquidity depth | +$2.00/window | TODO |
-| 5 | **Multi-tier bids** — 2-3 price levels per side for smoother fills and better average price | +$1.25/window | TODO |
-| 6 | **Conditional entry timing** — wait 15-30s after window open for volume/spread confirmation | +$1.50/window | TODO |
-| 7 | **Polymarket tape order flow signal** — analyze buy/sell imbalance in existing tape data | +$1.00/window | TODO |
-| 8 | **Per-crypto conviction bias** — tune per asset from realized directional accuracy | +$1.50/window (XRP) | TODO |
-| 9 | **Adaptive pair cost by duration** — 5min=0.90, 15min=0.93, 60min=0.96 | +$1.50/window on 5min | TODO |
-| 10 | **Window overlap exploitation** — use 5min resolution as signal for overlapping 15min window | +$0.80/window | TODO |
+**P&L breakdown:**
+- Merges: **+$1,133** (116 merges across 119 paired windows)
+- Resolve: **-$239** (351 resolutions; 63% win rate on paired, 7.5% on one-sided)
+- Sells: **-$855** (387 sells at avg $0.06 — nearly total loss on each)
+- By crypto: BTC -$424, XRP -$259, ETH -$241, SOL -$172, merges +$1,219
+
+**Core finding:** 72% of windows are one-sided (only 1 token side fills). One-sided windows lose 92.5% of the time at resolution. ALL profit comes from 28% paired windows.
+
+### Ranked Improvements (measured $ values, annualized from 24h sample)
+
+| # | Improvement | Est. Savings (24h) | Annualized | Status | Complexity |
+|---|------------|-------------------|------------|--------|------------|
+| 1 | **Disable sell excess** — never sell one-sided inventory, hold to resolution | **+$855** | ~$13k/yr | DONE | Trivial |
+| 2 | **Asymmetric fill detection** — cancel remaining bids after 1-sided fill persists >3 ticks | **+$260** | ~$3.9k/yr | TODO | Medium |
+| 3 | **Per-crypto capital allocation** — reduce XRP/BTC exposure, they lose more per window | **+$180** | ~$2.7k/yr | TODO | Low |
+| 4 | **Signal-gated quoting** — stop quoting losing side when signal > 80% | **+$85** | ~$1.3k/yr | TODO | Low |
+| 5 | **Pairing rate boost** — inventory-aware asymmetric offsets to attract the unfilled side | **+$200** | ~$3.0k/yr | TODO | Medium |
+| 6 | **Fill rate feedback loop** — auto-tune offset from realized fills per (symbol, regime) | **+$100** | ~$1.5k/yr | TODO | Medium |
+| 7 | **Cross-asset momentum cascade** — use BTC lead-lag to pre-cancel ALT wrong-side bids | **+$80** | ~$1.2k/yr | TODO | Medium |
+| 8 | **Multi-tier bids** — 2-3 price levels for smoother avg cost and more pairs | **+$60** | ~$900/yr | TODO | Medium |
+| 9 | **Conditional entry timing** — wait 15-30s for volume/spread confirmation | **+$50** | ~$750/yr | TODO | Low |
+| 10 | **Window overlap exploitation** — use 5min resolution as signal for overlapping 15min | **+$30** | ~$450/yr | TODO | Medium |
+
+**Note:** Estimates 2-10 are not purely additive — some overlap (e.g., asymmetric fill detection + signal gate both reduce one-sided losses). Realistic combined improvement: $700-900/24h beyond the sell fix.
+
+---
+
+### Measurement Methodology
+
+All $ values derived from actual D1 `strategy_trades` data for `strat-1774171384225` (safe-maker, paper mode, grounded fills, $200 capital, 24.1h runtime). Key queries:
+
+**#1 sell_excess=false:** Direct sum of all SELL trade P&L = -$855. Already implemented.
+
+**#2 Asymmetric fill detection:** 103 multi-fill one-sided losing windows deployed $803 capital. If limited to 1 fill per one-sided window (cancel after detecting asymmetry), saves ~$260 in subsequent fill capital that resolved to $0. Conservative: assumes 50% detection accuracy since some asymmetry is only temporary.
+
+**#3 Per-crypto allocation:** BTC loses -$424 (475 buys, 128 resolves), XRP -$259 (193 buys, 63 resolves). Reducing allocation 30% on worst performers while keeping SOL/ETH stable saves ~$180. Alternative: skip XRP entirely (+$259 savings but lose any paired upside).
+
+**#4 Signal gate (no quoting when signal > 80%):** 478 fills at ≤$0.10 (penny bids from extreme signal states). These deploy $205 capital, almost all lost at resolution. Not all can be eliminated (some are early-window fills), but gating at signal > 0.80 prevents most late-window penny fills. Estimated 40% elimination = $85 saved.
+
+**#5 Pairing rate boost:** Current pairing rate 28% (119/424 windows). Each paired window earns avg $10.52 ($1,133 merges + $433 resolve / 119 windows). Each one-sided window loses avg $2.58 (-$684/265). Converting 20 one-sided windows to paired: 20 × ($10.52 + $2.58) = +$262. Conservatively discounted to $200 since achieving higher pairing is uncertain.
+
+**#6-10:** Speculative estimates based on the per-window economics above. Each improvement targets a different aspect of the one-sided fill problem or pair quality.
 
 ### Recently completed (March 15-16)
 
@@ -34,9 +66,67 @@ Ranked by expected impact. Focus on safe-maker + directional-maker since they ru
 
 ---
 
-## New Improvement Ideas (Deep Analysis)
+## Detailed Improvement Designs
 
-### 1. Inventory-Aware Asymmetric Offsets
+### NEW-1. Asymmetric Fill Detection (+$260/24h)
+
+**Problem**: When one side fills and the other doesn't within a few ticks, the strategy keeps bidding on the filled side, accumulating more wrong-side inventory. 103 multi-fill one-sided windows deployed $803 in capital that resolved to $0.
+
+**Implementation**:
+```
+Per-window state: track fills_since_last_pair = 0
+After each fill:
+  if only_one_side_has_inventory AND fills_since_last_pair >= 3:
+    → Cancel ALL bids on the filled side
+    → Tighten unfilled side bid (reduce offset 50%)
+    → Set cooldown: don't re-bid filled side for 5 ticks
+  if both sides have inventory:
+    → Reset fills_since_last_pair = 0
+
+Key: the detection is based on CONSECUTIVE one-sided fills, not absolute inventory.
+```
+
+**Where**: `safe-maker.ts` `manageWindows()` — add after fill checks, before `updateQuotes()`.
+
+**Risk**: Some one-sided fills eventually pair up. 7.5% of one-sided windows DO win at resolution. But 92.5% lose, so the math strongly favors early cancellation.
+
+### NEW-2. Per-Crypto Capital Allocation (+$180/24h)
+
+**Problem**: All 4 cryptos get equal capital, but performance varies dramatically:
+- BTC: -$424 (worst — 475 buys, most volatile)
+- XRP: -$259 (2nd worst — 193 buys, low liquidity)
+- ETH: -$241 (mid — 291 buys)
+- SOL: -$172 (best — 285 buys, most paired fills)
+
+**Implementation**: New param `crypto_allocation` — per-symbol capital multiplier:
+```
+SOL: 1.0x (baseline — best performer)
+ETH: 0.8x
+BTC: 0.6x (most volatile, worst performer)
+XRP: 0.5x (lowest liquidity, 2nd worst)
+```
+
+Applied to `effectiveBaseSize` computation in `updateQuotes()`. Could also modulate `max_capital_per_window`.
+
+### NEW-3. Signal-Gated Quoting (+$85/24h)
+
+**Problem**: When signal strength > 80%, the strategy bids on the losing side at penny prices ($0.01-$0.05). These fill easily (real trade tape has lots of penny volume from people dumping losers) but NEVER pair up. 478 fills at ≤$0.10 deployed $205 in dead capital.
+
+**Implementation**:
+```
+In updateQuotes():
+  if signal.signalStrength > 0.80:
+    losing_side = opposite of signal.direction
+    → Set losing_side bidSize = 0 (don't bid at all)
+    → Only bid conviction side
+
+  OR more aggressive: if signal.signalStrength > 0.80:
+    → Stop quoting entirely (window outcome is ~determined)
+```
+
+**Where**: Add before bid size computation in `updateQuotes()`, after conviction bias calculation.
+
+### EXISTING-1. Inventory-Aware Asymmetric Offsets (+$200/24h, part of pairing boost)
 
 **Problem**: Current per-tick inventory safety is binary — cancel the heavy-side bid entirely or keep it. This loses queue position and stops price discovery on that side.
 
@@ -669,6 +759,162 @@ Root cause: when the market moves directionally, one side's ask becomes cheap (t
 
 Before: 4 one-sided losses totaling -$20.30, 1 balanced win +$2.32
 After: 6 wins totaling +$17.88, 1 loss -$4.80 — net +$13.08
+
+---
+
+## Real-Mode Adverse Selection (March 22, 2026)
+
+### Problem: One-Sided Fills in Directional Markets
+
+First observed March 12 with unified-adaptive, confirmed catastrophically on March 22 with orchestrator/safe-maker in real mode. Lost $64 across 4 windows — all one-sided UP tokens in a DOWN market.
+
+**Root cause**: In directional CLOB markets, fills are structurally asymmetric:
+- When price moves DOWN: UP holders panic-sell → UP bids fill instantly
+- DOWN holders hold (winning side) → DOWN bids never fill
+- Strategy ends up 100% wrong-side inventory, zero pairs, total loss
+
+**This is NOT a pricing problem.** No bid price on the conviction side will attract sellers who are holding the winning token. The issue is structural to paired maker strategies in directional markets.
+
+### What Worked (paper mode)
+Paper fills are simulated symmetrically via fair value — both sides fill equally. This creates the illusion that paired making works universally. It doesn't in real markets.
+
+### What Failed (real mode)
+| Window | Tokens | Outcome | P&L | Problem |
+|--------|--------|---------|-----|---------|
+| BTC 3:30-3:45 | 30 UP @ $0.46 | DOWN | -$13.80 | Wrong-side only |
+| XRP 3:30-3:45 | 30 UP @ $0.30 | DOWN | -$23.48 | Flip + wrong-side |
+| SOL 3:30-3:45 | 30 UP @ $0.46 | DOWN | -$13.80 | Wrong-side only |
+| ETH 3:30-3:45 | 30 UP @ $0.44 | DOWN | -$13.20 | Wrong-side only |
+
+All 4 had conviction DOWN, matched=0 pairs, fills only on UP (wrong) side.
+
+### Solutions (Ranked by Priority)
+
+#### 1. Graduated Pair-First Scaling
+Start small, prove pairing works before scaling up. Limits max loss to ~$3 per window instead of ~$14.
+
+```
+Phase 1 (ticks 0-10):  bid 5 tokens on each side
+  → If both fill: advance to Phase 2
+  → If only one fills after 10 ticks: tighten unfilled side bid, cancel filled side
+  → If still one-sided after 20 ticks: accept $2-3 loss, stop quoting
+
+Phase 2 (ticks 10-30): bid 15 tokens on each side
+  → Same pairing check
+  → Scale to Phase 3 only if pair rate >= 50%
+
+Phase 3 (ticks 30+):   bid 30 tokens on each side
+  → Full-size only after pairing is proven in this specific window
+```
+
+#### 2. Regime-Conditional Behavior (per-tactic, not just tactic selection)
+The orchestrator picks tactics by regime, but the tactic itself should change behavior:
+
+| Regime | Pairing Strategy | Rationale |
+|--------|-----------------|-----------|
+| Oscillating | Full paired maker | Price bounces → both sides fill |
+| Calm | Paired maker, tight spreads | Low vol → shallow discounts work |
+| Trending | Conviction-only (one side) | Don't waste capital on unfillable side |
+| Volatile | Small sizes, pair-first | High risk → graduated approach |
+
+#### 3. Ask-Aware Bid Pricing
+Never bid above the best ask. Currently if UP ask = $0.30, we might bid UP at $0.46 — bidding ABOVE the ask guarantees instant adverse fill.
+
+```
+maxBid = min(signalDerivedBid, bestAsk - buffer)
+buffer = 0.02 for conviction side, 0.05 for non-conviction
+If bestAsk < 0.15: skip this side entirely (market says it's nearly worthless)
+```
+
+#### 4. Fill-Velocity Feedback
+React to fill asymmetry in real-time, not just inventory levels:
+
+```
+Track fills per side per window:
+  If UP fills 3x in 60s and DN fills 0x → market is directional
+  → Cancel UP bids immediately (don't wait for inventory cap)
+  → Either: aggressively chase DN, or accept directional bet
+```
+
+### New Strategy Ideas for Real Trading
+
+#### 5. Cross-Market Hedger
+BTC and ETH are ~85% correlated. If you get one-sided BTC UP, hedge by bidding ETH DOWN.
+- Pairs across markets instead of within a single market
+- Requires correlation tracking and cross-market position management
+- Novel approach — not seen on Polymarket
+
+#### 6. Oscillation-Only Maker
+Only enters in confirmed oscillating regimes. Sits out trending/volatile entirely.
+- Lower throughput (fewer windows) but much higher win rate
+- Oscillating = price bounces → both sides fill naturally
+- Could be a "safe mode" for real trading
+
+#### 7. CLOB Depth Maker (Phase 2 — requires CLOB WebSocket)
+Use Polymarket order book depth to identify which side has sell pressure:
+- More sell orders = more likely to fill our bids on that side
+- Balanced sell pressure on both sides = good for pairing
+- Unbalanced = skip or conviction-only
+- Needs live CLOB book data (GCE WebSocket service)
+
+#### 8. Micro-Scalper
+Very short hold times within a window:
+- Buy during a dip, sell on the bounce (30-60 second holds)
+- Doesn't hold to resolution — takes profit on mean reversion
+- Works best in oscillating regimes
+- Requires faster tick rate (1-2s) and taker sells (pays fees)
+
+---
+
+## Deep Analysis: Safe-Maker 24h Paper Run (March 22-23, 2026)
+
+Data source: `strat-1774171384225`, 24.1h runtime, $200 capital, grounded fills, 8 strategies running in parallel.
+
+### Headline Numbers
+| Metric | Value |
+|--------|-------|
+| Total windows | 424 |
+| Net P&L | +$23 |
+| Merge P&L | +$1,133 (116 merges) |
+| Resolve P&L | -$239 (351 resolutions) |
+| Sell P&L | -$855 (387 sells at avg $0.06) |
+| Pairing rate | 28% (119 paired / 424 total) |
+| Buy fills | 1,206 (627 UP + 581 DN) |
+| Avg buy price | $0.195 |
+
+### Paired vs One-Sided Windows
+| Metric | Paired (28%) | One-Sided (72%) |
+|--------|-------------|-----------------|
+| Resolve win rate | 63% (60/96) | 7.5% (19/265) |
+| Resolve P&L | +$433 | -$672 |
+| Merge P&L | +$1,133 | $0 |
+| Total P&L | **+$1,252** | **-$1,213** |
+
+### Why One-Sided Fills Are Almost Always Losers
+When only one side fills, it's usually the **wrong** side — the side that will resolve to $0. This is **adverse selection**: the only reason we're getting filled is that informed sellers are dumping losing tokens into our bid. The winning side has no sellers, so our bid sits unfilled.
+
+### Buy Price Distribution
+| Tier | Fills | Avg Price | Total Cost | Merges | Total P&L |
+|------|-------|-----------|------------|--------|-----------|
+| ≤$0.05 | 390 | $0.015 | $85 | 0 | -$289 |
+| $0.06-0.10 | 86 | $0.079 | $117 | 0 | (part of ≤0.10 tier) |
+| $0.11-0.20 | 158 | $0.153 | $441 | 0 | -$502 |
+| $0.21-0.30 | 162 | $0.255 | $724 | 0 | -$212 |
+| $0.31-0.40 | 249 | $0.360 | $1,724 | 0 | +$49 |
+| $0.41+ | 156 | $0.427 | $1,586 | **116** | **+$978** |
+
+**Key insight**: ALL merges happen in the $0.41+ tier. These are windows where fair value ≈ $0.50, regime discount brings bid to ~$0.44, and BOTH sides fill near that price. The cheap fills are losing-side penny bids from extreme signal states.
+
+### Per-Crypto Performance
+| Crypto | P&L | Buys | Resolves | Sells | Notes |
+|--------|-----|------|----------|-------|-------|
+| BTC | -$424 | 475 | 128 | 159 | Most volatile, worst performer |
+| XRP | -$259 | 193 | 63 | 53 | Low liquidity, 2nd worst |
+| ETH | -$241 | 291 | 96 | 88 | Mid performer |
+| SOL | -$172 | 285 | 81 | 87 | Best performer (most pairs) |
+
+### The Pricing Model (Not Broken)
+Book mids are always $0.50/$0.50 (spreads are $0.98 wide — uninformative). Fair value defaults to $0.50, regime discount (8-20%) produces bids at $0.40-$0.46. This is correct: $0.44 bids ARE where pairing happens. Lower bids don't pair better.
 
 ---
 

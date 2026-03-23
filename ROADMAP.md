@@ -2,15 +2,16 @@
 
 ## Current State (March 2026)
 
-**Paper trading locally** — all three tiers run on localhost:
+**Paper trading on two machines** — laptop (local dev) and always-on Mac mini (24/7 recording):
 - Worker (`wrangler dev`) — strategy execution, copy trading, D1 storage
-- Python API (`uvicorn`) — bot detection, CLOB client
-- Frontend (`next dev`) — dashboard
+- Python API (`uvicorn`) — bot detection, CLOB order execution
+- Frontend (`next dev`) — dashboard with strategy monitoring
 
-Strategies are paper-only: fills simulated via signal-derived fair value model.
-Three strategies proven profitable: spread-sniper, directional-maker, unified-adaptive.
+Real trading infrastructure complete (CLOB orders, position redemption, balance protection).
+Safe-maker recording tick-level snapshots 24/7 on the Mac mini for offline optimization.
 
 See [STRATEGY-IMPROVEMENTS.md](./STRATEGY-IMPROVEMENTS.md) for the top-10 improvement hitlist and per-strategy analysis.
+See [OPTIMIZER.md](./OPTIMIZER.md) for the offline replay and parameter optimization system.
 
 ---
 
@@ -54,14 +55,25 @@ If free-tier e2-micro is insufficient (CPU/memory), upgrade to e2-small (~$7/mon
 
 ```
 GCE e2-micro (always-on, us-central1)
-  ├── Binance aggTrade WebSocket connections (BTC, ETH, SOL, XRP)
+  ├── Binance aggTrade WebSocket (BTC, ETH, SOL, XRP)
   │     → GET /api/orderflow/{symbol} — returns OrderFlowSignal
-  │     → Worker polls this every tick (5s) instead of local WebSocket
+  │
+  ├── Polymarket CLOB WebSocket (per active token)
+  │     → GET /api/book/{tokenId} — live order book snapshot
+  │     → GET /api/fills/{strategyId} — fill notifications for our orders
+  │     → Replaces polling CLOB REST /book every tick
+  │
+  ├── Polymarket RTDS WebSocket (real-time trade stream)
+  │     → GET /api/tape?since={ms} — trade tape since timestamp
+  │     → Continuous tape for grounded fill model (no 200-trade limit)
+  │     → Also feeds copy trading listener (replaces /activity polling)
   │
   └── Redemption service
         → POST /api/redeem — redeems all winning positions for USDC
-        → Worker calls after resolution events
         → Uses py-clob-client + web3 (or polymarket-apis)
+
+Worker polls GCE each tick for buffered state (order flow, book, tape, fills)
+rather than maintaining its own connections or hitting external REST APIs.
 ```
 
 The microservice is a lightweight FastAPI app (can reuse existing `polybot/api.py` or be a separate service). Runs via systemd or Docker on the VM.
@@ -70,10 +82,13 @@ The microservice is a lightweight FastAPI app (can reuse existing `polybot/api.p
 - [ ] Create EOA wallet (signature_type=0) for programmatic trading + redemption
 - [ ] Fund EOA with POL (gas) + USDC.e on Polygon
 - [ ] Set contract allowances (6 approve txns, one-time)
-- [ ] Add `/api/orderflow/{symbol}` endpoint with background WebSocket thread
+- [ ] Add `/api/orderflow/{symbol}` endpoint with background Binance WS thread
+- [ ] Add `/api/book/{tokenId}` endpoint with background CLOB WS (live book + fill events)
+- [ ] Add `/api/tape?since={ms}` endpoint with background RTDS WS (continuous trade tape)
+- [ ] Add `/api/fills/{strategyId}` endpoint (buffers fill notifications from CLOB WS)
 - [ ] Add `/api/redeem` endpoint using py-clob-client or polymarket-apis
 - [ ] Deploy to GCE e2-micro with systemd service
-- [ ] Update Worker to call GCE for order flow instead of local WebSocket
+- [ ] Update Worker to poll GCE for order flow, book, tape, fills instead of REST APIs
 - [ ] Update Worker to call GCE for redemption after `resolveWindows()`
 
 ### Alternative: Cloud Run always-on
@@ -95,15 +110,29 @@ Switch from paper to real order execution. Requires EOA wallet from Phase 2.
 | Position redemption | GCE `/api/redeem` after each resolved window |
 | Risk management | Unified-adaptive wallet management enforces capital limits |
 
-**Remaining work:**
-- [ ] Implement real-mode fill detection in `strategy.ts` (replace `checkFills()` simulation)
-- [ ] Wire StrategyDO tick to call CLOB API for order placement/cancellation
-- [ ] Add order status polling (fills, partial fills, cancellations)
-- [ ] Integrate redemption call into `resolveWindows()` flow
-- [ ] Set conservative initial capital ($100-200) for first real trades
-- [ ] Add kill switch: manual stop via dashboard + automatic drawdown halt
-- [ ] Add real P&L tracking with on-chain balance verification
+**Completed:**
+- [x] Real-mode order placement and cancellation via CLOB API
+- [x] Fill detection via CLOB order status polling
+- [x] Redemption via Cloud Run `/api/redeem/sweep` (cron-driven)
+- [x] Balance protection with HWM profit locking
+- [x] Kill switch: manual stop via dashboard + auto-stop on low capital
+- [x] Real P&L tracking in D1 strategy_trades
+- [x] DO config reload on update (no restart needed)
+
+**Remaining work — adverse selection fixes (critical for profitability):**
+- [ ] Graduated pair-first scaling: start 5 tokens, scale to 15→30 only after pairing confirmed
+- [ ] Ask-aware bid pricing: never bid above best ask minus buffer
+- [ ] Fill-velocity feedback: cancel wrong-side bids after 3 same-side fills in 60s
+- [ ] Regime-conditional tactic behavior: conviction-only in trending, paired in oscillating
+- [ ] Per-tactic real-mode defaults: smaller bid sizes, faster fill-side cancellation
+- [ ] Paper vs real fill model comparison: log paper-predicted fills alongside real fills to calibrate
+
+**Remaining work — infrastructure:**
+- [ ] On-chain balance verification (compare wallet USDC to tracked balance)
+- [ ] Order reconciliation: compare tracked orderIds against CLOB open orders
 - [ ] Monitor slippage: compare real fill prices to paper model predictions
+
+See [STRATEGY-IMPROVEMENTS.md — Real-Mode Adverse Selection](./STRATEGY-IMPROVEMENTS.md#real-mode-adverse-selection-march-22-2026) for full analysis.
 
 ### Wallet Setup (one-time)
 
@@ -112,6 +141,26 @@ See [redemption-code.md](./redemption-code.md) for detailed EOA wallet setup:
 2. Fund on Polygon: POL for gas + USDC.e for trading
 3. Approve Polymarket contracts (CTF Exchange, Neg Risk Exchange, Neg Risk Adapter)
 4. Set env vars: `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE=0`
+
+---
+
+## Phase 3b: Autoresearch — Offline Strategy Optimization
+
+Replay recorded market data to iterate on strategy logic without waiting for live windows.
+See [OPTIMIZER.md](./OPTIMIZER.md) for full architecture, schema, operations, and future plans.
+
+- [x] Design `strategy_snapshots` schema (one row per resolved window, JSON ticks array)
+- [x] Add snapshot recording to safe-maker tick loop (behind `record_snapshots: true` param)
+- [x] Build pure-function replay engine (`optimizer/replay.ts`)
+- [x] Build TPE optimizer CLI (`optimizer/optimize.ts`) — 13-param search, Sharpe objective, 20% holdout
+- [x] Compress tape data: raw trades → volume buckets (14KB/tick, ~40MB/day)
+- [x] Fix DO persistence crash (strip `tickSnapshots` from DO storage)
+- [x] Deploy recorder on always-on Mac mini, accumulating data 24/7
+- [ ] Accumulate 500+ windows (~2 days) then run first optimization
+- [ ] Deploy optimized params alongside default, compare live performance
+- [ ] Add recording to other strategies (orchestrator, avellaneda-maker)
+- [ ] Multi-strategy replay: test same data through different strategy logic
+- [ ] Automated nightly optimization pipeline
 
 ---
 
