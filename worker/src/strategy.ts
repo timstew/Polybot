@@ -1156,7 +1156,11 @@ export class StrategyDO implements DurableObject {
 
     this.currentConfig!.active = true;
     this.state.windingDown = false;
-    this.state.started_at = new Date().toISOString();
+    // Preserve original start time and tick count across DO restarts
+    // so cumulative runtime (ticks × interval) is accurate
+    if (!this.state.started_at) {
+      this.state.started_at = new Date().toISOString();
+    }
 
     // Ensure HWM is at least current balance on start (never lower it — locked funds are permanent)
     if (this.currentConfig!.balance_usd != null) {
