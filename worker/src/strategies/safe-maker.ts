@@ -852,9 +852,7 @@ export class SafeMakerStrategy implements Strategy {
               "SELECT ticks FROM strategy_snapshots WHERE id = ?"
             ).bind(w.snapshotId).first<{ ticks: string }>();
             w.tickSnapshots = row?.ticks ? JSON.parse(row.ticks) : [];
-            console.log(`[SNAP] re-hydrated ${w.tickSnapshots.length} ticks from D1 for ${w.snapshotId.slice(0, 20)}`);
-          } catch (e) {
-            console.log(`[SNAP] re-hydration error: ${e}`);
+          } catch {
             w.tickSnapshots = [];
           }
         } else {
@@ -1011,9 +1009,6 @@ export class SafeMakerStrategy implements Strategy {
         });
 
         // Incrementally flush snapshots to D1 every tick to survive DO evictions
-        if (w.snapshotId && w.tickSnapshots.length > 0) {
-          console.log(`[SNAP] flushing ${w.tickSnapshots.length} ticks for ${w.snapshotId.slice(0, 20)}`);
-        }
         if (w.snapshotId) {
           try {
             const openDate = new Date(w.windowOpenTime);
