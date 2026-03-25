@@ -1008,8 +1008,8 @@ export class SafeMakerStrategy implements Strategy {
           upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
         });
 
-        // Incrementally flush snapshots to D1 every 10 ticks to survive DO evictions
-        if (w.snapshotId && w.tickSnapshots.length % 10 === 0) {
+        // Incrementally flush snapshots to D1 every tick to survive DO evictions
+        if (w.snapshotId) {
           try {
             const openDate = new Date(w.windowOpenTime);
             await ctx.db.prepare(
