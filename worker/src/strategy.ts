@@ -1330,11 +1330,11 @@ export class StrategyDO implements DurableObject {
         await this.strategy.tick(ctx);
         this.state.ticks++;
         const now = Date.now();
-        // Accumulate wall-clock runtime, but only count gaps < 60s
-        // (skips DO evictions, reboots, pauses)
+        // Accumulate wall-clock runtime, counting gaps up to 10 min
+        // (includes DO eviction/re-hydration cycles, skips reboots and manual stops)
         if (this.state.last_tick_at) {
           const elapsed = now - new Date(this.state.last_tick_at).getTime();
-          if (elapsed < 60_000) {
+          if (elapsed < 600_000) {
             this.state.cumulative_runtime_ms = (this.state.cumulative_runtime_ms || 0) + elapsed;
           }
         }
