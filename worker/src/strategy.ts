@@ -79,6 +79,7 @@ export interface StrategyState {
   started_at: string;
   ticks: number;
   errors: number;
+  cumulative_runtime_ms: number;
   custom: Record<string, unknown>;
   logs: LogEntry[];
   high_water_balance: number;
@@ -793,6 +794,7 @@ function emptyState(): StrategyState {
     started_at: "",
     ticks: 0,
     errors: 0,
+    cumulative_runtime_ms: 0,
     custom: {},
     logs: [],
     high_water_balance: 0,
@@ -1327,7 +1329,16 @@ export class StrategyDO implements DurableObject {
       try {
         await this.strategy.tick(ctx);
         this.state.ticks++;
-        this.state.last_tick_at = new Date().toISOString();
+        const now = Date.now();
+        // Accumulate wall-clock runtime, but only count gaps < 60s
+        // (skips DO evictions, reboots, pauses)
+        if (this.state.last_tick_at) {
+          const elapsed = now - new Date(this.state.last_tick_at).getTime();
+          if (elapsed < 60_000) {
+            this.state.cumulative_runtime_ms = (this.state.cumulative_runtime_ms || 0) + elapsed;
+          }
+        }
+        this.state.last_tick_at = new Date(now).toISOString();
       } catch (e) {
         this.state.errors++;
         this.addLog(`Tick error: ${e instanceof Error ? e.message : String(e)}`);

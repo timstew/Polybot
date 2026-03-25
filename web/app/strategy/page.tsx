@@ -92,9 +92,9 @@ function fmtDuration(ms: number): string {
 
 // PairPnl imported from strategy-windows
 
-/** Format cumulative active runtime from tick count × interval (immune to laptop suspend) */
-function fmtRunTime(ticks: number, tickIntervalMs: number): string {
-  const ms = ticks * tickIntervalMs;
+/** Format cumulative active wall-clock runtime (skips gaps from evictions/reboots/pauses) */
+function fmtRunTime(cumulativeMs: number): string {
+  const ms = cumulativeMs;
   if (ms <= 0) return "0m";
   const min = Math.floor(ms / 60_000);
   if (min < 60) return `${min}m`;
@@ -2080,7 +2080,7 @@ export default function StrategyPage() {
                 const riskCapital = c.balance_usd ?? c.max_capital_usd;
                 const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
                 const bp = st?.balance_protection;
-                const runTime = fmtRunTime(state?.ticks ?? 0, c.tick_interval_ms ?? 5000);
+                const runTime = fmtRunTime(state?.cumulative_runtime_ms ?? (state?.ticks ?? 0) * (c.tick_interval_ms ?? 5000));
                 return (
                   <React.Fragment key={c.id}>
                     <tr
@@ -2176,7 +2176,7 @@ export default function StrategyPage() {
               const riskCapital = c.balance_usd ?? c.max_capital_usd;
               const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
               const bp = st?.balance_protection;
-              const runTime = fmtRunTime(state?.ticks ?? 0, c.tick_interval_ms ?? 5000);
+              const runTime = fmtRunTime(state?.cumulative_runtime_ms ?? (state?.ticks ?? 0) * (c.tick_interval_ms ?? 5000));
               return (
                 <React.Fragment key={c.id}>
                   <div

@@ -696,6 +696,7 @@ export interface StrategyState {
   last_tick_at: string;
   started_at: string;
   ticks: number;
+  cumulative_runtime_ms?: number;
   errors: number;
   custom: Record<string, unknown>;
   logs: StrategyLogEntry[];

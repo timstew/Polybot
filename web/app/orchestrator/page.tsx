@@ -80,8 +80,8 @@ function fmtDuration(ms: number): string {
   return `${Math.floor(min / 60)}h${min % 60}m`;
 }
 
-function fmtRunTime(ticks: number, tickIntervalMs: number): string {
-  const ms = ticks * tickIntervalMs;
+function fmtRunTime(cumulativeMs: number): string {
+  const ms = cumulativeMs;
   if (ms <= 0) return "0m";
   const min = Math.floor(ms / 60_000);
   if (min < 60) return `${min}m`;
@@ -484,7 +484,7 @@ export default function OrchestratorPage() {
                   {state && config && (
                     <Tip tip="Active runtime">
                       <span className="text-muted-foreground cursor-help">
-                        {fmtRunTime(state.ticks, config.tick_interval_ms)}
+                        {fmtRunTime(state.cumulative_runtime_ms ?? state.ticks * config.tick_interval_ms)}
                       </span>
                     </Tip>
                   )}
