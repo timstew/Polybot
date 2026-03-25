@@ -106,6 +106,7 @@ interface MakerWindowPosition {
 
   // Snapshot recording (populated when record_snapshots=true)
   tickSnapshots?: TickSnapshot[];
+  snapshotId?: string; // deterministic D1 row ID for incremental snapshot persistence
 }
 
 interface BookConviction {
@@ -808,7 +809,10 @@ export class SafeMakerStrategy implements Strategy {
         enteredAt: now,
         tickAction: "",
       };
-      if (params.record_snapshots) window.tickSnapshots = [];
+      if (params.record_snapshots) {
+        window.tickSnapshots = [];
+        window.snapshotId = `snap-${market.conditionId}-${now}`;
+      }
 
       this.custom.activeWindows.push(window);
 
@@ -840,7 +844,21 @@ export class SafeMakerStrategy implements Strategy {
 
     for (const w of this.custom.activeWindows) {
       // Re-init tickSnapshots after DO re-hydration (stripped by persistState)
-      if (params.record_snapshots && !w.tickSnapshots) w.tickSnapshots = [];
+      // Load previously flushed ticks from D1 so we don't lose data on eviction
+      if (params.record_snapshots && !w.tickSnapshots) {
+        if (w.snapshotId) {
+          try {
+            const row = await ctx.db.prepare(
+              "SELECT ticks FROM strategy_snapshots WHERE id = ?"
+            ).bind(w.snapshotId).first<{ ticks: string }>();
+            w.tickSnapshots = row?.ticks ? JSON.parse(row.ticks) : [];
+          } catch {
+            w.tickSnapshots = [];
+          }
+        } else {
+          w.tickSnapshots = [];
+        }
+      }
 
       const timeToEnd = w.windowEndTime - now;
 
@@ -989,6 +1007,24 @@ export class SafeMakerStrategy implements Strategy {
           upInventory: w.upInventory, downInventory: w.downInventory,
           upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
         });
+
+        // Incrementally flush snapshots to D1 every 10 ticks to survive DO evictions
+        if (w.snapshotId && w.tickSnapshots.length % 10 === 0) {
+          try {
+            const openDate = new Date(w.windowOpenTime);
+            await ctx.db.prepare(
+              `INSERT OR REPLACE INTO strategy_snapshots (id, strategy_id, window_title, crypto_symbol, window_open_time, window_end_time, window_duration_ms, oracle_strike, price_at_open, hour_utc, day_of_week, up_token_id, down_token_id, outcome, ticks)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(
+              w.snapshotId, ctx.config.id, w.market.title, w.cryptoSymbol,
+              w.windowOpenTime, w.windowEndTime, w.windowEndTime - w.windowOpenTime,
+              w.oracleStrike ?? null, w.priceAtWindowOpen,
+              openDate.getUTCHours(), openDate.getUTCDay(),
+              w.market.upTokenId, w.market.downTokenId,
+              null, JSON.stringify(w.tickSnapshots)
+            ).run();
+          } catch { /* best-effort flush */ }
+        }
       }
 
       // Per-tick safety: cancel bids on the heavy side regardless of requote state
@@ -2026,15 +2062,16 @@ export class SafeMakerStrategy implements Strategy {
         flipCount: w.flipCount,
       };
 
-      // Flush tick snapshots to D1 for offline replay
+      // Flush final tick snapshots to D1 with outcome
       if (params.record_snapshots && w.tickSnapshots?.length) {
         try {
           const openDate = new Date(w.windowOpenTime);
+          const snapId = w.snapshotId || `snap-${crypto.randomUUID()}`;
           await ctx.db.prepare(
-            `INSERT OR IGNORE INTO strategy_snapshots (id, strategy_id, window_title, crypto_symbol, window_open_time, window_end_time, window_duration_ms, oracle_strike, price_at_open, hour_utc, day_of_week, up_token_id, down_token_id, outcome, ticks)
+            `INSERT OR REPLACE INTO strategy_snapshots (id, strategy_id, window_title, crypto_symbol, window_open_time, window_end_time, window_duration_ms, oracle_strike, price_at_open, hour_utc, day_of_week, up_token_id, down_token_id, outcome, ticks)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
-            `snap-${crypto.randomUUID()}`, ctx.config.id, w.market.title, w.cryptoSymbol,
+            snapId, ctx.config.id, w.market.title, w.cryptoSymbol,
             w.windowOpenTime, w.windowEndTime, w.windowEndTime - w.windowOpenTime,
             w.oracleStrike ?? null, w.priceAtWindowOpen,
             openDate.getUTCHours(), openDate.getUTCDay(),
