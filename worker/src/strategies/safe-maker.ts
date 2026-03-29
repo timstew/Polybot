@@ -867,6 +867,29 @@ export class SafeMakerStrategy implements Strategy {
         } else {
           w.tickSnapshots = [];
         }
+
+        // Rebuild cumulative tape state from restored tick snapshots
+        // so we don't lose accumulated trade data across DO evictions
+        if (w.tickSnapshots!.length > 0 && !w.cumulativeTapeBuckets) {
+          w.cumulativeTapeBuckets = new Map();
+          w.cumulativeTapeWallets = new Set();
+          w.cumulativeTapeVolume = 0;
+          w.cumulativeTapeCount = 0;
+          w.lastTapeTimestamp = 0;
+          // The last tick's tapeBuckets has the most complete cumulative state
+          const lastTick = w.tickSnapshots![w.tickSnapshots!.length - 1];
+          for (const b of lastTick.tapeBuckets) {
+            const key = `${b.tokenId}:${b.price}`;
+            w.cumulativeTapeBuckets.set(key, b.size);
+          }
+          if (lastTick.tapeMeta) {
+            w.cumulativeTapeCount = lastTick.tapeMeta.totalTrades;
+            w.cumulativeTapeVolume = lastTick.tapeMeta.totalVolume;
+          }
+          // Use last tick's time as the dedup floor — we may miss trades
+          // between the last tick and eviction, but won't double-count
+          w.lastTapeTimestamp = lastTick.t;
+        }
       }
 
       const timeToEnd = w.windowEndTime - now;
