@@ -2429,19 +2429,6 @@ export default {
       return jsonCors(statuses, request);
     }
 
-    // Debug: fetch CLOB book from within worker context
-    if (
-      url.pathname.startsWith("/api/debug/book/") &&
-      request.method === "GET"
-    ) {
-      const tokenId = url.pathname.replace("/api/debug/book/", "");
-      const resp = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
-      const data = await resp.json() as { bids?: { price: string; size: string }[]; asks?: { price: string; size: string }[] };
-      const bids = (data.bids || []).map((l: { price: string; size: string }) => ({ price: parseFloat(l.price), size: parseFloat(l.size) }));
-      const asks = (data.asks || []).map((l: { price: string; size: string }) => ({ price: parseFloat(l.price), size: parseFloat(l.size) }));
-      return jsonCors({ bids: bids.slice(0, 5), asks: asks.slice(0, 5), totalBids: bids.length, totalAsks: asks.length }, request);
-    }
-
     // Single strategy status (legacy / convenience)
     if (
       url.pathname.startsWith("/api/strategy/status/") &&

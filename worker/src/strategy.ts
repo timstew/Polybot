@@ -257,7 +257,6 @@ export class PaperStrategyAPI implements StrategyAPI {
 
     // Bid crosses the spread — immediate fill at best ask (taker)
     if (bestAsk !== null && bidPrice >= bestAsk) {
-      console.log(`[FILL-DEBUG] crossesSpread: bid=${bidPrice} bestAsk=${bestAsk} token=${tokenId.slice(-8)}`);
       return { filled: true, fillPrice: bestAsk };
     }
 
@@ -272,11 +271,7 @@ export class PaperStrategyAPI implements StrategyAPI {
         .filter(b => b.price >= bidPrice)
         .reduce((sum, b) => sum + b.size, 0);
 
-      const tapeFill = checkTapeFill(tape, tokenId, bidPrice, bidSize, placedAtMs, queueAhead);
-      if (tapeFill.filled) {
-        console.log(`[FILL-DEBUG] tapeFill: bid=${bidPrice} size=${bidSize} token=${tokenId.slice(-8)} queueAhead=${queueAhead}`);
-      }
-      return tapeFill;
+      return checkTapeFill(tape, tokenId, bidPrice, bidSize, placedAtMs, queueAhead);
     }
 
     // Legacy probabilistic model
@@ -487,10 +482,6 @@ export class PaperStrategyAPI implements StrategyAPI {
           size: parseFloat(l.size),
         })),
       };
-      // Debug: log book data to diagnose recording mismatch
-      const bestBid = book.bids.length > 0 ? Math.max(...book.bids.map(b => b.price)) : null;
-      const bestAsk = book.asks.length > 0 ? Math.min(...book.asks.map(a => a.price)) : null;
-      console.log(`[BOOK-DEBUG] token=${token_id.slice(-8)} bids=${book.bids.length} asks=${book.asks.length} bestBid=${bestBid} bestAsk=${bestAsk}`);
       return book;
     } catch {
       return { bids: [], asks: [] };
