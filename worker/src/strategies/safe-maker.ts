@@ -2142,22 +2142,15 @@ export class SafeMakerStrategy implements Strategy {
         flipCount: w.flipCount,
       };
 
-      // Flush final tick snapshots to D1 with outcome
-      if (params.record_snapshots && w.tickSnapshots?.length) {
+      // Update snapshot outcome in D1 (ticks already flushed per-tick)
+      // Note: resolveWindows runs BEFORE tickSnapshot re-hydration in tick(),
+      // so w.tickSnapshots may be undefined after DO eviction. Use UPDATE
+      // instead of INSERT OR REPLACE to avoid requiring tickSnapshots.
+      if (params.record_snapshots && w.snapshotId) {
         try {
-          const openDate = new Date(w.windowOpenTime);
-          const snapId = w.snapshotId || `snap-${crypto.randomUUID()}`;
           await ctx.db.prepare(
-            `INSERT OR REPLACE INTO strategy_snapshots (id, strategy_id, window_title, crypto_symbol, window_open_time, window_end_time, window_duration_ms, oracle_strike, price_at_open, hour_utc, day_of_week, up_token_id, down_token_id, outcome, ticks)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).bind(
-            snapId, ctx.config.id, w.market.title, w.cryptoSymbol,
-            w.windowOpenTime, w.windowEndTime, w.windowEndTime - w.windowOpenTime,
-            w.oracleStrike ?? null, w.priceAtWindowOpen,
-            openDate.getUTCHours(), openDate.getUTCDay(),
-            w.market.upTokenId, w.market.downTokenId,
-            outcome, JSON.stringify(w.tickSnapshots)
-          ).run();
+            `UPDATE strategy_snapshots SET outcome = ? WHERE id = ?`
+          ).bind(outcome, w.snapshotId).run();
           // Purge snapshots older than 7 days to prevent unbounded growth
           const retentionMs = 7 * 24 * 60 * 60 * 1000;
           await ctx.db.prepare(
