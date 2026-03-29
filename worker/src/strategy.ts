@@ -477,7 +477,7 @@ export class PaperStrategyAPI implements StrategyAPI {
         bids?: { price: string; size: string }[];
         asks?: { price: string; size: string }[];
       };
-      return {
+      const book = {
         bids: (data.bids || []).map((l) => ({
           price: parseFloat(l.price),
           size: parseFloat(l.size),
@@ -487,6 +487,11 @@ export class PaperStrategyAPI implements StrategyAPI {
           size: parseFloat(l.size),
         })),
       };
+      // Debug: log book data to diagnose recording mismatch
+      const bestBid = book.bids.length > 0 ? Math.max(...book.bids.map(b => b.price)) : null;
+      const bestAsk = book.asks.length > 0 ? Math.min(...book.asks.map(a => a.price)) : null;
+      console.log(`[BOOK-DEBUG] token=${token_id.slice(-8)} bids=${book.bids.length} asks=${book.asks.length} bestBid=${bestBid} bestAsk=${bestAsk}`);
+      return book;
     } catch {
       return { bids: [], asks: [] };
     }
