@@ -42,6 +42,8 @@ export interface TickSnapshot {
   tapeBuckets: TapeBucket[];
   tapeMeta: TapeMeta;
   bookBids: { price: number; size: number }[];
+  upBookAsks: { price: number; size: number }[];
+  downBookAsks: { price: number; size: number }[];
   upBidOrderId: string | null;
   upBidPrice: number;
   upBidSize: number;

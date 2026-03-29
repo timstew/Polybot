@@ -9,23 +9,40 @@ import type { WindowSnapshot, ReplayResult, TickSnapshot, TapeBucket } from "./t
 import type { DirectionalMakerParams } from "../strategies/safe-maker";
 import { calcFeePerShare, CRYPTO_FEES } from "../categories";
 
-/** Check fill against volume buckets instead of raw tape */
+/** Sum volume at or below bidPrice for a given token in the tape buckets */
+function volumeAtOrBelow(
+  buckets: TapeBucket[],
+  tokenId: string,
+  bidPrice: number,
+): number {
+  let total = 0;
+  for (const b of buckets) {
+    if (b.tokenId === tokenId && b.price <= bidPrice) {
+      total += b.size;
+    }
+  }
+  return total;
+}
+
+/**
+ * Check fill against cumulative volume buckets.
+ * The tape is cumulative (grows each tick), so we compare current volume
+ * against volume at bid placement time. Only NEW volume since placement
+ * counts toward fills — mirrors live checkTapeFill's placedAtMs filter.
+ */
 function checkBucketFill(
   buckets: TapeBucket[],
   tokenId: string,
   bidPrice: number,
   bidSize: number,
   queueAhead: number,
+  volumeAtPlacement: number,
 ): { filled: boolean; fillPrice: number } {
+  const currentVolume = volumeAtOrBelow(buckets, tokenId, bidPrice);
+  const newVolume = currentVolume - volumeAtPlacement;
   const totalNeeded = bidSize + queueAhead;
-  let volumeAtOrBelow = 0;
-  for (const b of buckets) {
-    if (b.tokenId === tokenId && b.price <= bidPrice) {
-      volumeAtOrBelow += b.size;
-      if (volumeAtOrBelow >= totalNeeded) {
-        return { filled: true, fillPrice: bidPrice };
-      }
-    }
+  if (newVolume >= totalNeeded) {
+    return { filled: true, fillPrice: bidPrice };
   }
   return { filled: false, fillPrice: 0 };
 }
@@ -41,17 +58,32 @@ export function replayWindow(
   let downAvgCost = 0;
   let totalBuyCost = 0;
   let realizedSellPnl = 0;
+  let mergePnl = 0;
   let fillCount = 0;
   let sellCount = 0;
   let flipCount = 0;
 
-  // Bid tracking
+  // Merge helper: realize profit from paired inventory with pairCost < 1.00
+  const tryMerge = () => {
+    const matched = Math.min(upInventory, downInventory);
+    if (matched <= 0) return;
+    const pairCost = upAvgCost + downAvgCost;
+    if (pairCost >= 1.0) return;
+    const pnl = matched * (1.0 - pairCost);
+    mergePnl += pnl;
+    upInventory = Math.round((upInventory - matched) * 1e6) / 1e6;
+    downInventory = Math.round((downInventory - matched) * 1e6) / 1e6;
+  };
+
+  // Bid tracking (includes cumulative volume at placement for fill detection)
   let upBidPrice = 0;
   let upBidSize = 0;
   let upBidPlacedAt = 0;
+  let upBidVolumeAtPlacement = 0;
   let downBidPrice = 0;
   let downBidSize = 0;
   let downBidPlacedAt = 0;
+  let downBidVolumeAtPlacement = 0;
 
   let confirmedDirection: "UP" | "DOWN" | null = null;
   let lastFlipSellAt = 0;
@@ -72,43 +104,97 @@ export function replayWindow(
     }
 
     // Check fills on existing bids
+    // Two fill paths (matching live PaperStrategyAPI.simulatePaperFill):
+    //   1. CrossesSpread: bidPrice >= bestAsk → immediate fill at bestAsk
+    //   2. Tape volume: cumulative trade volume exceeds bid + queue
     if (upBidSize > 0) {
-      const queueAhead = computeQueueAhead(tick, upBidPrice, true);
-      const result = checkBucketFill(tick.tapeBuckets, snap.upTokenId, upBidPrice, upBidSize, queueAhead);
-      if (result.filled) {
-        const costBasis = upBidPrice;
-        if (upInventory > 0) {
-          const totalCost = upAvgCost * upInventory + costBasis * upBidSize;
-          upInventory += upBidSize;
-          upAvgCost = totalCost / upInventory;
-        } else {
-          upInventory = upBidSize;
-          upAvgCost = costBasis;
+      let filled = false;
+      // Path 1: CrossesSpread — bid crosses the order book spread
+      const upAsks = tick.upBookAsks ?? [];
+      if (upAsks.length > 0) {
+        const bestAsk = Math.min(...upAsks.map(a => a.price));
+        if (upBidPrice >= bestAsk) {
+          const costBasis = bestAsk; // taker semantics: fill at bestAsk
+          if (upInventory > 0) {
+            const totalCost = upAvgCost * upInventory + costBasis * upBidSize;
+            upInventory += upBidSize;
+            upAvgCost = totalCost / upInventory;
+          } else {
+            upInventory = upBidSize;
+            upAvgCost = costBasis;
+          }
+          totalBuyCost += costBasis * upBidSize;
+          fillCount++;
+          upBidPrice = 0; upBidSize = 0;
+          filled = true;
         }
-        totalBuyCost += costBasis * upBidSize;
-        fillCount++;
-        upBidPrice = 0; upBidSize = 0;
+      }
+      // Path 2: Tape volume fill (fallback)
+      if (!filled) {
+        const queueAhead = computeQueueAhead(tick, upBidPrice, true);
+        const result = checkBucketFill(tick.tapeBuckets, snap.upTokenId, upBidPrice, upBidSize, queueAhead, upBidVolumeAtPlacement);
+        if (result.filled) {
+          const costBasis = upBidPrice;
+          if (upInventory > 0) {
+            const totalCost = upAvgCost * upInventory + costBasis * upBidSize;
+            upInventory += upBidSize;
+            upAvgCost = totalCost / upInventory;
+          } else {
+            upInventory = upBidSize;
+            upAvgCost = costBasis;
+          }
+          totalBuyCost += costBasis * upBidSize;
+          fillCount++;
+          upBidPrice = 0; upBidSize = 0;
+        }
       }
     }
 
     if (downBidSize > 0) {
-      const queueAhead = computeQueueAhead(tick, downBidPrice, false);
-      const result = checkBucketFill(tick.tapeBuckets, snap.downTokenId, downBidPrice, downBidSize, queueAhead);
-      if (result.filled) {
-        const costBasis = downBidPrice;
-        if (downInventory > 0) {
-          const totalCost = downAvgCost * downInventory + costBasis * downBidSize;
-          downInventory += downBidSize;
-          downAvgCost = totalCost / downInventory;
-        } else {
-          downInventory = downBidSize;
-          downAvgCost = costBasis;
+      let filled = false;
+      // Path 1: CrossesSpread
+      const downAsks = tick.downBookAsks ?? [];
+      if (downAsks.length > 0) {
+        const bestAsk = Math.min(...downAsks.map(a => a.price));
+        if (downBidPrice >= bestAsk) {
+          const costBasis = bestAsk;
+          if (downInventory > 0) {
+            const totalCost = downAvgCost * downInventory + costBasis * downBidSize;
+            downInventory += downBidSize;
+            downAvgCost = totalCost / downInventory;
+          } else {
+            downInventory = downBidSize;
+            downAvgCost = costBasis;
+          }
+          totalBuyCost += costBasis * downBidSize;
+          fillCount++;
+          downBidPrice = 0; downBidSize = 0;
+          filled = true;
         }
-        totalBuyCost += costBasis * downBidSize;
-        fillCount++;
-        downBidPrice = 0; downBidSize = 0;
+      }
+      // Path 2: Tape volume fill (fallback)
+      if (!filled) {
+        const queueAhead = computeQueueAhead(tick, downBidPrice, false);
+        const result = checkBucketFill(tick.tapeBuckets, snap.downTokenId, downBidPrice, downBidSize, queueAhead, downBidVolumeAtPlacement);
+        if (result.filled) {
+          const costBasis = downBidPrice;
+          if (downInventory > 0) {
+            const totalCost = downAvgCost * downInventory + costBasis * downBidSize;
+            downInventory += downBidSize;
+            downAvgCost = totalCost / downInventory;
+          } else {
+            downInventory = downBidSize;
+            downAvgCost = costBasis;
+          }
+          totalBuyCost += costBasis * downBidSize;
+          fillCount++;
+          downBidPrice = 0; downBidSize = 0;
+        }
       }
     }
+
+    // Merge paired inventory for instant profit (mirrors live strategy)
+    if (upInventory > 0 && downInventory > 0) tryMerge();
 
     // Direction tracking with hysteresis
     const confirmedFlip =
@@ -240,11 +326,12 @@ export function replayWindow(
     newUpBid = Math.max(0.01, Math.floor(newUpBid * 100) / 100);
     newDnBid = Math.max(0.01, Math.floor(newDnBid * 100) / 100);
 
-    // Place bids
+    // Place bids — record cumulative volume at placement for fill delta tracking
     if (upSize > 0) {
       upBidPrice = newUpBid;
       upBidSize = upSize;
       upBidPlacedAt = now;
+      upBidVolumeAtPlacement = volumeAtOrBelow(tick.tapeBuckets, snap.upTokenId, newUpBid);
     } else {
       upBidPrice = 0; upBidSize = 0;
     }
@@ -252,6 +339,7 @@ export function replayWindow(
       downBidPrice = newDnBid;
       downBidSize = downSize;
       downBidPlacedAt = now;
+      downBidVolumeAtPlacement = volumeAtOrBelow(tick.tapeBuckets, snap.downTokenId, newDnBid);
     } else {
       downBidPrice = 0; downBidSize = 0;
     }
@@ -271,11 +359,12 @@ export function replayWindow(
     }
   }
 
-  // Compute P&L from final inventory + outcome
-  let netPnl = realizedSellPnl;
+  // Compute P&L: merge profit + resolution of remaining (unmerged) inventory
+  let netPnl = mergePnl + realizedSellPnl;
   const feeParams = params.fee_params ?? CRYPTO_FEES;
 
-  if (snap.outcome !== "UNKNOWN") {
+  // Resolve any remaining unmerged inventory at window outcome
+  if (snap.outcome !== "UNKNOWN" && (upInventory > 0 || downInventory > 0)) {
     const winInv = snap.outcome === "UP" ? upInventory : downInventory;
     const winCost = snap.outcome === "UP" ? upAvgCost : downAvgCost;
     const loseInv = snap.outcome === "UP" ? downInventory : upInventory;
@@ -296,7 +385,10 @@ export function replayWindow(
   };
 }
 
-/** Estimate queue depth ahead of our bid from recorded book bids */
+/** Estimate queue depth ahead of our bid from recorded book bids.
+ *  Assume ~25% queue position (we're a fast requoter, not last in line).
+ *  Only count bids at strictly better prices as fully ahead;
+ *  bids at our price level are partially ahead. */
 function computeQueueAhead(
   tick: TickSnapshot,
   bidPrice: number,
@@ -304,8 +396,10 @@ function computeQueueAhead(
 ): number {
   let ahead = 0;
   for (const level of tick.bookBids) {
-    if (level.price >= bidPrice) {
-      ahead += level.size;
+    if (level.price > bidPrice) {
+      ahead += level.size;  // better price = always ahead
+    } else if (level.price === bidPrice) {
+      ahead += level.size * 0.25;  // same price = partial queue
     }
   }
   return ahead;

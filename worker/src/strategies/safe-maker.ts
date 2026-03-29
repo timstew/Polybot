@@ -103,6 +103,8 @@ interface MakerWindowPosition {
   lastFairDown?: number;
   lastBookConviction?: BookConvictionSnapshot;
   lastBookBids?: { price: number; size: number }[];
+  lastUpBookAsks?: { price: number; size: number }[];
+  lastDownBookAsks?: { price: number; size: number }[];
 
   // Snapshot recording (populated when record_snapshots=true)
   tickSnapshots?: TickSnapshot[];
@@ -388,8 +390,10 @@ export class SafeMakerStrategy implements Strategy {
     w.lastUpMid = upMid;
     w.lastDownMid = downMid;
 
-    // Save book bids for snapshot recording (top 5 levels)
+    // Save book data for snapshot recording (top 5 levels)
     w.lastBookBids = upBook.bids.slice(0, 5).map(l => ({ price: l.price, size: l.size }));
+    w.lastUpBookAsks = upBook.asks.slice(0, 5).map(l => ({ price: l.price, size: l.size }));
+    w.lastDownBookAsks = downBook.asks.slice(0, 5).map(l => ({ price: l.price, size: l.size }));
 
     return { upMid, downMid, bookDirection, bookStrength, bookBidDepthRatio, midDelta, agreement };
   }
@@ -1057,6 +1061,8 @@ export class SafeMakerStrategy implements Strategy {
           tapeBuckets,
           tapeMeta,
           bookBids: w.lastBookBids ?? [],
+          upBookAsks: w.lastUpBookAsks ?? [],
+          downBookAsks: w.lastDownBookAsks ?? [],
           upBidOrderId: w.upBidOrderId, upBidPrice: w.upBidPrice, upBidSize: w.upBidSize,
           downBidOrderId: w.downBidOrderId, downBidPrice: w.downBidPrice, downBidSize: w.downBidSize,
           upInventory: w.upInventory, downInventory: w.downInventory,

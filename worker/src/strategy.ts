@@ -257,6 +257,7 @@ export class PaperStrategyAPI implements StrategyAPI {
 
     // Bid crosses the spread — immediate fill at best ask (taker)
     if (bestAsk !== null && bidPrice >= bestAsk) {
+      console.log(`[FILL-DEBUG] crossesSpread: bid=${bidPrice} bestAsk=${bestAsk} token=${tokenId.slice(-8)}`);
       return { filled: true, fillPrice: bestAsk };
     }
 
@@ -271,7 +272,11 @@ export class PaperStrategyAPI implements StrategyAPI {
         .filter(b => b.price >= bidPrice)
         .reduce((sum, b) => sum + b.size, 0);
 
-      return checkTapeFill(tape, tokenId, bidPrice, bidSize, placedAtMs, queueAhead);
+      const tapeFill = checkTapeFill(tape, tokenId, bidPrice, bidSize, placedAtMs, queueAhead);
+      if (tapeFill.filled) {
+        console.log(`[FILL-DEBUG] tapeFill: bid=${bidPrice} size=${bidSize} token=${tokenId.slice(-8)} queueAhead=${queueAhead}`);
+      }
+      return tapeFill;
     }
 
     // Legacy probabilistic model

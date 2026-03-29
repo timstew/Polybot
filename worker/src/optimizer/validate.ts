@@ -178,6 +178,52 @@ function analyzeTape(snap: WindowSnapshot) {
   };
 }
 
+// ── Book asks diagnostics ──
+
+function analyzeBookAsks(snap: WindowSnapshot) {
+  const ticks = snap.ticks;
+  if (ticks.length === 0) return null;
+
+  let ticksWithUpAsks = 0;
+  let ticksWithDownAsks = 0;
+  let crossesUpCount = 0;  // ticks where upBidPrice >= upBestAsk
+  let crossesDownCount = 0;
+  let upAskPrices: number[] = [];
+  let downAskPrices: number[] = [];
+
+  for (const tick of ticks) {
+    const upAsks = tick.upBookAsks ?? [];
+    const downAsks = tick.downBookAsks ?? [];
+
+    if (upAsks.length > 0) {
+      ticksWithUpAsks++;
+      const bestAsk = Math.min(...upAsks.map(a => a.price));
+      upAskPrices.push(bestAsk);
+      if (tick.upBidPrice > 0 && tick.upBidPrice >= bestAsk) crossesUpCount++;
+    }
+    if (downAsks.length > 0) {
+      ticksWithDownAsks++;
+      const bestAsk = Math.min(...downAsks.map(a => a.price));
+      downAskPrices.push(bestAsk);
+      if (tick.downBidPrice > 0 && tick.downBidPrice >= bestAsk) crossesDownCount++;
+    }
+  }
+
+  return {
+    ticksWithUpAsks,
+    ticksWithDownAsks,
+    crossesUpCount,
+    crossesDownCount,
+    upAskRange: upAskPrices.length > 0
+      ? { min: Math.min(...upAskPrices), max: Math.max(...upAskPrices), avg: upAskPrices.reduce((a, b) => a + b, 0) / upAskPrices.length }
+      : null,
+    downAskRange: downAskPrices.length > 0
+      ? { min: Math.min(...downAskPrices), max: Math.max(...downAskPrices), avg: downAskPrices.reduce((a, b) => a + b, 0) / downAskPrices.length }
+      : null,
+    hasAskData: ticksWithUpAsks > 0 || ticksWithDownAsks > 0,
+  };
+}
+
 // ── Main ──
 
 async function main() {
@@ -262,6 +308,23 @@ async function main() {
       console.log(`  Growing ticks: ${tape.growingTicks}/${tape.tickCount} (${(tape.growingTicks / tape.tickCount * 100).toFixed(0)}%)`);
       if (tape.lastTapeMeta) {
         console.log(`  Tape meta: ${tape.lastTapeMeta.totalTrades} trades, ${tape.lastTapeMeta.uniqueWallets} wallets, $${tape.lastTapeMeta.totalVolume.toFixed(2)} volume`);
+      }
+    }
+
+    // Book asks analysis
+    const bookInfo = analyzeBookAsks(snap);
+    if (bookInfo) {
+      if (!bookInfo.hasAskData) {
+        console.log(`  ⚠️  No book asks recorded (old snapshot — needs re-recording)`);
+      } else {
+        console.log(`  Book asks: UP=${bookInfo.ticksWithUpAsks}/${snap.ticks.length} ticks, DN=${bookInfo.ticksWithDownAsks}/${snap.ticks.length} ticks`);
+        if (bookInfo.upAskRange) {
+          console.log(`  UP bestAsk range: $${bookInfo.upAskRange.min.toFixed(2)}-$${bookInfo.upAskRange.max.toFixed(2)} (avg=$${bookInfo.upAskRange.avg.toFixed(2)})`);
+        }
+        if (bookInfo.downAskRange) {
+          console.log(`  DN bestAsk range: $${bookInfo.downAskRange.min.toFixed(2)}-$${bookInfo.downAskRange.max.toFixed(2)} (avg=$${bookInfo.downAskRange.avg.toFixed(2)})`);
+        }
+        console.log(`  CrossesSpread: UP=${bookInfo.crossesUpCount} ticks, DN=${bookInfo.crossesDownCount} ticks`);
       }
     }
 
