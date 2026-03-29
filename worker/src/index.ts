@@ -2429,6 +2429,19 @@ export default {
       return jsonCors(statuses, request);
     }
 
+    // Debug: fetch CLOB book from within worker context
+    if (
+      url.pathname.startsWith("/api/debug/book/") &&
+      request.method === "GET"
+    ) {
+      const tokenId = url.pathname.replace("/api/debug/book/", "");
+      const resp = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+      const data = await resp.json() as { bids?: { price: string; size: string }[]; asks?: { price: string; size: string }[] };
+      const bids = (data.bids || []).map((l: { price: string; size: string }) => ({ price: parseFloat(l.price), size: parseFloat(l.size) }));
+      const asks = (data.asks || []).map((l: { price: string; size: string }) => ({ price: parseFloat(l.price), size: parseFloat(l.size) }));
+      return jsonCors({ bids: bids.slice(0, 5), asks: asks.slice(0, 5), totalBids: bids.length, totalAsks: asks.length }, request);
+    }
+
     // Single strategy status (legacy / convenience)
     if (
       url.pathname.startsWith("/api/strategy/status/") &&
@@ -2442,6 +2455,162 @@ export default {
       );
       const data = await resp.json();
       return jsonCors(data, request);
+    }
+
+    // Strategy chart data (PnL series + tick snapshots + book depth + windows)
+    if (
+      url.pathname.startsWith("/api/strategy/chart-data/") &&
+      request.method === "GET"
+    ) {
+      const configId = url.pathname.split("/").pop() || "";
+      const since = parseInt(url.searchParams.get("since") || "0");
+      const until = parseInt(url.searchParams.get("until") || `${Date.now()}`);
+      const maxPoints = Math.min(parseInt(url.searchParams.get("max_points") || "300"), 1000);
+
+      // 1) PnL series — fetch ALL trades to compute cumulative sum, then trim to time range
+      const tradeRows = await env.DB.prepare(
+        "SELECT timestamp, pnl, market FROM strategy_trades WHERE strategy_id = ? ORDER BY timestamp ASC"
+      ).bind(configId).all();
+      let cumPnl = 0;
+      // Parse symbol and duration from market slug: "btc-updown-15m-1774576800"
+      const SYMBOL_NORM: Record<string, string> = { bitcoin: "BTC", btc: "BTC", ethereum: "ETH", eth: "ETH", solana: "SOL", sol: "SOL", xrp: "XRP", dogecoin: "DOGE", doge: "DOGE" };
+      const parseMarket = (market: string) => {
+        const parts = (market || "").split("-");
+        const raw = (parts[0] || "").toLowerCase();
+        const symbol = SYMBOL_NORM[raw] || raw.toUpperCase();
+        // Duration part may be at index 2 ("btc-updown-15m") or further if name has hyphens
+        const durPart = parts.find(p => /^\d+[mh]$/.test(p)) || "";
+        const duration_ms = durPart.endsWith("m") ? parseInt(durPart) * 60_000
+          : durPart.endsWith("h") ? parseInt(durPart) * 3_600_000 : 0;
+        return { symbol, duration_ms };
+      };
+      const allPnl: Array<{ t: number; cumulative_pnl: number; trade_pnl: number; symbol: string; window_duration_ms: number }> = [];
+      for (const r of (tradeRows.results || []) as Array<Record<string, unknown>>) {
+        const pnl = r.pnl as number;
+        cumPnl += pnl;
+        const { symbol, duration_ms } = parseMarket(r.market as string);
+        allPnl.push({ t: new Date(r.timestamp as string).getTime(), cumulative_pnl: cumPnl, trade_pnl: pnl, symbol, window_duration_ms: duration_ms });
+      }
+      // Find first point at or before `since` to anchor the chart, then include all points in range
+      let startIdx = 0;
+      if (since > 0) {
+        // Find the last trade before the window to establish the baseline
+        let baselineIdx = -1;
+        for (let i = 0; i < allPnl.length; i++) {
+          if (allPnl[i].t < since) baselineIdx = i; else break;
+        }
+        startIdx = Math.max(0, baselineIdx);
+      }
+      const pnl_series = allPnl.slice(startIdx);
+
+      // 2) Snapshot metadata (pass 1 — no tick JSON)
+      // Don't cap snapshots — let the time range filter naturally, stride-sampling handles output size
+      const snapMeta = await env.DB.prepare(
+        `SELECT id, window_open_time, window_end_time, window_duration_ms, crypto_symbol, outcome, up_token_id FROM strategy_snapshots WHERE strategy_id = ? AND window_end_time >= ? AND window_open_time <= ? ORDER BY window_open_time DESC`
+      ).bind(configId, since, until).all();
+      const snapRows = snapMeta.results || [];
+
+      // Build lookup map: snapshot id → metadata
+      const snapLookup = new Map<string, { symbol: string; duration_ms: number }>();
+      for (const r of snapRows) {
+        snapLookup.set(r.id as string, {
+          symbol: r.crypto_symbol as string,
+          duration_ms: r.window_duration_ms as number,
+        });
+      }
+
+      // 3) Windows from metadata
+      const windows = snapRows.map((r: Record<string, unknown>) => ({
+        open_time: r.window_open_time as number,
+        end_time: r.window_end_time as number,
+        symbol: r.crypto_symbol as string,
+        duration_ms: r.window_duration_ms as number,
+        outcome: (r.outcome as string) || null,
+      }));
+
+      // 4) Tick series (pass 2 — load tick JSON for selected snapshots)
+      // Cap how many snapshot blobs we fetch: each has ~60-180 ticks (~14KB each),
+      // so limit to maxPoints/10 windows (stride-sampling handles the rest)
+      let tick_series: Array<Record<string, unknown>> = [];
+      let book_depth: Array<{ price: number; size: number; token_id: string }> = [];
+      // Collect UP token IDs to distinguish UP vs DOWN volume in tapeBuckets
+      const upTokenIds = new Set<string>();
+      for (const r of snapRows) { if (r.up_token_id) upTokenIds.add(r.up_token_id as string); }
+      if (snapRows.length > 0) {
+        const allIds = snapRows.map((r: Record<string, unknown>) => r.id as string);
+        const maxSnaps = Math.min(allIds.length, Math.max(10, Math.ceil(maxPoints / 10)));
+        const snapStride = Math.max(1, Math.floor(allIds.length / maxSnaps));
+        const ids = allIds.filter((_, i) => i % snapStride === 0);
+        const placeholders = ids.map(() => "?").join(",");
+        const tickRows = await env.DB.prepare(
+          `SELECT id, ticks FROM strategy_snapshots WHERE id IN (${placeholders})`
+        ).bind(...ids).all();
+
+        const allTicks: Array<Record<string, unknown>> = [];
+        for (const row of (tickRows.results || [])) {
+          const meta = snapLookup.get(row.id as string);
+          try {
+            const parsed = JSON.parse(row.ticks as string) as Array<Record<string, unknown>>;
+            for (const tick of parsed) {
+              const t = tick.t as number;
+              if (t >= since && t <= until) {
+                if (meta) { tick._symbol = meta.symbol; tick._duration_ms = meta.duration_ms; }
+                allTicks.push(tick);
+              }
+            }
+          } catch { /* skip malformed */ }
+        }
+
+        // Sort by time and stride-sample to maxPoints
+        allTicks.sort((a, b) => (a.t as number) - (b.t as number));
+        const stride = Math.max(1, Math.floor(allTicks.length / maxPoints));
+        const sampled = allTicks.filter((_, i) => i % stride === 0);
+
+        tick_series = sampled.map((tick) => {
+          const signal = tick.signal as Record<string, unknown> | undefined;
+          const tapeMeta = tick.tapeMeta as Record<string, unknown> | undefined;
+          const bookConviction = tick.bookConviction as Record<string, unknown> | undefined;
+          // Sum tapeBuckets by token to get UP vs DOWN volume
+          const buckets = tick.tapeBuckets as Array<{ tokenId: string; size: number }> | undefined;
+          let up_volume = 0, down_volume = 0;
+          if (buckets) {
+            for (const b of buckets) {
+              if (upTokenIds.has(b.tokenId)) up_volume += b.size;
+              else down_volume += b.size;
+            }
+          }
+          return {
+            t: tick.t,
+            price: tick.price,
+            symbol: tick._symbol ?? "",
+            window_duration_ms: tick._duration_ms ?? 0,
+            signal_strength: signal?.strength ?? 0,
+            signal_direction: signal?.direction ?? "NEUTRAL",
+            regime: tick.regime ?? "unknown",
+            unique_wallets: tapeMeta?.uniqueWallets ?? 0,
+            total_volume: tapeMeta?.totalVolume ?? 0,
+            up_volume, down_volume,
+            fair_up: tick.fairUp ?? 0,
+            fair_down: tick.fairDown ?? 0,
+            up_inventory: tick.upInventory ?? 0,
+            down_inventory: tick.downInventory ?? 0,
+            up_avg_cost: tick.upAvgCost ?? 0,
+            down_avg_cost: tick.downAvgCost ?? 0,
+            book_strength: bookConviction?.bookStrength ?? 0,
+          };
+        });
+
+        // Book depth from last tick's tapeBuckets
+        if (allTicks.length > 0) {
+          const lastTick = allTicks[allTicks.length - 1];
+          const buckets = lastTick.tapeBuckets as Array<{ price: number; size: number; tokenId: string }> | undefined;
+          if (buckets) {
+            book_depth = buckets.map((b) => ({ price: b.price, size: b.size, token_id: b.tokenId }));
+          }
+        }
+      }
+
+      return jsonCors({ pnl_series, tick_series, book_depth, windows }, request);
     }
 
     if (
