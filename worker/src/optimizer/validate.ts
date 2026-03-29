@@ -104,12 +104,13 @@ interface LiveTrade {
 
 function loadLiveTrades(dbPath: string, strategyId: string, sinceMs: number): LiveTrade[] {
   const db = new Database(dbPath, { readonly: true });
+  const sinceStr = new Date(sinceMs).toISOString().replace("T", " ").slice(0, 19);
   const rows = db.prepare(
     `SELECT token_id, side, price, size, timestamp
      FROM strategy_trades
-     WHERE strategy_id = ? AND timestamp >= datetime(? / 1000, 'unixepoch')
+     WHERE strategy_id = ? AND timestamp >= ?
      ORDER BY timestamp`
-  ).all(strategyId, sinceMs) as LiveTrade[];
+  ).all(strategyId, sinceStr) as LiveTrade[];
   db.close();
   return rows;
 }
@@ -269,10 +270,10 @@ async function main() {
     totalReplayFills += result.fillCount;
     totalReplayPnl += result.netPnl;
 
-    // Find matching live trades
+    // Find matching live trades (timestamps stored as UTC without Z suffix)
     const windowTrades = liveTrades.filter(t => {
-      const tMs = new Date(t.timestamp).getTime();
-      return tMs >= snap.windowOpenTime && tMs <= snap.windowEndTime + 60_000;
+      const tMs = new Date(t.timestamp + "Z").getTime();
+      return tMs >= snap.windowOpenTime && tMs <= snap.windowEndTime + 120_000;
     });
     // Count BUY fills for this window's tokens
     const liveFills = windowTrades.filter(t =>
@@ -306,8 +307,10 @@ async function main() {
     }
 
     // Check for recording quality issues
-    if (tape && tape.growingTicks < tape.tickCount * 0.1 && tape.tickCount > 10) {
-      console.log(`  ⚠️  Tape barely grows — may still be using old recording format`);
+    // Note: growth rate of 5-10% is normal — token-specific trades are sparse
+    // in the global 200-trade feed. Only warn if tape has zero growth.
+    if (tape && tape.volumeGrowth === 0 && tape.tickCount > 5) {
+      console.log(`  ⚠️  Tape never grows — no new token trades observed during window`);
     }
     if (tape && tape.otherBuckets > tape.upBuckets + tape.downBuckets) {
       console.log(`  ❌ More non-token buckets than token buckets — old format data`);
