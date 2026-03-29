@@ -17,7 +17,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { replayWindow } from "./replay";
-import type { WindowSnapshot } from "./types";
+import type { WindowSnapshot, TickSnapshot } from "./types";
 import type { DirectionalMakerParams } from "../strategies/safe-maker";
 import { DEFAULT_PARAMS } from "../strategies/safe-maker";
 

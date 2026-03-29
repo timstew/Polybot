@@ -107,6 +107,15 @@ interface MakerWindowPosition {
   // Snapshot recording (populated when record_snapshots=true)
   tickSnapshots?: TickSnapshot[];
   snapshotId?: string; // deterministic D1 row ID for incremental snapshot persistence
+
+  // Cumulative tape: tracks token-specific trades seen since window open.
+  // The global tape (200 trades) is too sparse per-token, so we accumulate
+  // across ticks to build a complete picture of our token's trade activity.
+  cumulativeTapeBuckets?: Map<string, number>; // "tokenId:price" → total size
+  cumulativeTapeWallets?: Set<string>;
+  cumulativeTapeVolume?: number;
+  cumulativeTapeCount?: number;
+  lastTapeTimestamp?: number; // highest timestamp seen, to deduplicate
 }
 
 interface BookConviction {
@@ -963,19 +972,42 @@ export class SafeMakerStrategy implements Strategy {
       if (params.record_snapshots && w.tickSnapshots) {
         const tapeNow = await fetchTradeTape();
 
-        // Build volume buckets per token×price instead of storing raw tape
-        const bucketMap = new Map<string, number>(); // "tokenId:price" → total size
-        const walletSet = new Set<string>();
-        let totalVol = 0;
+        // Initialize cumulative tape tracker on first tick
+        if (!w.cumulativeTapeBuckets) {
+          w.cumulativeTapeBuckets = new Map();
+          w.cumulativeTapeWallets = new Set();
+          w.cumulativeTapeVolume = 0;
+          w.cumulativeTapeCount = 0;
+          w.lastTapeTimestamp = 0;
+        }
+
+        // Accumulate NEW token-specific trades since last tick.
+        // The global tape has 200 trades across all markets; we extract only
+        // trades for our UP/DOWN tokens with timestamps > lastTapeTimestamp
+        // to build a cumulative view of our token's trade activity.
+        const relevantTokens = new Set([w.market.upTokenId, w.market.downTokenId]);
         for (const t of tapeNow) {
-          if (t.taker) walletSet.add(t.taker);
-          totalVol += t.size * t.price;
+          if (!relevantTokens.has(t.asset)) continue;
+          // Deduplicate: only count trades newer than what we've seen
+          const ts = t.timestamp;
+          if (ts <= w.lastTapeTimestamp!) continue;
+          if (t.taker) w.cumulativeTapeWallets!.add(t.taker);
+          w.cumulativeTapeVolume! += t.size * t.price;
+          w.cumulativeTapeCount!++;
           const roundedPrice = Math.round(t.price * 100) / 100;
           const key = `${t.asset}:${roundedPrice}`;
-          bucketMap.set(key, (bucketMap.get(key) ?? 0) + t.size);
+          w.cumulativeTapeBuckets!.set(key, (w.cumulativeTapeBuckets!.get(key) ?? 0) + t.size);
         }
+        // Update high-water timestamp from all relevant trades (not just new ones)
+        for (const t of tapeNow) {
+          if (relevantTokens.has(t.asset) && t.timestamp > w.lastTapeTimestamp!) {
+            w.lastTapeTimestamp = t.timestamp;
+          }
+        }
+
+        // Build tapeBuckets from cumulative data
         const tapeBuckets: TapeBucket[] = [];
-        for (const [key, size] of bucketMap) {
+        for (const [key, size] of w.cumulativeTapeBuckets!) {
           const sep = key.lastIndexOf(":");
           tapeBuckets.push({
             tokenId: key.slice(0, sep),
@@ -984,9 +1016,9 @@ export class SafeMakerStrategy implements Strategy {
           });
         }
         const tapeMeta: TapeMeta = {
-          totalTrades: tapeNow.length,
-          totalVolume: totalVol,
-          uniqueWallets: walletSet.size,
+          totalTrades: w.cumulativeTapeCount!,
+          totalVolume: w.cumulativeTapeVolume!,
+          uniqueWallets: w.cumulativeTapeWallets!.size,
         };
 
         w.tickSnapshots.push({
@@ -2078,6 +2110,11 @@ export class SafeMakerStrategy implements Strategy {
             w.market.upTokenId, w.market.downTokenId,
             outcome, JSON.stringify(w.tickSnapshots)
           ).run();
+          // Purge snapshots older than 7 days to prevent unbounded growth
+          const retentionMs = 7 * 24 * 60 * 60 * 1000;
+          await ctx.db.prepare(
+            `DELETE FROM strategy_snapshots WHERE window_end_time < ?`
+          ).bind(Date.now() - retentionMs).run();
         } catch (e) {
           ctx.log(`SNAPSHOT SAVE ERROR: ${e}`, { level: "error", phase: "snapshot" } as never);
         }
