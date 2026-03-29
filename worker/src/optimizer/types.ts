@@ -29,6 +29,13 @@ export interface TapeMeta {
   uniqueWallets: number;
 }
 
+/** A fill event observed by the live strategy during a tick period */
+export interface RecordedFill {
+  side: "UP" | "DOWN";
+  price: number;    // actual fill price (bestAsk from crossesSpread)
+  size: number;     // filled size
+}
+
 export interface TickSnapshot {
   t: number;
   price: number;
@@ -54,6 +61,9 @@ export interface TickSnapshot {
   downInventory: number;
   upAvgCost: number;
   downAvgCost: number;
+  /** Fill events detected since the previous tick.
+   *  Recorded by the live strategy so replay can reproduce them exactly. */
+  fills?: RecordedFill[];
 }
 
 export interface WindowSnapshot {

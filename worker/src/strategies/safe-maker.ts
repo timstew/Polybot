@@ -109,6 +109,7 @@ interface MakerWindowPosition {
   // Snapshot recording (populated when record_snapshots=true)
   tickSnapshots?: TickSnapshot[];
   snapshotId?: string; // deterministic D1 row ID for incremental snapshot persistence
+  pendingFills?: Array<{ side: "UP" | "DOWN"; price: number; size: number }>;
 
   // Cumulative tape: tracks token-specific trades seen since window open.
   // The global tape (200 trades) is too sparse per-token, so we accumulate
@@ -825,6 +826,7 @@ export class SafeMakerStrategy implements Strategy {
       if (params.record_snapshots) {
         window.tickSnapshots = [];
         window.snapshotId = `snap-${market.conditionId}-${now}`;
+        window.pendingFills = [];
       }
 
       this.custom.activeWindows.push(window);
@@ -871,6 +873,9 @@ export class SafeMakerStrategy implements Strategy {
         } else {
           w.tickSnapshots = [];
         }
+
+        // Always reset pendingFills on restore (fills for restored ticks are already recorded)
+        w.pendingFills = [];
 
         // Rebuild cumulative tape state from restored tick snapshots
         // so we don't lose accumulated trade data across DO evictions
@@ -1063,11 +1068,15 @@ export class SafeMakerStrategy implements Strategy {
           bookBids: w.lastBookBids ?? [],
           upBookAsks: w.lastUpBookAsks ?? [],
           downBookAsks: w.lastDownBookAsks ?? [],
+          fills: w.pendingFills && w.pendingFills.length > 0 ? [...w.pendingFills] : undefined,
           upBidOrderId: w.upBidOrderId, upBidPrice: w.upBidPrice, upBidSize: w.upBidSize,
           downBidOrderId: w.downBidOrderId, downBidPrice: w.downBidPrice, downBidSize: w.downBidSize,
           upInventory: w.upInventory, downInventory: w.downInventory,
           upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
         });
+
+        // Clear pending fills after recording them in the tick snapshot
+        if (w.pendingFills) w.pendingFills = [];
 
         // Incrementally flush snapshots to D1 every tick to survive DO evictions
         if (w.snapshotId) {
@@ -1337,6 +1346,11 @@ export class SafeMakerStrategy implements Strategy {
         const filledSize = status.size_matched;
         const costBasis = status.price || w.upBidPrice;
 
+        // Record fill event for snapshot replay
+        if (w.pendingFills) {
+          w.pendingFills.push({ side: "UP", price: costBasis, size: filledSize });
+        }
+
         if (w.upInventory > 0) {
           const totalCost = w.upAvgCost * w.upInventory + costBasis * filledSize;
           w.upInventory += filledSize;
@@ -1383,6 +1397,11 @@ export class SafeMakerStrategy implements Strategy {
       if (status.status === "MATCHED" && status.size_matched > 0) {
         const filledSize = status.size_matched;
         const costBasis = status.price || w.downBidPrice;
+
+        // Record fill event for snapshot replay
+        if (w.pendingFills) {
+          w.pendingFills.push({ side: "DOWN", price: costBasis, size: filledSize });
+        }
 
         if (w.downInventory > 0) {
           const totalCost = w.downAvgCost * w.downInventory + costBasis * filledSize;

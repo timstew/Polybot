@@ -103,38 +103,54 @@ export function replayWindow(
       continue;
     }
 
-    // Check fills on existing bids
-    // Two fill paths (matching live PaperStrategyAPI.simulatePaperFill):
-    //   1. CrossesSpread: bidPrice >= bestAsk → immediate fill at bestAsk
-    //   2. Tape volume: cumulative trade volume exceeds bid + queue
+    // Check fills using recorded fill events from the live strategy.
+    // The live strategy fills via crossesSpread against a non-aggregated CLOB book
+    // (Polymarket's CLOB returns thin extreme-price books to CF Workers). These
+    // brief fill opportunities happen between snapshot ticks, so we can't derive
+    // them from recorded book data. Instead, we replay the actual fills and check
+    // whether the replayed strategy would have had a matching bid active.
+    const recordedFills = tick.fills ?? [];
+    for (const fill of recordedFills) {
+      if (fill.side === "UP" && upBidSize > 0 && upBidPrice >= fill.price) {
+        // Replay accepts this fill: our bid was active and at/above the fill price
+        const costBasis = fill.price;
+        const fillSize = Math.min(fill.size, upBidSize);
+        if (upInventory > 0) {
+          const totalCost = upAvgCost * upInventory + costBasis * fillSize;
+          upInventory += fillSize;
+          upAvgCost = totalCost / upInventory;
+        } else {
+          upInventory = fillSize;
+          upAvgCost = costBasis;
+        }
+        totalBuyCost += costBasis * fillSize;
+        fillCount++;
+        upBidPrice = 0; upBidSize = 0;
+      } else if (fill.side === "DOWN" && downBidSize > 0 && downBidPrice >= fill.price) {
+        const costBasis = fill.price;
+        const fillSize = Math.min(fill.size, downBidSize);
+        if (downInventory > 0) {
+          const totalCost = downAvgCost * downInventory + costBasis * fillSize;
+          downInventory += fillSize;
+          downAvgCost = totalCost / downInventory;
+        } else {
+          downInventory = fillSize;
+          downAvgCost = costBasis;
+        }
+        totalBuyCost += costBasis * fillSize;
+        fillCount++;
+        downBidPrice = 0; downBidSize = 0;
+      }
+    }
+
+    // Fallback: also check book-based crossesSpread and tape fills for
+    // snapshots that have ask data but no recorded fills (transition period)
     if (upBidSize > 0) {
-      let filled = false;
-      // Path 1: CrossesSpread — bid crosses the order book spread
       const upAsks = tick.upBookAsks ?? [];
       if (upAsks.length > 0) {
         const bestAsk = Math.min(...upAsks.map(a => a.price));
         if (upBidPrice >= bestAsk) {
-          const costBasis = bestAsk; // taker semantics: fill at bestAsk
-          if (upInventory > 0) {
-            const totalCost = upAvgCost * upInventory + costBasis * upBidSize;
-            upInventory += upBidSize;
-            upAvgCost = totalCost / upInventory;
-          } else {
-            upInventory = upBidSize;
-            upAvgCost = costBasis;
-          }
-          totalBuyCost += costBasis * upBidSize;
-          fillCount++;
-          upBidPrice = 0; upBidSize = 0;
-          filled = true;
-        }
-      }
-      // Path 2: Tape volume fill (fallback)
-      if (!filled) {
-        const queueAhead = computeQueueAhead(tick, upBidPrice, true);
-        const result = checkBucketFill(tick.tapeBuckets, snap.upTokenId, upBidPrice, upBidSize, queueAhead, upBidVolumeAtPlacement);
-        if (result.filled) {
-          const costBasis = upBidPrice;
+          const costBasis = bestAsk;
           if (upInventory > 0) {
             const totalCost = upAvgCost * upInventory + costBasis * upBidSize;
             upInventory += upBidSize;
@@ -149,35 +165,12 @@ export function replayWindow(
         }
       }
     }
-
     if (downBidSize > 0) {
-      let filled = false;
-      // Path 1: CrossesSpread
       const downAsks = tick.downBookAsks ?? [];
       if (downAsks.length > 0) {
         const bestAsk = Math.min(...downAsks.map(a => a.price));
         if (downBidPrice >= bestAsk) {
           const costBasis = bestAsk;
-          if (downInventory > 0) {
-            const totalCost = downAvgCost * downInventory + costBasis * downBidSize;
-            downInventory += downBidSize;
-            downAvgCost = totalCost / downInventory;
-          } else {
-            downInventory = downBidSize;
-            downAvgCost = costBasis;
-          }
-          totalBuyCost += costBasis * downBidSize;
-          fillCount++;
-          downBidPrice = 0; downBidSize = 0;
-          filled = true;
-        }
-      }
-      // Path 2: Tape volume fill (fallback)
-      if (!filled) {
-        const queueAhead = computeQueueAhead(tick, downBidPrice, false);
-        const result = checkBucketFill(tick.tapeBuckets, snap.downTokenId, downBidPrice, downBidSize, queueAhead, downBidVolumeAtPlacement);
-        if (result.filled) {
-          const costBasis = downBidPrice;
           if (downInventory > 0) {
             const totalCost = downAvgCost * downInventory + costBasis * downBidSize;
             downInventory += downBidSize;

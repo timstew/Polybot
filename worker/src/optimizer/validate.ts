@@ -311,21 +311,21 @@ async function main() {
       }
     }
 
+    // Recorded fill events
+    let recordedFillCount = 0;
+    for (const tick of snap.ticks) {
+      if (tick.fills) recordedFillCount += tick.fills.length;
+    }
+    if (recordedFillCount > 0) {
+      console.log(`  Recorded fills: ${recordedFillCount} events`);
+    } else {
+      console.log(`  ⚠️  No recorded fill events (old snapshot or no fills during window)`);
+    }
+
     // Book asks analysis
     const bookInfo = analyzeBookAsks(snap);
-    if (bookInfo) {
-      if (!bookInfo.hasAskData) {
-        console.log(`  ⚠️  No book asks recorded (old snapshot — needs re-recording)`);
-      } else {
-        console.log(`  Book asks: UP=${bookInfo.ticksWithUpAsks}/${snap.ticks.length} ticks, DN=${bookInfo.ticksWithDownAsks}/${snap.ticks.length} ticks`);
-        if (bookInfo.upAskRange) {
-          console.log(`  UP bestAsk range: $${bookInfo.upAskRange.min.toFixed(2)}-$${bookInfo.upAskRange.max.toFixed(2)} (avg=$${bookInfo.upAskRange.avg.toFixed(2)})`);
-        }
-        if (bookInfo.downAskRange) {
-          console.log(`  DN bestAsk range: $${bookInfo.downAskRange.min.toFixed(2)}-$${bookInfo.downAskRange.max.toFixed(2)} (avg=$${bookInfo.downAskRange.avg.toFixed(2)})`);
-        }
-        console.log(`  CrossesSpread: UP=${bookInfo.crossesUpCount} ticks, DN=${bookInfo.crossesDownCount} ticks`);
-      }
+    if (bookInfo && bookInfo.hasAskData) {
+      console.log(`  Book asks: UP bestAsk=$${bookInfo.upAskRange?.avg.toFixed(2) ?? "?"} DN bestAsk=$${bookInfo.downAskRange?.avg.toFixed(2) ?? "?"}`);
     }
 
     // Replay
