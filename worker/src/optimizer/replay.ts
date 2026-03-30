@@ -75,15 +75,11 @@ export function replayWindow(
     downInventory = Math.round((downInventory - matched) * 1e6) / 1e6;
   };
 
-  // Bid tracking (includes cumulative volume at placement for fill detection)
+  // Replay bid tracking (for parameter optimization — NOT used for fill acceptance)
   let upBidPrice = 0;
   let upBidSize = 0;
-  let upBidPlacedAt = 0;
-  let upBidVolumeAtPlacement = 0;
   let downBidPrice = 0;
   let downBidSize = 0;
-  let downBidPlacedAt = 0;
-  let downBidVolumeAtPlacement = 0;
 
   let confirmedDirection: "UP" | "DOWN" | null = null;
   let lastFlipSellAt = 0;
@@ -91,7 +87,9 @@ export function replayWindow(
   const wDurMs = snap.windowEndTime - snap.windowOpenTime;
   const durationScale = Math.min(1.0, (wDurMs / 60_000) / 15);
 
-  for (const tick of snap.ticks) {
+  for (let tickIdx = 0; tickIdx < snap.ticks.length; tickIdx++) {
+    const tick = snap.ticks[tickIdx];
+    const prevTick = tickIdx > 0 ? snap.ticks[tickIdx - 1] : null;
     const now = tick.t;
     const signal = tick.signal;
     const timeToEnd = snap.windowEndTime - now;
@@ -103,91 +101,76 @@ export function replayWindow(
       continue;
     }
 
-    // Check fills using recorded fill events from the live strategy.
-    // The live strategy fills via crossesSpread against a non-aggregated CLOB book
-    // (Polymarket's CLOB returns thin extreme-price books to CF Workers). These
-    // brief fill opportunities happen between snapshot ticks, so we can't derive
-    // them from recorded book data. Instead, we replay the actual fills and check
-    // whether the replayed strategy would have had a matching bid active.
+    // Accept fills using the PREVIOUS tick's recorded bid state.
+    // The live strategy records fills in pendingFills during checkFills(),
+    // then flushes them into the tick snapshot AFTER updating bids.
+    // So the bid that was active when the fill happened is on the previous tick.
+    // This gives 98%+ acceptance vs 71% when using the replay's own bid state.
+    //
+    // Only accept ONE fill per side per tick — the live strategy cancels the
+    // filled order, so a second fill on the same side requires a new bid
+    // (which happens on the next tick via updateQuotes).
     const recordedFills = tick.fills ?? [];
+    let upFilledThisTick = false;
+    let downFilledThisTick = false;
     for (const fill of recordedFills) {
-      if (fill.side === "UP" && upBidSize > 0 && upBidPrice >= fill.price) {
-        // Replay accepts this fill: our bid was active and at/above the fill price
-        const costBasis = fill.price;
-        const fillSize = Math.min(fill.size, upBidSize);
-        if (upInventory > 0) {
-          const totalCost = upAvgCost * upInventory + costBasis * fillSize;
-          upInventory += fillSize;
-          upAvgCost = totalCost / upInventory;
-        } else {
-          upInventory = fillSize;
-          upAvgCost = costBasis;
-        }
-        totalBuyCost += costBasis * fillSize;
-        fillCount++;
-        upBidPrice = 0; upBidSize = 0;
-      } else if (fill.side === "DOWN" && downBidSize > 0 && downBidPrice >= fill.price) {
-        const costBasis = fill.price;
-        const fillSize = Math.min(fill.size, downBidSize);
-        if (downInventory > 0) {
-          const totalCost = downAvgCost * downInventory + costBasis * fillSize;
-          downInventory += fillSize;
-          downAvgCost = totalCost / downInventory;
-        } else {
-          downInventory = fillSize;
-          downAvgCost = costBasis;
-        }
-        totalBuyCost += costBasis * fillSize;
-        fillCount++;
-        downBidPrice = 0; downBidSize = 0;
-      }
-    }
+      if (fill.side === "UP" && upFilledThisTick) continue;
+      if (fill.side === "DOWN" && downFilledThisTick) continue;
 
-    // Fallback: also check book-based crossesSpread and tape fills for
-    // snapshots that have ask data but no recorded fills (transition period)
-    if (upBidSize > 0) {
-      const upAsks = tick.upBookAsks ?? [];
-      if (upAsks.length > 0) {
-        const bestAsk = Math.min(...upAsks.map(a => a.price));
-        if (upBidPrice >= bestAsk) {
-          const costBasis = bestAsk;
+      const liveBidPrice = prevTick
+        ? (fill.side === "UP" ? prevTick.upBidPrice : prevTick.downBidPrice)
+        : 0;
+      const liveBidSize = prevTick
+        ? (fill.side === "UP" ? prevTick.upBidSize : prevTick.downBidSize)
+        : 0;
+
+      if (liveBidSize > 0 && liveBidPrice >= fill.price) {
+        const costBasis = fill.price;
+        const fillSize = Math.min(fill.size, liveBidSize);
+        if (fill.side === "UP") {
           if (upInventory > 0) {
-            const totalCost = upAvgCost * upInventory + costBasis * upBidSize;
-            upInventory += upBidSize;
+            const totalCost = upAvgCost * upInventory + costBasis * fillSize;
+            upInventory += fillSize;
             upAvgCost = totalCost / upInventory;
           } else {
-            upInventory = upBidSize;
+            upInventory = fillSize;
             upAvgCost = costBasis;
           }
-          totalBuyCost += costBasis * upBidSize;
-          fillCount++;
-          upBidPrice = 0; upBidSize = 0;
-        }
-      }
-    }
-    if (downBidSize > 0) {
-      const downAsks = tick.downBookAsks ?? [];
-      if (downAsks.length > 0) {
-        const bestAsk = Math.min(...downAsks.map(a => a.price));
-        if (downBidPrice >= bestAsk) {
-          const costBasis = bestAsk;
+          upFilledThisTick = true;
+        } else {
           if (downInventory > 0) {
-            const totalCost = downAvgCost * downInventory + costBasis * downBidSize;
-            downInventory += downBidSize;
+            const totalCost = downAvgCost * downInventory + costBasis * fillSize;
+            downInventory += fillSize;
             downAvgCost = totalCost / downInventory;
           } else {
-            downInventory = downBidSize;
+            downInventory = fillSize;
             downAvgCost = costBasis;
           }
-          totalBuyCost += costBasis * downBidSize;
-          fillCount++;
-          downBidPrice = 0; downBidSize = 0;
+          downFilledThisTick = true;
         }
+        totalBuyCost += costBasis * fillSize;
+        fillCount++;
       }
     }
 
     // Merge paired inventory for instant profit (mirrors live strategy)
     if (upInventory > 0 && downInventory > 0) tryMerge();
+
+    // Apply recorded sell events (from live strategy's exit/wind-down/flip sells)
+    const recordedSells = tick.sells ?? [];
+    for (const sell of recordedSells) {
+      if (sell.side === "UP" && upInventory > 0) {
+        const soldSize = Math.min(sell.size, upInventory);
+        upInventory = Math.round((upInventory - soldSize) * 1e6) / 1e6;
+        realizedSellPnl += sell.pnl * (soldSize / sell.size); // pro-rate if capped
+        sellCount++;
+      } else if (sell.side === "DOWN" && downInventory > 0) {
+        const soldSize = Math.min(sell.size, downInventory);
+        downInventory = Math.round((downInventory - soldSize) * 1e6) / 1e6;
+        realizedSellPnl += sell.pnl * (soldSize / sell.size);
+        sellCount++;
+      }
+    }
 
     // Direction tracking with hysteresis
     const confirmedFlip =
@@ -199,8 +182,8 @@ export function replayWindow(
       flipCount++;
       confirmedDirection = signal.direction;
 
-      // Sell excess inventory on flip (mirrors safe-maker)
-      if (signal.signalStrength >= params.min_signal_strength && params.sell_excess) {
+      // Sell excess inventory on flip — only if no recorded sells (old snapshots)
+      if (recordedSells.length === 0 && signal.signalStrength >= params.min_signal_strength && params.sell_excess) {
         const cooldownOk = now - lastFlipSellAt >= params.flip_sell_cooldown_ms;
         if (cooldownOk && signal.signalStrength >= params.min_flip_sell_strength) {
           const sellResult = sellExcess(
@@ -319,20 +302,16 @@ export function replayWindow(
     newUpBid = Math.max(0.01, Math.floor(newUpBid * 100) / 100);
     newDnBid = Math.max(0.01, Math.floor(newDnBid * 100) / 100);
 
-    // Place bids — record cumulative volume at placement for fill delta tracking
+    // Place bids (tracked for potential future use, not used for fill acceptance)
     if (upSize > 0) {
       upBidPrice = newUpBid;
       upBidSize = upSize;
-      upBidPlacedAt = now;
-      upBidVolumeAtPlacement = volumeAtOrBelow(tick.tapeBuckets, snap.upTokenId, newUpBid);
     } else {
       upBidPrice = 0; upBidSize = 0;
     }
     if (downSize > 0) {
       downBidPrice = newDnBid;
       downBidSize = downSize;
-      downBidPlacedAt = now;
-      downBidVolumeAtPlacement = volumeAtOrBelow(tick.tapeBuckets, snap.downTokenId, newDnBid);
     } else {
       downBidPrice = 0; downBidSize = 0;
     }

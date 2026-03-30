@@ -110,6 +110,7 @@ interface MakerWindowPosition {
   tickSnapshots?: TickSnapshot[];
   snapshotId?: string; // deterministic D1 row ID for incremental snapshot persistence
   pendingFills?: Array<{ side: "UP" | "DOWN"; price: number; size: number }>;
+  pendingSells?: Array<{ side: "UP" | "DOWN"; price: number; size: number; costBasis: number; fee: number; pnl: number }>;
 
   // Cumulative tape: tracks token-specific trades seen since window open.
   // The global tape (200 trades) is too sparse per-token, so we accumulate
@@ -827,6 +828,7 @@ export class SafeMakerStrategy implements Strategy {
         window.tickSnapshots = [];
         window.snapshotId = `snap-${market.conditionId}-${now}`;
         window.pendingFills = [];
+        window.pendingSells = [];
       }
 
       this.custom.activeWindows.push(window);
@@ -874,8 +876,9 @@ export class SafeMakerStrategy implements Strategy {
           w.tickSnapshots = [];
         }
 
-        // Always reset pendingFills on restore (fills for restored ticks are already recorded)
+        // Always reset pending events on restore (events for restored ticks are already recorded)
         w.pendingFills = [];
+        w.pendingSells = [];
 
         // Rebuild cumulative tape state from restored tick snapshots
         // so we don't lose accumulated trade data across DO evictions
@@ -928,6 +931,7 @@ export class SafeMakerStrategy implements Strategy {
         }
         // Sell losing side inventory if any
         await this.sellLosingInventory(ctx, w, params, "DUMP");
+        await this.recordSellPhaseTick(ctx, w, now);
         w.tickAction = `Exiting: sell excess ${w.upInventory}↑/${w.downInventory}↓`;
         continue;
       }
@@ -951,6 +955,7 @@ export class SafeMakerStrategy implements Strategy {
           }
         }
         await this.sellLosingInventory(ctx, w, params, "WIND DOWN");
+        await this.recordSellPhaseTick(ctx, w, now);
         {
           const up = w.upInventory, dn = w.downInventory;
           const pc = (up > 0 && dn > 0) ? (w.upAvgCost + w.downAvgCost).toFixed(2) : "—";
@@ -1069,14 +1074,16 @@ export class SafeMakerStrategy implements Strategy {
           upBookAsks: w.lastUpBookAsks ?? [],
           downBookAsks: w.lastDownBookAsks ?? [],
           fills: w.pendingFills && w.pendingFills.length > 0 ? [...w.pendingFills] : undefined,
+          sells: w.pendingSells && w.pendingSells.length > 0 ? [...w.pendingSells] : undefined,
           upBidOrderId: w.upBidOrderId, upBidPrice: w.upBidPrice, upBidSize: w.upBidSize,
           downBidOrderId: w.downBidOrderId, downBidPrice: w.downBidPrice, downBidSize: w.downBidSize,
           upInventory: w.upInventory, downInventory: w.downInventory,
           upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
         });
 
-        // Clear pending fills after recording them in the tick snapshot
+        // Clear pending events after recording them in the tick snapshot
         if (w.pendingFills) w.pendingFills = [];
+        if (w.pendingSells) w.pendingSells = [];
 
         // Incrementally flush snapshots to D1 every tick to survive DO evictions
         if (w.snapshotId) {
@@ -2003,6 +2010,11 @@ export class SafeMakerStrategy implements Strategy {
         w.downInventory -= soldSize;
       }
 
+      // Record sell for snapshot replay
+      if (w.pendingSells) {
+        w.pendingSells.push({ side: losingSide, price: soldPrice, size: soldSize, costBasis: losingAvgCost, fee: sellFee, pnl: sellPnl });
+      }
+
       ctx.log(
         `${label}: ${w.market.title.slice(0, 25)} ${losingSide} ${soldSize}@${soldPrice.toFixed(3)} cost=${losingAvgCost.toFixed(3)} pnl=$${sellPnl.toFixed(2)} | sig=${(signal.signalStrength * 100).toFixed(0)}% ${signal.direction}`
       );
@@ -2034,6 +2046,56 @@ export class SafeMakerStrategy implements Strategy {
         `SELL PLACED: ${w.market.title.slice(0, 25)} ${losingSide} ${losingInventory}@${sellPrice.toFixed(3)} order=${result.order_id.slice(0, 12)}`,
         { level: "trade", symbol: w.cryptoSymbol, direction: losingSide, phase: "sell_placed" }
       );
+    }
+  }
+
+  // ── Record sell-phase tick snapshot ─────────────────────────────
+
+  private async recordSellPhaseTick(
+    ctx: StrategyContext,
+    w: MakerWindowPosition,
+    now: number
+  ): Promise<void> {
+    if (!w.tickSnapshots || !w.pendingSells?.length) return;
+    const lastTick = w.tickSnapshots.length > 0 ? w.tickSnapshots[w.tickSnapshots.length - 1] : null;
+    w.tickSnapshots.push({
+      t: now,
+      price: lastTick?.price ?? w.priceAtWindowOpen,
+      signal: lastTick?.signal ?? { symbol: w.cryptoSymbol, windowOpenPrice: w.priceAtWindowOpen, currentPrice: w.priceAtWindowOpen, priceChangePct: 0, direction: "UP" as const, signalStrength: 0, velocity: 0, sampleCount: 0, momentum: 0, acceleration: 0, volatilityRegime: "low" as const, confidenceMultiplier: 1, orderFlowImbalance: 0, orderFlowAvailable: false, rawDirection: "UP" as const, inDeadZone: false },
+      regime: w.lastRegime ?? "calm",
+      regimeFeatures: lastTick?.regimeFeatures ?? { choppiness: 0, trendStrength: 0, realizedVol: 0, momentum: 0, signalStrength: 0, distanceToStrike: 1, timeRemainingPct: 1, flipCount: 0, orderFlowImbalance: 0 },
+      regimeScores: lastTick?.regimeScores ?? {},
+      fairUp: w.lastFairUp ?? 0.50,
+      fairDown: w.lastFairDown ?? 0.50,
+      bookConviction: w.lastBookConviction ?? { upMid: null, downMid: null, bookDirection: "NEUTRAL", bookStrength: 0, bidDepthRatio: 0.5, midDelta: 0, agreement: 0 },
+      tapeBuckets: lastTick?.tapeBuckets ?? [],
+      tapeMeta: lastTick?.tapeMeta ?? { totalTrades: 0, totalVolume: 0, uniqueWallets: 0 },
+      bookBids: [],
+      upBookAsks: [],
+      downBookAsks: [],
+      sells: [...w.pendingSells],
+      upBidOrderId: null, upBidPrice: 0, upBidSize: 0,
+      downBidOrderId: null, downBidPrice: 0, downBidSize: 0,
+      upInventory: w.upInventory, downInventory: w.downInventory,
+      upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
+    });
+    w.pendingSells = [];
+    // Flush to D1
+    if (w.snapshotId) {
+      try {
+        const openDate = new Date(w.windowOpenTime);
+        await ctx.db.prepare(
+          `INSERT OR REPLACE INTO strategy_snapshots (id, strategy_id, window_title, crypto_symbol, window_open_time, window_end_time, window_duration_ms, oracle_strike, price_at_open, hour_utc, day_of_week, up_token_id, down_token_id, outcome, ticks)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          w.snapshotId, ctx.config.id, w.market.title, w.cryptoSymbol,
+          w.windowOpenTime, w.windowEndTime, w.windowEndTime - w.windowOpenTime,
+          w.oracleStrike ?? null, w.priceAtWindowOpen,
+          openDate.getUTCHours(), openDate.getUTCDay(),
+          w.market.upTokenId, w.market.downTokenId,
+          null, JSON.stringify(w.tickSnapshots)
+        ).run();
+      } catch { /* best-effort flush */ }
     }
   }
 

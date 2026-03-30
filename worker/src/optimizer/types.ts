@@ -36,6 +36,16 @@ export interface RecordedFill {
   size: number;     // filled size
 }
 
+/** A sell event executed by the live strategy during a tick period */
+export interface RecordedSell {
+  side: "UP" | "DOWN";   // which token was sold
+  price: number;          // actual sell price
+  size: number;           // sold size
+  costBasis: number;      // avg cost of the sold tokens
+  fee: number;            // taker fee charged
+  pnl: number;            // realized P&L from this sell
+}
+
 export interface TickSnapshot {
   t: number;
   price: number;
@@ -64,6 +74,9 @@ export interface TickSnapshot {
   /** Fill events detected since the previous tick.
    *  Recorded by the live strategy so replay can reproduce them exactly. */
   fills?: RecordedFill[];
+  /** Sell events executed since the previous tick.
+   *  Recorded by the live strategy so replay can reproduce sell P&L exactly. */
+  sells?: RecordedSell[];
 }
 
 export interface WindowSnapshot {
