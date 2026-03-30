@@ -101,56 +101,33 @@ export function replayWindow(
       continue;
     }
 
-    // Accept fills using the PREVIOUS tick's recorded bid state.
-    // The live strategy records fills in pendingFills during checkFills(),
-    // then flushes them into the tick snapshot AFTER updating bids.
-    // So the bid that was active when the fill happened is on the previous tick.
-    // This gives 98%+ acceptance vs 71% when using the replay's own bid state.
-    //
-    // Only accept ONE fill per side per tick — the live strategy cancels the
-    // filled order, so a second fill on the same side requires a new bid
-    // (which happens on the next tick via updateQuotes).
+    // Accept ALL recorded fills unconditionally — they are market events that
+    // actually happened in the live strategy. No bid-state gating needed.
     const recordedFills = tick.fills ?? [];
-    let upFilledThisTick = false;
-    let downFilledThisTick = false;
     for (const fill of recordedFills) {
-      if (fill.side === "UP" && upFilledThisTick) continue;
-      if (fill.side === "DOWN" && downFilledThisTick) continue;
-
-      const liveBidPrice = prevTick
-        ? (fill.side === "UP" ? prevTick.upBidPrice : prevTick.downBidPrice)
-        : 0;
-      const liveBidSize = prevTick
-        ? (fill.side === "UP" ? prevTick.upBidSize : prevTick.downBidSize)
-        : 0;
-
-      if (liveBidSize > 0 && liveBidPrice >= fill.price) {
-        const costBasis = fill.price;
-        const fillSize = Math.min(fill.size, liveBidSize);
-        if (fill.side === "UP") {
-          if (upInventory > 0) {
-            const totalCost = upAvgCost * upInventory + costBasis * fillSize;
-            upInventory += fillSize;
-            upAvgCost = totalCost / upInventory;
-          } else {
-            upInventory = fillSize;
-            upAvgCost = costBasis;
-          }
-          upFilledThisTick = true;
+      const costBasis = fill.price;
+      const fillSize = fill.size;
+      if (fill.side === "UP") {
+        if (upInventory > 0) {
+          const totalCost = upAvgCost * upInventory + costBasis * fillSize;
+          upInventory += fillSize;
+          upAvgCost = totalCost / upInventory;
         } else {
-          if (downInventory > 0) {
-            const totalCost = downAvgCost * downInventory + costBasis * fillSize;
-            downInventory += fillSize;
-            downAvgCost = totalCost / downInventory;
-          } else {
-            downInventory = fillSize;
-            downAvgCost = costBasis;
-          }
-          downFilledThisTick = true;
+          upInventory = fillSize;
+          upAvgCost = costBasis;
         }
-        totalBuyCost += costBasis * fillSize;
-        fillCount++;
+      } else {
+        if (downInventory > 0) {
+          const totalCost = downAvgCost * downInventory + costBasis * fillSize;
+          downInventory += fillSize;
+          downAvgCost = totalCost / downInventory;
+        } else {
+          downInventory = fillSize;
+          downAvgCost = costBasis;
+        }
       }
+      totalBuyCost += costBasis * fillSize;
+      fillCount++;
     }
 
     // Merge paired inventory for instant profit (mirrors live strategy)

@@ -650,6 +650,10 @@ export class SafeMakerStrategy implements Strategy {
     w.fillCount++;
     w.totalBuyCost += costBasis * size;
     this.custom.totalMakerFills++;
+    // Record cancel-fill for snapshot replay
+    if (w.pendingFills) {
+      w.pendingFills.push({ side, price: costBasis, size });
+    }
     ctx.log(
       `CANCEL-FILL ${side}: ${w.market.title.slice(0, 25)} ${size}@${price.toFixed(3)} (discovered during cancel)`,
       { level: "trade", symbol: w.cryptoSymbol, direction: side, phase: "cancel_fill" }
