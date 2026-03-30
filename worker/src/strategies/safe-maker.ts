@@ -1310,6 +1310,11 @@ export class SafeMakerStrategy implements Strategy {
             w.downInventory = Math.max(0, w.downInventory - soldSize);
           }
 
+          // Record sell for snapshot replay
+          if (w.pendingSells) {
+            w.pendingSells.push({ side: w.pendingSellSide!, price: soldPrice, size: soldSize, costBasis: w.pendingSellCostBasis, fee: sellFee, pnl: sellPnl });
+          }
+
           ctx.log(
             `SELL FILLED: ${w.market.title.slice(0, 25)} ${w.pendingSellSide} ${soldSize}@${soldPrice.toFixed(3)} pnl=$${sellPnl.toFixed(2)}`,
             { level: "trade", symbol: w.cryptoSymbol, direction: w.pendingSellSide ?? undefined, phase: "sell_fill" }
