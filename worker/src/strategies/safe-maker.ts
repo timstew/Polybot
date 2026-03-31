@@ -1236,6 +1236,9 @@ export class SafeMakerStrategy implements Strategy {
         w.fillCount++;
         w.totalBuyCost += costBasis * fillSize;
         this.custom.totalMakerFills++;
+        if (w.pendingFills) {
+          w.pendingFills.push({ side: lightSide, price: costBasis, size: fillSize });
+        }
         ctx.log(
           `WIND-DOWN FILL ${lightSide}: ${w.market.title.slice(0, 25)} ${fillSize}@${fillPrice.toFixed(3)} gap=${gap}->${Math.abs(w.upInventory - w.downInventory)}`,
           { level: "trade", symbol: w.cryptoSymbol, direction: lightSide, upInventory: w.upInventory, downInventory: w.downInventory, phase: "wind_down" }
@@ -1271,6 +1274,9 @@ export class SafeMakerStrategy implements Strategy {
     }
 
     w.tickAction = `Wind-down: matching light side (gap=${gap})`;
+
+    // Record any fills/sells from this wind-down tick (cancel-fills, wind-down fills)
+    await this.recordSellPhaseTick(ctx, w, Date.now());
 
     if (ctx.state.ticks % 5 === 0) {
       ctx.log(
@@ -1821,6 +1827,9 @@ export class SafeMakerStrategy implements Strategy {
         w.fillCount++;
         w.totalBuyCost += costBasis * fillSize;
         this.custom.totalMakerFills++;
+        if (w.pendingFills) {
+          w.pendingFills.push({ side: "UP", price: costBasis, size: fillSize });
+        }
         ctx.log(
           `MAKER FILL UP (immediate): ${w.market.title.slice(0, 30)} ${fillSize}@${fillPrice.toFixed(3)}${fillSize < upBidSize ? ` (partial ${fillSize}/${upBidSize})` : ""}`
         );
@@ -1884,6 +1893,9 @@ export class SafeMakerStrategy implements Strategy {
         w.fillCount++;
         w.totalBuyCost += costBasis * fillSize;
         this.custom.totalMakerFills++;
+        if (w.pendingFills) {
+          w.pendingFills.push({ side: "DOWN", price: costBasis, size: fillSize });
+        }
         ctx.log(
           `MAKER FILL DN (immediate): ${w.market.title.slice(0, 30)} ${fillSize}@${fillPrice.toFixed(3)}${fillSize < downBidSize ? ` (partial ${fillSize}/${downBidSize})` : ""}`
         );
@@ -2065,7 +2077,9 @@ export class SafeMakerStrategy implements Strategy {
     w: MakerWindowPosition,
     now: number
   ): Promise<void> {
-    if (!w.tickSnapshots || !w.pendingSells?.length) return;
+    const hasSells = w.pendingSells && w.pendingSells.length > 0;
+    const hasFills = w.pendingFills && w.pendingFills.length > 0;
+    if (!w.tickSnapshots || (!hasSells && !hasFills)) return;
     const lastTick = w.tickSnapshots.length > 0 ? w.tickSnapshots[w.tickSnapshots.length - 1] : null;
     w.tickSnapshots.push({
       t: now,
@@ -2082,13 +2096,15 @@ export class SafeMakerStrategy implements Strategy {
       bookBids: [],
       upBookAsks: [],
       downBookAsks: [],
-      sells: [...w.pendingSells],
+      fills: hasFills ? [...w.pendingFills!] : undefined,
+      sells: hasSells ? [...w.pendingSells!] : undefined,
       upBidOrderId: null, upBidPrice: 0, upBidSize: 0,
       downBidOrderId: null, downBidPrice: 0, downBidSize: 0,
       upInventory: w.upInventory, downInventory: w.downInventory,
       upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
     });
-    w.pendingSells = [];
+    if (w.pendingSells) w.pendingSells = [];
+    if (w.pendingFills) w.pendingFills = [];
     // Flush to D1
     if (w.snapshotId) {
       try {
