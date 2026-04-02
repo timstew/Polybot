@@ -94,11 +94,11 @@ export function replayWindow(
     const signal = tick.signal;
     const timeToEnd = snap.windowEndTime - now;
 
-    // Stop quoting near end
-    if (timeToEnd < params.stop_quoting_before_end_ms) {
+    // Stop quoting near end — but still process recorded events and sync
+    const inStopQuoting = timeToEnd < params.stop_quoting_before_end_ms;
+    if (inStopQuoting) {
       upBidPrice = 0; upBidSize = 0;
       downBidPrice = 0; downBidSize = 0;
-      continue;
     }
 
     // Apply recorded fills from live strategy
@@ -170,6 +170,9 @@ export function replayWindow(
       downInventory = tick.downInventory;
       downAvgCost = tick.downAvgCost;
     }
+
+    // In stop-quoting phase, we've processed events and synced — skip quoting logic
+    if (inStopQuoting) continue;
 
     // Direction tracking with hysteresis
     const confirmedFlip =
