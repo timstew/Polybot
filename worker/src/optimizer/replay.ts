@@ -101,46 +101,11 @@ export function replayWindow(
       continue;
     }
 
-    // Accept recorded fills, but deduplicate phantom duplicates from DO
-    // eviction/re-hydration. Compute net delta (fills - sells) per side and
-    // compare to inventory change. If there are more fill events than the
-    // inventory change accounts for, skip the excess.
+    // Apply recorded fills from live strategy
     const recordedFills = tick.fills ?? [];
-    const recordedSells = tick.sells ?? [];
-
-    // Compute expected inventory change from all events this tick
-    const prevUpInv = prevTick ? prevTick.upInventory : 0;
-    const prevDnInv = prevTick ? prevTick.downInventory : 0;
-    const liveUpDelta = tick.upInventory - prevUpInv;
-    const liveDnDelta = tick.downInventory - prevDnInv;
-
-    // Compute recorded fill/sell deltas
-    let fillUpDelta = 0, fillDnDelta = 0;
-    for (const f of recordedFills) {
-      if (f.side === "UP") fillUpDelta += f.size;
-      else fillDnDelta += f.size;
-    }
-    let sellUpDelta = 0, sellDnDelta = 0;
-    for (const s of recordedSells) {
-      if (s.side === "UP") sellUpDelta += s.size;
-      else sellDnDelta += s.size;
-    }
-    const eventUpDelta = fillUpDelta - sellUpDelta;
-    const eventDnDelta = fillDnDelta - sellDnDelta;
-
-    // If events would change inventory more than live actually changed,
-    // scale down fills proportionally to match live delta
-    const upScale = (fillUpDelta > 0 && eventUpDelta > liveUpDelta + 0.5)
-      ? Math.max(0, liveUpDelta + sellUpDelta) / fillUpDelta : 1.0;
-    const dnScale = (fillDnDelta > 0 && eventDnDelta > liveDnDelta + 0.5)
-      ? Math.max(0, liveDnDelta + sellDnDelta) / fillDnDelta : 1.0;
-
     for (const fill of recordedFills) {
-      const scale = fill.side === "UP" ? upScale : dnScale;
-      if (scale < 0.01) continue; // completely phantom
       const costBasis = fill.price;
-      const fillSize = Math.round(fill.size * scale);
-      if (fillSize <= 0) continue;
+      const fillSize = fill.size;
       if (fill.side === "UP") {
         if (upInventory > 0) {
           const totalCost = upAvgCost * upInventory + costBasis * fillSize;
@@ -168,6 +133,7 @@ export function replayWindow(
     if (upInventory > 0 && downInventory > 0) tryMerge();
 
     // Apply recorded sell events (from live strategy's exit/wind-down/flip sells)
+    const recordedSells = tick.sells ?? [];
     for (const sell of recordedSells) {
       if (sell.side === "UP" && upInventory > 0) {
         const soldSize = Math.min(sell.size, upInventory);
@@ -180,6 +146,29 @@ export function replayWindow(
         realizedSellPnl += sell.pnl * (soldSize / sell.size);
         sellCount++;
       }
+    }
+
+    // Sync to recorded live inventory — handles missing/duplicate events
+    // from DO eviction gaps without letting errors compound across ticks.
+    // Use recorded avg cost when inventory was missing from events.
+    if (Math.abs(upInventory - tick.upInventory) > 0.5) {
+      if (tick.upInventory > upInventory) {
+        // Missing fills — account for the gap
+        const missing = tick.upInventory - upInventory;
+        totalBuyCost += tick.upAvgCost * missing;
+        fillCount++;
+      }
+      upInventory = tick.upInventory;
+      upAvgCost = tick.upAvgCost;
+    }
+    if (Math.abs(downInventory - tick.downInventory) > 0.5) {
+      if (tick.downInventory > downInventory) {
+        const missing = tick.downInventory - downInventory;
+        totalBuyCost += tick.downAvgCost * missing;
+        fillCount++;
+      }
+      downInventory = tick.downInventory;
+      downAvgCost = tick.downAvgCost;
     }
 
     // Direction tracking with hysteresis
