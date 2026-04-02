@@ -101,16 +101,47 @@ export function replayWindow(
       continue;
     }
 
-    // Accept recorded fills, but deduplicate: if applying a fill would push
-    // our computed inventory ABOVE the recorded live inventory at this tick,
-    // skip it — it's a phantom duplicate from DO eviction/re-hydration.
+    // Accept recorded fills, but deduplicate phantom duplicates from DO
+    // eviction/re-hydration. Compute net delta (fills - sells) per side and
+    // compare to inventory change. If there are more fill events than the
+    // inventory change accounts for, skip the excess.
     const recordedFills = tick.fills ?? [];
+    const recordedSells = tick.sells ?? [];
+
+    // Compute expected inventory change from all events this tick
+    const prevUpInv = prevTick ? prevTick.upInventory : 0;
+    const prevDnInv = prevTick ? prevTick.downInventory : 0;
+    const liveUpDelta = tick.upInventory - prevUpInv;
+    const liveDnDelta = tick.downInventory - prevDnInv;
+
+    // Compute recorded fill/sell deltas
+    let fillUpDelta = 0, fillDnDelta = 0;
+    for (const f of recordedFills) {
+      if (f.side === "UP") fillUpDelta += f.size;
+      else fillDnDelta += f.size;
+    }
+    let sellUpDelta = 0, sellDnDelta = 0;
+    for (const s of recordedSells) {
+      if (s.side === "UP") sellUpDelta += s.size;
+      else sellDnDelta += s.size;
+    }
+    const eventUpDelta = fillUpDelta - sellUpDelta;
+    const eventDnDelta = fillDnDelta - sellDnDelta;
+
+    // If events would change inventory more than live actually changed,
+    // scale down fills proportionally to match live delta
+    const upScale = (fillUpDelta > 0 && eventUpDelta > liveUpDelta + 0.5)
+      ? Math.max(0, liveUpDelta + sellUpDelta) / fillUpDelta : 1.0;
+    const dnScale = (fillDnDelta > 0 && eventDnDelta > liveDnDelta + 0.5)
+      ? Math.max(0, liveDnDelta + sellDnDelta) / fillDnDelta : 1.0;
+
     for (const fill of recordedFills) {
+      const scale = fill.side === "UP" ? upScale : dnScale;
+      if (scale < 0.01) continue; // completely phantom
       const costBasis = fill.price;
-      const fillSize = fill.size;
+      const fillSize = Math.round(fill.size * scale);
+      if (fillSize <= 0) continue;
       if (fill.side === "UP") {
-        const wouldBe = upInventory + fillSize;
-        if (wouldBe > tick.upInventory + 0.5) continue; // phantom duplicate
         if (upInventory > 0) {
           const totalCost = upAvgCost * upInventory + costBasis * fillSize;
           upInventory += fillSize;
@@ -120,8 +151,6 @@ export function replayWindow(
           upAvgCost = costBasis;
         }
       } else {
-        const wouldBe = downInventory + fillSize;
-        if (wouldBe > tick.downInventory + 0.5) continue; // phantom duplicate
         if (downInventory > 0) {
           const totalCost = downAvgCost * downInventory + costBasis * fillSize;
           downInventory += fillSize;
@@ -139,19 +168,13 @@ export function replayWindow(
     if (upInventory > 0 && downInventory > 0) tryMerge();
 
     // Apply recorded sell events (from live strategy's exit/wind-down/flip sells)
-    // Skip phantom duplicates: if selling would push below recorded live inventory
-    const recordedSells = tick.sells ?? [];
     for (const sell of recordedSells) {
       if (sell.side === "UP" && upInventory > 0) {
-        const wouldBe = upInventory - sell.size;
-        if (wouldBe < tick.upInventory - 0.5) continue; // phantom duplicate
         const soldSize = Math.min(sell.size, upInventory);
         upInventory = Math.round((upInventory - soldSize) * 1e6) / 1e6;
         realizedSellPnl += sell.pnl * (soldSize / sell.size); // pro-rate if capped
         sellCount++;
       } else if (sell.side === "DOWN" && downInventory > 0) {
-        const wouldBe = downInventory - sell.size;
-        if (wouldBe < tick.downInventory - 0.5) continue; // phantom duplicate
         const soldSize = Math.min(sell.size, downInventory);
         downInventory = Math.round((downInventory - soldSize) * 1e6) / 1e6;
         realizedSellPnl += sell.pnl * (soldSize / sell.size);
