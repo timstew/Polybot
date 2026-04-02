@@ -101,13 +101,16 @@ export function replayWindow(
       continue;
     }
 
-    // Accept ALL recorded fills unconditionally — they are market events that
-    // actually happened in the live strategy. No bid-state gating needed.
+    // Accept recorded fills, but deduplicate: if applying a fill would push
+    // our computed inventory ABOVE the recorded live inventory at this tick,
+    // skip it — it's a phantom duplicate from DO eviction/re-hydration.
     const recordedFills = tick.fills ?? [];
     for (const fill of recordedFills) {
       const costBasis = fill.price;
       const fillSize = fill.size;
       if (fill.side === "UP") {
+        const wouldBe = upInventory + fillSize;
+        if (wouldBe > tick.upInventory + 0.5) continue; // phantom duplicate
         if (upInventory > 0) {
           const totalCost = upAvgCost * upInventory + costBasis * fillSize;
           upInventory += fillSize;
@@ -117,6 +120,8 @@ export function replayWindow(
           upAvgCost = costBasis;
         }
       } else {
+        const wouldBe = downInventory + fillSize;
+        if (wouldBe > tick.downInventory + 0.5) continue; // phantom duplicate
         if (downInventory > 0) {
           const totalCost = downAvgCost * downInventory + costBasis * fillSize;
           downInventory += fillSize;
@@ -134,14 +139,19 @@ export function replayWindow(
     if (upInventory > 0 && downInventory > 0) tryMerge();
 
     // Apply recorded sell events (from live strategy's exit/wind-down/flip sells)
+    // Skip phantom duplicates: if selling would push below recorded live inventory
     const recordedSells = tick.sells ?? [];
     for (const sell of recordedSells) {
       if (sell.side === "UP" && upInventory > 0) {
+        const wouldBe = upInventory - sell.size;
+        if (wouldBe < tick.upInventory - 0.5) continue; // phantom duplicate
         const soldSize = Math.min(sell.size, upInventory);
         upInventory = Math.round((upInventory - soldSize) * 1e6) / 1e6;
         realizedSellPnl += sell.pnl * (soldSize / sell.size); // pro-rate if capped
         sellCount++;
       } else if (sell.side === "DOWN" && downInventory > 0) {
+        const wouldBe = downInventory - sell.size;
+        if (wouldBe < tick.downInventory - 0.5) continue; // phantom duplicate
         const soldSize = Math.min(sell.size, downInventory);
         downInventory = Math.round((downInventory - soldSize) * 1e6) / 1e6;
         realizedSellPnl += sell.pnl * (soldSize / sell.size);
