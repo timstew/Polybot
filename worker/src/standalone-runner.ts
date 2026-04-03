@@ -36,8 +36,8 @@ function parseArgs() {
   const args = process.argv.slice(2);
   let configId = "";
   let dbPath = "";
-  let port = 8787;
-  let pythonApiUrl = "http://127.0.0.1:8000";
+  let port = parseInt(process.env.PORT || "8787", 10);
+  let pythonApiUrl = process.env.PYTHON_API_URL || "http://127.0.0.1:8000";
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -72,13 +72,7 @@ function parseArgs() {
     process.exit(1);
   }
 
-  if (!configId) {
-    console.error("ERROR: --config-id is required.");
-    console.error("Usage: npx tsx src/standalone-runner.ts --config-id=strat-xxx");
-    process.exit(1);
-  }
-
-  return { configId, dbPath, port, pythonApiUrl };
+  return { configId: configId || null, dbPath, port, pythonApiUrl };
 }
 
 // ── D1-compatible SQLite wrapper ──
@@ -630,7 +624,7 @@ async function main() {
   console.log("═".repeat(60));
   console.log("Standalone Strategy Runner (no DO eviction)");
   console.log(`Database: ${dbPath}`);
-  console.log(`Config:   ${configId}`);
+  console.log(`Config:   ${configId ?? "(auto-start all active)"}`);
   console.log(`Port:     ${port}`);
   console.log(`Python:   ${pythonApiUrl}`);
   console.log("═".repeat(60));
@@ -642,14 +636,27 @@ async function main() {
   // Start HTTP server
   startServer(port, pythonApiUrl);
 
-  // Start the specified strategy
-  const result = await startStrategy(configId, pythonApiUrl);
-  if (result !== "started") {
-    console.error(`Failed to start strategy: ${result}`);
-    process.exit(1);
+  if (configId) {
+    // Start the specified strategy
+    const result = await startStrategy(configId, pythonApiUrl);
+    if (result !== "started") {
+      console.error(`Failed to start strategy: ${result}`);
+      process.exit(1);
+    }
+    console.log(`\nStrategy ${configId} running. Ticks every ${instances.get(configId)!.config.tick_interval_ms}ms.`);
+  } else {
+    // Auto-start all active configs
+    const rows = sqliteDb.prepare("SELECT id, name FROM strategy_configs WHERE active = 1").all() as Array<{ id: string; name: string }>;
+    if (rows.length === 0) {
+      console.log("\nNo active strategies found. Server is running — use POST /api/strategy/start/:id to start one.");
+    } else {
+      console.log(`\nAuto-starting ${rows.length} active strategies...`);
+      for (const row of rows) {
+        const result = await startStrategy(row.id, pythonApiUrl);
+        console.log(`  ${row.name} (${row.id}): ${result}`);
+      }
+    }
   }
-
-  console.log(`\nStrategy ${configId} running. Ticks every ${instances.get(configId)!.config.tick_interval_ms}ms.`);
   console.log("Press Ctrl+C to stop.\n");
 
   // Graceful shutdown
