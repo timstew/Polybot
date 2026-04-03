@@ -16,7 +16,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
-import { replayWindow } from "./replay";
+import { replayWindow, replayWindowSimulated } from "./replay";
 import type { WindowSnapshot, TickSnapshot } from "./types";
 import type { DirectionalMakerParams } from "../strategies/safe-maker";
 import { DEFAULT_PARAMS } from "../strategies/safe-maker";
@@ -227,7 +227,7 @@ function evaluate(
   let totalFills = 0;
 
   for (const snap of windows) {
-    const result = replayWindow(snap, params);
+    const result = replayWindowSimulated(snap, params);
     pnls.push(result.netPnl);
     totalFills += result.fillCount;
   }

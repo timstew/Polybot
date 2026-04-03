@@ -359,6 +359,378 @@ export function replayWindow(
   };
 }
 
+/**
+ * Simulated replay: computes bid prices from params and checks fills against
+ * recorded tape bucket data. Changing params produces different fill/sell outcomes,
+ * unlike the faithful replayWindow() which replays recorded events as-is.
+ */
+export function replayWindowSimulated(
+  snap: WindowSnapshot,
+  params: DirectionalMakerParams,
+): ReplayResult {
+  let upInventory = 0;
+  let downInventory = 0;
+  let upAvgCost = 0;
+  let downAvgCost = 0;
+  let totalBuyCost = 0;
+  let realizedSellPnl = 0;
+  let mergePnl = 0;
+  let fillCount = 0;
+  let sellCount = 0;
+  let flipCount = 0;
+  let bidPlacementCount = 0;
+
+  const tryMerge = () => {
+    const matched = Math.min(upInventory, downInventory);
+    if (matched <= 0) return;
+    const pairCost = upAvgCost + downAvgCost;
+    if (pairCost >= 1.0) return;
+    const pnl = matched * (1.0 - pairCost);
+    mergePnl += pnl;
+    upInventory = Math.round((upInventory - matched) * 1e6) / 1e6;
+    downInventory = Math.round((downInventory - matched) * 1e6) / 1e6;
+  };
+
+  // Active bid state — tracks simulated resting bids
+  let upBidPrice = 0;
+  let upBidSize = 0;
+  let downBidPrice = 0;
+  let downBidSize = 0;
+
+  // Track tape volume at bid placement for cumulative fill detection
+  let upVolumeAtPlacement = 0;
+  let downVolumeAtPlacement = 0;
+
+  let confirmedDirection: "UP" | "DOWN" | null = null;
+  let lastFlipSellAt = 0;
+
+  const wDurMs = snap.windowEndTime - snap.windowOpenTime;
+  const durationScale = Math.min(1.0, (wDurMs / 60_000) / 15);
+
+  for (let tickIdx = 0; tickIdx < snap.ticks.length; tickIdx++) {
+    const tick = snap.ticks[tickIdx];
+    const now = tick.t;
+    const signal = tick.signal;
+    const timeToEnd = snap.windowEndTime - now;
+
+    const inStopQuoting = timeToEnd < params.stop_quoting_before_end_ms;
+
+    // ── Check simulated fills on active bids ──
+    if (upBidPrice > 0 && upBidSize > 0) {
+      // Check immediate fill: bid >= best ask
+      const bestUpAsk = tick.upBookAsks?.length
+        ? Math.min(...tick.upBookAsks.map(a => a.price))
+        : null;
+      let filled = false;
+      let fillPrice = upBidPrice;
+
+      if (bestUpAsk !== null && upBidPrice >= bestUpAsk) {
+        filled = true;
+        fillPrice = bestUpAsk; // taker fill at best ask
+      } else if (tick.tapeBuckets.length > 0) {
+        // Resting bid: check tape volume
+        const queueAhead = computeQueueAhead(tick, upBidPrice, true);
+        const result = checkBucketFill(
+          tick.tapeBuckets, snap.upTokenId, upBidPrice, upBidSize,
+          queueAhead, upVolumeAtPlacement,
+        );
+        filled = result.filled;
+        fillPrice = result.fillPrice;
+      }
+
+      if (filled) {
+        const costBasis = fillPrice;
+        if (upInventory > 0) {
+          const totalCost = upAvgCost * upInventory + costBasis * upBidSize;
+          upInventory += upBidSize;
+          upAvgCost = totalCost / upInventory;
+        } else {
+          upInventory = upBidSize;
+          upAvgCost = costBasis;
+        }
+        totalBuyCost += costBasis * upBidSize;
+        fillCount++;
+        upBidPrice = 0; upBidSize = 0;
+      }
+    }
+
+    if (downBidPrice > 0 && downBidSize > 0) {
+      const bestDnAsk = tick.downBookAsks?.length
+        ? Math.min(...tick.downBookAsks.map(a => a.price))
+        : null;
+      let filled = false;
+      let fillPrice = downBidPrice;
+
+      if (bestDnAsk !== null && downBidPrice >= bestDnAsk) {
+        filled = true;
+        fillPrice = bestDnAsk;
+      } else if (tick.tapeBuckets.length > 0) {
+        const queueAhead = computeQueueAhead(tick, downBidPrice, false);
+        const result = checkBucketFill(
+          tick.tapeBuckets, snap.downTokenId, downBidPrice, downBidSize,
+          queueAhead, downVolumeAtPlacement,
+        );
+        filled = result.filled;
+        fillPrice = result.fillPrice;
+      }
+
+      if (filled) {
+        const costBasis = fillPrice;
+        if (downInventory > 0) {
+          const totalCost = downAvgCost * downInventory + costBasis * downBidSize;
+          downInventory += downBidSize;
+          downAvgCost = totalCost / downInventory;
+        } else {
+          downInventory = downBidSize;
+          downAvgCost = costBasis;
+        }
+        totalBuyCost += costBasis * downBidSize;
+        fillCount++;
+        downBidPrice = 0; downBidSize = 0;
+      }
+    }
+
+    // Merge paired inventory
+    if (upInventory > 0 && downInventory > 0) tryMerge();
+
+    if (inStopQuoting) {
+      upBidPrice = 0; upBidSize = 0;
+      downBidPrice = 0; downBidSize = 0;
+      continue;
+    }
+
+    // Direction tracking with hysteresis
+    const confirmedFlip =
+      confirmedDirection !== null &&
+      signal.direction !== confirmedDirection &&
+      !signal.inDeadZone;
+
+    if (confirmedFlip) {
+      flipCount++;
+      confirmedDirection = signal.direction;
+
+      // Simulate sells on flip
+      if (params.sell_excess && signal.signalStrength >= params.min_signal_strength) {
+        const cooldownOk = now - lastFlipSellAt >= params.flip_sell_cooldown_ms;
+        if (cooldownOk && signal.signalStrength >= params.min_flip_sell_strength) {
+          // Estimate sell price from recorded ask book (if available)
+          const losingSide = signal.direction === "UP" ? "DOWN" : "UP";
+          const sellResult = sellExcessSimulated(
+            losingSide, upInventory, downInventory, upAvgCost, downAvgCost,
+            params, tick,
+          );
+          realizedSellPnl += sellResult.pnl;
+          sellCount += sellResult.soldCount;
+          upInventory = sellResult.upInv;
+          downInventory = sellResult.downInv;
+          lastFlipSellAt = now;
+        }
+      }
+
+      // Cancel existing bids on flip
+      upBidPrice = 0; upBidSize = 0;
+      downBidPrice = 0; downBidSize = 0;
+    } else if (confirmedDirection === null) {
+      confirmedDirection = signal.direction;
+    }
+
+    if (flipCount > params.max_flips_per_window) {
+      upBidPrice = 0; upBidSize = 0;
+      downBidPrice = 0; downBidSize = 0;
+      continue;
+    }
+
+    // ── Compute bid prices and sizes from params (identical to faithful replay) ──
+    const regime = tick.regime;
+    const regimeDiscount =
+      regime === "oscillating" ? 0.20 :
+      regime === "trending"    ? 0.08 :
+      regime === "volatile"    ? 0.18 :
+      regime === "calm"        ? 0.12 :
+      0.12;
+
+    const fairUp = tick.fairUp;
+    const fairDown = tick.fairDown;
+    const discountedFairUp = Math.max(0.01, fairUp * (1 - regimeDiscount));
+    const discountedFairDown = Math.max(0.01, fairDown * (1 - regimeDiscount));
+
+    const convictionSide =
+      signal.signalStrength >= params.min_signal_strength
+        ? signal.direction
+        : null;
+
+    const strengthRange = 1.0 - params.min_signal_strength;
+    const strengthFraction = strengthRange > 0
+      ? Math.min(1.0, (signal.signalStrength - params.min_signal_strength) / strengthRange)
+      : 0;
+    const scaledBias = 1.0 + (params.conviction_bias - 1.0) * strengthFraction;
+    const adjustedBias = scaledBias * signal.confidenceMultiplier;
+    const effectiveBaseSize = Math.max(3, Math.round(params.base_bid_size * durationScale));
+
+    let upSize = effectiveBaseSize;
+    let downSize = effectiveBaseSize;
+    const clampedBias = Math.min(adjustedBias, 2.0);
+    if (convictionSide === "UP") {
+      upSize = Math.round(effectiveBaseSize * clampedBias);
+      downSize = Math.max(
+        Math.round(effectiveBaseSize * 0.5),
+        Math.round(effectiveBaseSize / clampedBias)
+      );
+    } else if (convictionSide === "DOWN") {
+      downSize = Math.round(effectiveBaseSize * clampedBias);
+      upSize = Math.max(
+        Math.round(effectiveBaseSize * 0.5),
+        Math.round(effectiveBaseSize / clampedBias)
+      );
+    }
+
+    // One-sided cap
+    if (downInventory === 0) upSize = Math.min(upSize, Math.max(0, effectiveBaseSize - upInventory));
+    if (upInventory === 0) downSize = Math.min(downSize, Math.max(0, effectiveBaseSize - downInventory));
+
+    // Inventory ratio check
+    const maxInvRatio = params.max_inventory_ratio;
+    if (upInventory > 0 && downInventory > 0) {
+      if (upInventory / downInventory > maxInvRatio) upSize = 0;
+      if (downInventory / upInventory > maxInvRatio) downSize = 0;
+    } else if (upInventory >= effectiveBaseSize && downInventory === 0) {
+      upSize = 0;
+    } else if (downInventory >= effectiveBaseSize && upInventory === 0) {
+      downSize = 0;
+    }
+
+    // Bid prices with time decay
+    const windowProgress = (now - snap.windowOpenTime) / wDurMs;
+    const tightenStart = params.tighten_start_pct;
+    const timeDecay = windowProgress > tightenStart
+      ? 1.0 - (windowProgress - tightenStart) / (1.0 - tightenStart)
+      : 1.0;
+
+    const upBidFair = upInventory > 0 ? discountedFairUp : fairUp * (1 - regimeDiscount * timeDecay);
+    const dnBidFair = downInventory > 0 ? discountedFairDown : fairDown * (1 - regimeDiscount * timeDecay);
+
+    let rawUpBid = Math.min(Math.max(0.01, upBidFair), params.max_bid_per_side);
+    let rawDnBid = Math.min(Math.max(0.01, dnBidFair), params.max_bid_per_side);
+
+    // Cross-fill guard
+    let newUpBid = downInventory > 0
+      ? Math.min(rawUpBid, params.max_pair_cost - downAvgCost)
+      : rawUpBid;
+    let newDnBid = upInventory > 0
+      ? Math.min(rawDnBid, params.max_pair_cost - upAvgCost)
+      : rawDnBid;
+
+    if (newUpBid + newDnBid > params.max_pair_cost) {
+      const scale = params.max_pair_cost / (newUpBid + newDnBid);
+      newUpBid *= scale;
+      newDnBid *= scale;
+    }
+    newUpBid = Math.max(0.01, Math.floor(newUpBid * 100) / 100);
+    newDnBid = Math.max(0.01, Math.floor(newDnBid * 100) / 100);
+
+    // Place or update bids — record volume at placement for tape fill detection
+    if (upSize > 0) {
+      if (upBidPrice !== newUpBid || upBidSize !== upSize) {
+        // New or changed bid — reset volume baseline
+        upVolumeAtPlacement = volumeAtOrBelow(tick.tapeBuckets, snap.upTokenId, newUpBid);
+      }
+      upBidPrice = newUpBid;
+      upBidSize = upSize;
+      bidPlacementCount++;
+    } else {
+      upBidPrice = 0; upBidSize = 0;
+    }
+    if (downSize > 0) {
+      if (downBidPrice !== newDnBid || downBidSize !== downSize) {
+        downVolumeAtPlacement = volumeAtOrBelow(tick.tapeBuckets, snap.downTokenId, newDnBid);
+      }
+      downBidPrice = newDnBid;
+      downBidSize = downSize;
+      bidPlacementCount++;
+    } else {
+      downBidPrice = 0; downBidSize = 0;
+    }
+
+    // Per-tick safety: cancel heavy side
+    if (upBidSize > 0) {
+      const shouldCancelUp =
+        (upInventory >= effectiveBaseSize && downInventory === 0) ||
+        (downInventory > 0 && upInventory / downInventory > maxInvRatio);
+      if (shouldCancelUp) { upBidPrice = 0; upBidSize = 0; }
+    }
+    if (downBidSize > 0) {
+      const shouldCancelDn =
+        (downInventory >= effectiveBaseSize && upInventory === 0) ||
+        (upInventory > 0 && downInventory / upInventory > maxInvRatio);
+      if (shouldCancelDn) { downBidPrice = 0; downBidSize = 0; }
+    }
+  }
+
+  // Resolve: merge profit + remaining inventory at window outcome
+  let netPnl = mergePnl + realizedSellPnl;
+  const feeParams = params.fee_params ?? CRYPTO_FEES;
+
+  if (snap.outcome !== "UNKNOWN" && (upInventory > 0 || downInventory > 0)) {
+    const winInv = snap.outcome === "UP" ? upInventory : downInventory;
+    const winCost = snap.outcome === "UP" ? upAvgCost : downAvgCost;
+    const loseInv = snap.outcome === "UP" ? downInventory : upInventory;
+    const loseCost = snap.outcome === "UP" ? downAvgCost : upAvgCost;
+
+    const payoutFee = calcFeePerShare(1.0, feeParams) * winInv;
+    const winPayout = winInv * (1.0 - winCost) - payoutFee;
+    const loseLoss = -(loseInv * loseCost);
+    netPnl += winPayout + loseLoss;
+  }
+
+  return {
+    upInventory, downInventory,
+    upAvgCost, downAvgCost,
+    totalBuyCost, realizedSellPnl,
+    fillCount, sellCount, flipCount,
+    netPnl,
+    simulatedFillCount: fillCount,
+    simulatedSellCount: sellCount,
+    bidPlacementCount,
+  };
+}
+
+/** Sell excess with estimated sell price from recorded ask book */
+function sellExcessSimulated(
+  losingSide: "UP" | "DOWN",
+  upInv: number,
+  downInv: number,
+  upAvgCost: number,
+  downAvgCost: number,
+  params: DirectionalMakerParams,
+  tick: TickSnapshot,
+): { pnl: number; soldCount: number; upInv: number; downInv: number } {
+  const paired = Math.min(upInv, downInv);
+  const feeParams = params.fee_params ?? CRYPTO_FEES;
+
+  if (losingSide === "UP") {
+    const excess = upInv - paired;
+    if (excess <= 0) return { pnl: 0, soldCount: 0, upInv, downInv };
+    // Use recorded UP ask book for sell price estimate, fallback to $0.01
+    const bestAsk = tick.upBookAsks?.length
+      ? Math.min(...tick.upBookAsks.map(a => a.price))
+      : null;
+    const sellPrice = bestAsk !== null ? Math.max(0.01, bestAsk) : 0.01;
+    const fee = calcFeePerShare(sellPrice, feeParams) * excess;
+    const pnl = excess * sellPrice - excess * upAvgCost - fee;
+    return { pnl, soldCount: 1, upInv: upInv - excess, downInv };
+  } else {
+    const excess = downInv - paired;
+    if (excess <= 0) return { pnl: 0, soldCount: 0, upInv, downInv };
+    const bestAsk = tick.downBookAsks?.length
+      ? Math.min(...tick.downBookAsks.map(a => a.price))
+      : null;
+    const sellPrice = bestAsk !== null ? Math.max(0.01, bestAsk) : 0.01;
+    const fee = calcFeePerShare(sellPrice, feeParams) * excess;
+    const pnl = excess * sellPrice - excess * downAvgCost - fee;
+    return { pnl, soldCount: 1, upInv, downInv: downInv - excess };
+  }
+}
+
 /** Estimate queue depth ahead of our bid from recorded book bids.
  *  Assume ~25% queue position (we're a fast requoter, not last in line).
  *  Only count bids at strictly better prices as fully ahead;

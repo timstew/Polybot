@@ -106,4 +106,8 @@ export interface ReplayResult {
   sellCount: number;
   flipCount: number;
   netPnl: number;
+  // Simulated replay debugging fields
+  simulatedFillCount?: number;
+  simulatedSellCount?: number;
+  bidPlacementCount?: number;
 }

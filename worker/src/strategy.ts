@@ -1,760 +1,65 @@
 /**
- * Abstract strategy execution framework.
+ * Strategy execution framework — Cloudflare Worker entry point.
  *
  * StrategyDO is a Durable Object that runs trading strategies on a configurable
- * tick interval.  Each strategy implements the Strategy interface (init/tick/stop).
- * The StrategyAPI abstraction handles paper vs real mode transparently — paper
- * mode simulates fills from live orderbook data; real mode places actual CLOB orders
- * via the Cloud Run backend.
+ * tick interval. Portable code (interfaces, API classes, registry) lives in
+ * strategy-core.ts and is re-exported here for backwards compatibility.
  */
 
-// ── Interfaces ───────────────────────────────────────────────────────
-
-export interface StrategyConfig {
-  id: string;
-  name: string;
-  strategy_type: string; // registry key, e.g. "split-arb", "passive-mm"
-  mode: "paper" | "real";
-  active: boolean;
-  params: Record<string, unknown>;
-  tick_interval_ms: number;
-  max_capital_usd: number;
-  balance_usd: number | null;
-  lock_increment_usd: number | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface OrderState {
-  id: string;
-  token_id: string;
-  market: string;
-  title: string;
-  side: "BUY" | "SELL";
-  price: number;
-  size: number;
-  originalSize: number; // requested size at placement (size may be 0 for resting orders)
-  filled: number;
-  status: "open" | "filled" | "cancelled" | "failed";
-  placed_at: string;
-}
-
-export interface PositionState {
-  token_id: string;
-  market: string;
-  title: string;
-  side: "BUY" | "SELL";
-  size: number;
-  avg_price: number;
-  cost: number;
-}
-
-export interface LogEntry {
-  ts: string;
-  msg: string;
-  data?: StructuredLogData;
-}
-
-export interface StructuredLogData {
-  level?: "info" | "signal" | "trade" | "warning" | "error";
-  symbol?: string;
-  direction?: "UP" | "DOWN";
-  signalStrength?: number;
-  priceChangePct?: number;
-  momentum?: number;
-  volatilityRegime?: string;
-  inDeadZone?: boolean;
-  flipCount?: number;
-  upInventory?: number;
-  downInventory?: number;
-  phase?: string;
-}
-
-export interface StrategyState {
-  open_orders: OrderState[];
-  positions: PositionState[];
-  total_pnl: number;
-  capital_deployed: number;
-  last_tick_at: string;
-  started_at: string;
-  ticks: number;
-  errors: number;
-  cumulative_runtime_ms: number;
-  custom: Record<string, unknown>;
-  logs: LogEntry[];
-  high_water_balance: number;
-  windingDown: boolean;
-  wallet_balance_at_start: number | null;
-}
-
-export interface BookLevel {
-  price: number;
-  size: number;
-}
-
-export interface OrderBook {
-  bids: BookLevel[];
-  asks: BookLevel[];
-}
-
-export interface PlaceOrderResult {
-  order_id: string;
-  status: "placed" | "filled" | "failed";
-  size: number;
-  price: number;
-  error?: string;
-}
-
-export interface OrderStatusResult {
-  order_id: string;
-  status: string; // "MATCHED" | "LIVE" | "CANCELLED" | "ERROR" | "UNKNOWN"
-  size_matched: number;
-  original_size: number;
-  price: number;
-}
-
-export interface ActivityTrade {
-  id: string;
-  asset: string;       // token_id
-  side: "BUY" | "SELL";
-  price: number;       // actual execution price
-  size: number;
-  timestamp: string;
-  type: string;        // "TRADE", "CONVERSION", etc.
-}
-
-export type OrderType = "GTC" | "FAK" | "FOK";
-
-export interface StrategyAPI {
-  placeOrder(params: {
-    token_id: string;
-    side: "BUY" | "SELL";
-    size: number;
-    price: number;
-    market?: string;
-    title?: string;
-    order_type?: OrderType;
-  }): Promise<PlaceOrderResult>;
-
-  cancelOrder(order_id: string): Promise<boolean>;
-
-  getOrderStatus(order_id: string): Promise<OrderStatusResult>;
-
-  getBook(token_id: string): Promise<OrderBook>;
-
-  getBalance(): Promise<number>;
-
-  getOpenOrders(): Promise<OrderState[]>;
-
-  getActivity(limit?: number): Promise<ActivityTrade[]>;
-
-  redeemConditions(conditionIds: string[]): Promise<{ redeemed: number; error?: string }>;
-
-  mergePositions(conditionId: string, amount: number): Promise<{
-    status: "merged" | "failed";
-    tx_hash?: string;
-    duration_ms?: number;
-    error?: string;
-  }>;
-}
-
-export interface StrategyContext {
-  config: StrategyConfig;
-  state: StrategyState;
-  api: StrategyAPI;
-  db: D1Database;
-  log: (msg: string, data?: StructuredLogData) => void;
-  windingDown: boolean;
-}
-
-export interface Strategy {
-  name: string;
-  init(ctx: StrategyContext): Promise<void>;
-  tick(ctx: StrategyContext): Promise<void>;
-  stop(ctx: StrategyContext): Promise<void>;
-}
-
-// ── Safe cancel helper ──────────────────────────────────────────────
-
-export interface SafeCancelResult {
-  cleared: boolean;
-  fill?: { size: number; price: number };
-}
-
-/**
- * Cancel an order safely, mode-agnostic. Both PaperStrategyAPI and
- * RealStrategyAPI now handle fill-before-cancel internally.
- * If cancel fails (already matched, network error), checks order status.
- * Returns cleared=false if the order is still live — caller should retry.
- */
-export async function safeCancelOrder(
-  api: StrategyAPI,
-  orderId: string,
-): Promise<SafeCancelResult> {
-  const cancelled = await api.cancelOrder(orderId);
-  if (cancelled) return { cleared: true };
-
-  // Cancel failed — check if already filled or cancelled
-  try {
-    const status = await api.getOrderStatus(orderId);
-    if (status.status === "MATCHED") {
-      return {
-        cleared: true,
-        fill: { size: status.size_matched, price: status.price },
-      };
-    }
-    if (status.status === "CANCELLED") return { cleared: true };
-    // Still LIVE — don't clear, retry next tick
-    return { cleared: false };
-  } catch {
-    return { cleared: false };
-  }
-}
-
-// ── Paper API (simulates fills from live book data) ─────────────────
-
-let paperOrderCounter = 0;
-
-export interface PaperFillConfig {
-  takerFillRate: number;   // fraction of book depth available to us (default 0.65)
-  slippageBps: number;     // additional slippage in basis points (default 30)
-  makerFillProb: number;   // probability a resting maker bid gets filled when price touches (default 0.4)
-}
-
-const DEFAULT_PAPER_FILL: PaperFillConfig = {
-  takerFillRate: 0.65,
-  slippageBps: 30,
-  makerFillProb: 0.4,
-};
-
-export class PaperStrategyAPI implements StrategyAPI {
-  private pythonApiUrl: string;
-  private orders: OrderState[] = [];
-  private fillConfig: PaperFillConfig;
-  private grounded: boolean;
-  balanceOverride: number | null = null;
-
-  constructor(pythonApiUrl: string, fillConfig?: Partial<PaperFillConfig>, grounded = true) {
-    this.pythonApiUrl = pythonApiUrl;
-    this.fillConfig = { ...DEFAULT_PAPER_FILL, ...fillConfig };
-    this.grounded = grounded;
-  }
-
-  /**
-   * Simulate a paper fill for a resting bid using real CLOB book + trade tape.
-   * Shared by getOrderStatus() and cancelOrder() so strategies never branch on mode.
-   */
-  private async simulatePaperFill(
-    bidPrice: number,
-    bidSize: number,
-    book: OrderBook,
-    tokenId: string,
-    placedAtMs?: number,
-  ): Promise<{ filled: boolean; fillPrice: number }> {
-    const bestAsk = book.asks.length > 0
-      ? Math.min(...book.asks.map(a => a.price))
-      : null;
-
-    // Bid crosses the spread — immediate fill at best ask (taker)
-    if (bestAsk !== null && bidPrice >= bestAsk) {
-      return { filled: true, fillPrice: bestAsk };
-    }
-
-    if (this.grounded) {
-      // Grounded mode: only fill if enough real volume traded through our level
-      const { fetchTradeTape, checkTapeFill } = await import("./strategies/price-feed");
-      const tape = await fetchTradeTape();
-
-      // Queue depth: sum of all REAL resting bids at or above our price
-      // These orders have queue priority (higher price = first; same price = FIFO, we're last)
-      const queueAhead = book.bids
-        .filter(b => b.price >= bidPrice)
-        .reduce((sum, b) => sum + b.size, 0);
-
-      return checkTapeFill(tape, tokenId, bidPrice, bidSize, placedAtMs, queueAhead);
-    }
-
-    // Legacy probabilistic model
-    if (bestAsk === null) return { filled: false, fillPrice: 0 };
-    const distance = bestAsk - bidPrice;
-
-    let depthBonus = 0;
-    const totalAskDepth = book.asks.reduce((s, l) => s + l.size, 0);
-    if (totalAskDepth > 100) depthBonus = 0.05;
-    if (totalAskDepth > 500) depthBonus = 0.10;
-
-    const fillProb = Math.min(0.6, 0.30 * Math.exp(-distance * 20) + depthBonus);
-    if (Math.random() <= fillProb) {
-      return { filled: true, fillPrice: bidPrice };
-    }
-    return { filled: false, fillPrice: 0 };
-  }
-
-  async placeOrder(params: {
-    token_id: string;
-    side: "BUY" | "SELL";
-    size: number;
-    price: number;
-    market?: string;
-    title?: string;
-    order_type?: OrderType;
-  }): Promise<PlaceOrderResult> {
-    const orderType = params.order_type || "GTC";
-
-    // Check live orderbook to see if this would fill immediately.
-    // Walk the book to compute realistic VWAP and partial fills.
-    const book = await this.getBook(params.token_id);
-    const levels = params.side === "BUY" ? book.asks : book.bids;
-
-    // Quick check: if order doesn't cross the spread, it's a resting limit order
-    const bestOpposite = levels.length > 0 ? levels[0].price : null;
-    const crossesSpread = bestOpposite !== null && (
-      params.side === "BUY" ? params.price >= bestOpposite :
-      params.price <= bestOpposite
-    );
-
-    // Walk book levels to compute fill — VWAP across levels, partial if not enough depth
-    // Apply fill rate: we can only access a fraction of displayed depth
-    // (the rest is stale, gets pulled, or other takers beat us)
-    let remaining = params.size;
-    let totalCost = 0; // sum of (price × size) for filled portion
-    let filledSize = 0;
-
-    if (crossesSpread) {
-      for (const level of levels) {
-        const priceOk =
-          params.side === "BUY"
-            ? level.price <= params.price
-            : level.price >= params.price;
-        if (!priceOk) continue;
-
-        // Only a fraction of displayed size is realistically available
-        const availableAtLevel = Math.floor(level.size * this.fillConfig.takerFillRate);
-        if (availableAtLevel <= 0) continue;
-
-        const fillAtLevel = Math.min(remaining, availableAtLevel);
-        totalCost += fillAtLevel * level.price;
-        filledSize += fillAtLevel;
-        remaining -= fillAtLevel;
-        if (remaining <= 0) break;
-      }
-    }
-
-    const id = `paper-${Date.now()}-${++paperOrderCounter}`;
-
-    // FAK/FOK: immediate execution only, no resting orders
-    if (orderType === "FAK") {
-      // FAK: fill what's available, cancel the rest
-      const actualFilled = filledSize; // whatever crossed, even if partial
-      let vwap = actualFilled > 0 ? totalCost / actualFilled : params.price;
-      if (actualFilled > 0 && this.fillConfig.slippageBps > 0) {
-        const slippageMult = this.fillConfig.slippageBps / 10000;
-        vwap = params.side === "BUY"
-          ? Math.min(1.0, vwap * (1 + slippageMult))
-          : Math.max(0.01, vwap * (1 - slippageMult));
-      }
-      const order: OrderState = {
-        id, token_id: params.token_id, market: params.market || "",
-        title: params.title || "", side: params.side, price: vwap,
-        size: actualFilled, originalSize: params.size, filled: actualFilled,
-        status: actualFilled > 0 ? "filled" : "cancelled",
-        placed_at: new Date().toISOString(),
-      };
-      this.orders.push(order);
-      return {
-        order_id: id,
-        status: actualFilled > 0 ? "filled" : "failed",
-        size: actualFilled,
-        price: vwap,
-      };
-    }
-
-    if (orderType === "FOK") {
-      // FOK: fill entirely or cancel entirely
-      const wouldFillAll = filledSize >= params.size;
-      if (!wouldFillAll) {
-        return { order_id: id, status: "failed", size: 0, price: params.price };
-      }
-      let vwap = totalCost / params.size;
-      if (this.fillConfig.slippageBps > 0) {
-        const slippageMult = this.fillConfig.slippageBps / 10000;
-        vwap = params.side === "BUY"
-          ? Math.min(1.0, vwap * (1 + slippageMult))
-          : Math.max(0.01, vwap * (1 - slippageMult));
-      }
-      const order: OrderState = {
-        id, token_id: params.token_id, market: params.market || "",
-        title: params.title || "", side: params.side, price: vwap,
-        size: params.size, originalSize: params.size, filled: params.size,
-        status: "filled", placed_at: new Date().toISOString(),
-      };
-      this.orders.push(order);
-      return { order_id: id, status: "filled", size: params.size, price: vwap };
-    }
-
-    // GTC: existing behavior — fill what crosses, rest goes on book
-    const wouldFill = filledSize >= params.size;
-    // Partial fill: filled at least 20% of requested size
-    const partialFill = !wouldFill && filledSize >= params.size * 0.2;
-    const actualFilled = wouldFill ? params.size : (partialFill ? filledSize : 0);
-    let vwap = actualFilled > 0 ? totalCost / actualFilled : params.price;
-
-    // Apply slippage: shift VWAP unfavorably
-    if (actualFilled > 0 && this.fillConfig.slippageBps > 0) {
-      const slippageMult = this.fillConfig.slippageBps / 10000;
-      if (params.side === "BUY") {
-        vwap = Math.min(1.0, vwap * (1 + slippageMult)); // pay more
-      } else {
-        vwap = Math.max(0.01, vwap * (1 - slippageMult)); // receive less
-      }
-    }
-
-    const order: OrderState = {
-      id,
-      token_id: params.token_id,
-      market: params.market || "",
-      title: params.title || "",
-      side: params.side,
-      price: actualFilled > 0 ? vwap : params.price,
-      size: actualFilled > 0 ? actualFilled : params.size,
-      originalSize: params.size,
-      filled: actualFilled,
-      status: actualFilled > 0 ? "filled" : "open",
-      placed_at: new Date().toISOString(),
-    };
-
-    this.orders.push(order);
-
-    // Trim old filled/cancelled orders to avoid unbounded growth
-    if (this.orders.length > 500) {
-      this.orders = this.orders.filter(
-        (o) => o.status === "open" || Date.now() - new Date(o.placed_at).getTime() < 300_000
-      );
-    }
-
-    return {
-      order_id: id,
-      status: actualFilled > 0 ? "filled" : "placed",
-      size: actualFilled > 0 ? actualFilled : params.size,
-      price: vwap,
-    };
-  }
-
-  async cancelOrder(order_id: string): Promise<boolean> {
-    const order = this.orders.find((o) => o.id === order_id);
-    if (!order || order.status !== "open") return false;
-
-    // Check for fill before cancelling — mirrors real CLOB behavior where
-    // a cancel request can fail because the order was already matched.
-    const book = await this.getBook(order.token_id);
-    const placedMs = new Date(order.placed_at).getTime();
-    const result = await this.simulatePaperFill(
-      order.price, order.originalSize, book, order.token_id, placedMs,
-    );
-    if (result.filled) {
-      order.status = "filled";
-      order.price = result.fillPrice;
-      order.filled = order.originalSize;
-      return false; // Can't cancel — was filled
-    }
-
-    order.status = "cancelled";
-    return true;
-  }
-
-  async getBook(token_id: string): Promise<OrderBook> {
-    try {
-      const resp = await fetch(
-        `https://clob.polymarket.com/book?token_id=${token_id}`
-      );
-      if (!resp.ok) return { bids: [], asks: [] };
-      const data = (await resp.json()) as {
-        bids?: { price: string; size: string }[];
-        asks?: { price: string; size: string }[];
-      };
-      const book = {
-        bids: (data.bids || []).map((l) => ({
-          price: parseFloat(l.price),
-          size: parseFloat(l.size),
-        })),
-        asks: (data.asks || []).map((l) => ({
-          price: parseFloat(l.price),
-          size: parseFloat(l.size),
-        })),
-      };
-      return book;
-    } catch {
-      return { bids: [], asks: [] };
-    }
-  }
-
-  async getOrderStatus(order_id: string): Promise<OrderStatusResult> {
-    const order = this.orders.find((o) => o.id === order_id);
-    if (!order) {
-      return { order_id, status: "UNKNOWN", size_matched: 0, original_size: 0, price: 0 };
-    }
-
-    // Already terminal — return stored state
-    if (order.status !== "open") {
-      return {
-        order_id,
-        status: order.status === "filled" ? "MATCHED" : "CANCELLED",
-        size_matched: order.status === "filled" ? order.filled : 0,
-        original_size: order.originalSize,
-        price: order.price,
-      };
-    }
-
-    // Open order: check book + tape for fill
-    const book = await this.getBook(order.token_id);
-    const placedMs = new Date(order.placed_at).getTime();
-    const result = await this.simulatePaperFill(
-      order.price, order.originalSize, book, order.token_id, placedMs,
-    );
-    if (result.filled) {
-      order.status = "filled";
-      order.price = result.fillPrice;
-      order.filled = order.originalSize;
-      return {
-        order_id,
-        status: "MATCHED",
-        size_matched: order.originalSize,
-        original_size: order.originalSize,
-        price: result.fillPrice,
-      };
-    }
-
-    return {
-      order_id,
-      status: "LIVE",
-      size_matched: 0,
-      original_size: order.originalSize,
-      price: order.price,
-    };
-  }
-
-  async getBalance(): Promise<number> {
-    return this.balanceOverride ?? 10000;
-  }
-
-  async getOpenOrders(): Promise<OrderState[]> {
-    return this.orders.filter((o) => o.status === "open");
-  }
-
-  async getActivity(_limit?: number): Promise<ActivityTrade[]> {
-    return []; // Paper mode has no real activity
-  }
-
-  async redeemConditions(_conditionIds: string[]): Promise<{ redeemed: number }> {
-    return { redeemed: 0 }; // Paper mode — nothing to redeem
-  }
-
-  async mergePositions(_conditionId: string, _amount: number): Promise<{
-    status: "merged" | "failed"; tx_hash?: string; duration_ms?: number; error?: string;
-  }> {
-    return { status: "merged", duration_ms: 0 }; // Paper mode — instant accounting
-  }
-}
-
-// ── Real API (places actual orders via Cloud Run) ───────────────────
-
-export class RealStrategyAPI implements StrategyAPI {
-  private pythonApiUrl: string;
-
-  constructor(pythonApiUrl: string) {
-    this.pythonApiUrl = pythonApiUrl;
-  }
-
-  async placeOrder(params: {
-    token_id: string;
-    side: "BUY" | "SELL";
-    size: number;
-    price: number;
-    market?: string;
-    title?: string;
-    order_type?: OrderType;
-  }): Promise<PlaceOrderResult> {
-    try {
-      const resp = await fetch(`${this.pythonApiUrl}/api/strategy/order`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          token_id: params.token_id,
-          side: params.side,
-          size: params.size,
-          price: params.price,
-          order_type: params.order_type || "GTC",
-        }),
-      });
-      const data = (await resp.json()) as {
-        status: string;
-        order_id?: string;
-        size?: number;
-        price?: number;
-        error?: string;
-      };
-      return {
-        order_id: data.order_id || "",
-        status: data.status === "filled" ? "filled" : data.status === "placed" ? "placed" : "failed",
-        size: data.size || params.size,
-        price: data.price || params.price,
-        error: data.error,
-      };
-    } catch (e) {
-      return {
-        order_id: "",
-        status: "failed",
-        size: params.size,
-        price: params.price,
-        error: String(e),
-      };
-    }
-  }
-
-  async cancelOrder(order_id: string): Promise<boolean> {
-    try {
-      const resp = await fetch(`${this.pythonApiUrl}/api/strategy/cancel`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ order_id }),
-      });
-      const data = (await resp.json()) as { success: boolean };
-      return data.success;
-    } catch {
-      return false;
-    }
-  }
-
-  async getOrderStatus(order_id: string): Promise<OrderStatusResult> {
-    try {
-      const resp = await fetch(
-        `${this.pythonApiUrl}/api/strategy/order-status/${encodeURIComponent(order_id)}`
-      );
-      const data = (await resp.json()) as OrderStatusResult;
-      return {
-        order_id: data.order_id || order_id,
-        status: data.status || "UNKNOWN",
-        size_matched: data.size_matched || 0,
-        original_size: data.original_size || 0,
-        price: data.price || 0,
-      };
-    } catch {
-      return { order_id, status: "ERROR", size_matched: 0, original_size: 0, price: 0 };
-    }
-  }
-
-  async getBook(token_id: string): Promise<OrderBook> {
-    try {
-      const resp = await fetch(
-        `${this.pythonApiUrl}/api/strategy/book/${token_id}`
-      );
-      const data = (await resp.json()) as OrderBook;
-      return data;
-    } catch {
-      return { bids: [], asks: [] };
-    }
-  }
-
-  async getBalance(): Promise<number> {
-    try {
-      const resp = await fetch(`${this.pythonApiUrl}/api/strategy/balance`);
-      const data = (await resp.json()) as { balance: number };
-      return data.balance;
-    } catch {
-      return 0;
-    }
-  }
-
-  async getOpenOrders(): Promise<OrderState[]> {
-    try {
-      const resp = await fetch(`${this.pythonApiUrl}/api/strategy/orders`);
-      const data = (await resp.json()) as { orders: OrderState[] };
-      return data.orders || [];
-    } catch {
-      return [];
-    }
-  }
-
-  async getActivity(limit = 50): Promise<ActivityTrade[]> {
-    try {
-      const resp = await fetch(
-        `${this.pythonApiUrl}/api/strategy/activity?limit=${limit}`
-      );
-      const data = (await resp.json()) as { trades: ActivityTrade[] };
-      return data.trades || [];
-    } catch {
-      return [];
-    }
-  }
-
-  async redeemConditions(conditionIds: string[]): Promise<{ redeemed: number; error?: string }> {
-    try {
-      const resp = await fetch(`${this.pythonApiUrl}/api/redeem/conditions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ condition_ids: conditionIds }),
-      });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        const error = `redeem API returned ${resp.status}: ${text.slice(0, 200)}`;
-        console.error(`[REDEEM] ${error}`);
-        return { redeemed: 0, error };
-      }
-      const data = (await resp.json()) as { redeemed: number };
-      return { redeemed: data.redeemed || 0 };
-    } catch (e) {
-      const error = `redeem API call failed: ${e}`;
-      console.error(`[REDEEM] ${error}`);
-      return { redeemed: 0, error };
-    }
-  }
-
-  async mergePositions(conditionId: string, amount: number): Promise<{
-    status: "merged" | "failed"; tx_hash?: string; duration_ms?: number; error?: string;
-  }> {
-    try {
-      const resp = await fetch(`${this.pythonApiUrl}/api/merge/positions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ condition_id: conditionId, amount }),
-      });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        return { status: "failed", error: `merge API returned ${resp.status}: ${text.slice(0, 200)}` };
-      }
-      const data = (await resp.json()) as {
-        status: string; tx_hash?: string; gas_used?: number; duration_ms?: number; error?: string;
-      };
-      return {
-        status: data.status === "merged" ? "merged" : "failed",
-        tx_hash: data.tx_hash,
-        duration_ms: data.duration_ms,
-        error: data.error,
-      };
-    } catch (e) {
-      return { status: "failed", error: `merge API call failed: ${e}` };
-    }
-  }
-}
-
-// ── Strategy Registry ───────────────────────────────────────────────
-
-const strategyRegistry: Record<string, () => Strategy> = {};
-
-export function registerStrategy(type: string, factory: () => Strategy) {
-  strategyRegistry[type] = factory;
-}
+// Re-export everything from strategy-core so existing imports from "./strategy" keep working
+export {
+  type StrategyConfig,
+  type OrderState,
+  type PositionState,
+  type LogEntry,
+  type StructuredLogData,
+  type StrategyState,
+  type BookLevel,
+  type OrderBook,
+  type PlaceOrderResult,
+  type OrderStatusResult,
+  type ActivityTrade,
+  type OrderType,
+  type StrategyAPI,
+  type StrategyContext,
+  type Strategy,
+  type SafeCancelResult,
+  type PaperFillConfig,
+  type BalanceProtection,
+  safeCancelOrder,
+  PaperStrategyAPI,
+  RealStrategyAPI,
+  registerStrategy,
+  getStrategy,
+  getRegisteredTypes,
+  emptyState,
+  computeBalanceProtection,
+  buildProtectedConfig,
+} from "./strategy-core";
+
+import {
+  type StrategyConfig,
+  type StrategyContext,
+  type StrategyState,
+  type StrategyAPI,
+  type Strategy,
+  type StructuredLogData,
+  PaperStrategyAPI,
+  RealStrategyAPI,
+  registerStrategy,
+  getStrategy,
+  getRegisteredTypes,
+  emptyState,
+  buildProtectedConfig,
+} from "./strategy-core";
+
+// ── Strategy Registration (DO-specific dynamic imports) ─────────────
 
 /**
  * Ensure strategy implementations are registered.
- * Side-effect imports in index.ts should have already populated the registry,
- * but after DO eviction/re-creation those may not have run yet.
- * We explicitly import them here as a safety net.
+ * Side-effect imports trigger registerStrategy() in each module.
  */
 async function ensureRegistered(): Promise<void> {
-  // Dynamic imports to trigger side-effect registration.
-  // Always run all imports — the early-return check was too coarse
-  // (existing registrations blocked new strategy imports).
   await import("./strategies/split-arb");
   await import("./strategies/passive-mm");
   await import("./strategies/directional-taker");
@@ -770,11 +75,6 @@ async function ensureRegistered(): Promise<void> {
   await import("./strategies/scaling-safe-maker");
 }
 
-export function getStrategy(type: string): Strategy | null {
-  const factory = strategyRegistry[type];
-  return factory ? factory() : null;
-}
-
 // ── StrategyDO (Durable Object) ─────────────────────────────────────
 
 export interface StrategyEnv {
@@ -784,25 +84,6 @@ export interface StrategyEnv {
 }
 
 const MAX_LOG_ENTRIES = 100;
-
-function emptyState(): StrategyState {
-  return {
-    open_orders: [],
-    positions: [],
-    total_pnl: 0,
-    capital_deployed: 0,
-    last_tick_at: "",
-    started_at: "",
-    ticks: 0,
-    errors: 0,
-    cumulative_runtime_ms: 0,
-    custom: {},
-    logs: [],
-    high_water_balance: 0,
-    windingDown: false,
-    wallet_balance_at_start: null,
-  };
-}
 
 export class StrategyDO implements DurableObject {
   private doState: DurableObjectState;
@@ -1115,7 +396,7 @@ export class StrategyDO implements DurableObject {
 
     const strategy = getStrategy(config.strategy_type);
     if (!strategy) {
-      const available = Object.keys(strategyRegistry).join(", ") || "(none)";
+      const available = getRegisteredTypes().join(", ") || "(none)";
       return this.json(
         { error: `Unknown strategy type: ${config.strategy_type}. Available: ${available}` },
         400
