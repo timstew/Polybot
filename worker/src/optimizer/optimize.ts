@@ -16,7 +16,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
-import { replayWindow, replayWindowSimulated } from "./replay";
+import { replayWindowSimulated } from "./replay";
 import type { WindowSnapshot, TickSnapshot } from "./types";
 import type { DirectionalMakerParams } from "../strategies/safe-maker";
 import { DEFAULT_PARAMS } from "../strategies/safe-maker";
@@ -82,13 +82,48 @@ function parseArgs() {
 }
 
 // ── Load snapshots ──
+// Metadata-only snapshot (ticks loaded lazily to avoid OOM on large datasets)
+interface WindowMeta {
+  id: string;
+  cryptoSymbol: string;
+  windowOpenTime: number;
+  windowEndTime: number;
+  windowDurationMs: number;
+  oracleStrike: number | null;
+  outcome: "UP" | "DOWN";
+  priceAtWindowOpen: number;
+  hourUtc: number;
+  dayOfWeek: number;
+  upTokenId: string;
+  downTokenId: string;
+}
 
-function loadSnapshots(dbPath: string): WindowSnapshot[] {
-  const db = new Database(dbPath, { readonly: true });
+let _db: InstanceType<typeof Database> | null = null;
+let _ticksStmt: ReturnType<InstanceType<typeof Database>["prepare"]> | null = null;
+
+function getDb(dbPath: string): InstanceType<typeof Database> {
+  if (!_db) {
+    _db = new Database(dbPath, { readonly: true });
+    _ticksStmt = _db.prepare("SELECT ticks FROM strategy_snapshots WHERE id = ?");
+  }
+  return _db;
+}
+
+function loadTicks(id: string): TickSnapshot[] {
+  const row = _ticksStmt!.get(id) as { ticks: string } | undefined;
+  return row ? JSON.parse(row.ticks) : [];
+}
+
+function hydrateWindow(meta: WindowMeta): WindowSnapshot {
+  return { ...meta, ticks: loadTicks(meta.id) };
+}
+
+function loadSnapshotMeta(dbPath: string): WindowMeta[] {
+  const db = getDb(dbPath);
   const rows = db.prepare(
     `SELECT id, crypto_symbol, window_open_time, window_end_time, window_duration_ms,
             oracle_strike, price_at_open, hour_utc, day_of_week,
-            up_token_id, down_token_id, outcome, ticks
+            up_token_id, down_token_id, outcome
      FROM strategy_snapshots
      WHERE outcome IS NOT NULL AND outcome != 'UNKNOWN'
      ORDER BY window_open_time`
@@ -105,9 +140,7 @@ function loadSnapshots(dbPath: string): WindowSnapshot[] {
     up_token_id: string;
     down_token_id: string;
     outcome: string;
-    ticks: string;
   }>;
-  db.close();
 
   return rows.map(r => ({
     id: r.id,
@@ -122,7 +155,6 @@ function loadSnapshots(dbPath: string): WindowSnapshot[] {
     dayOfWeek: r.day_of_week,
     upTokenId: r.up_token_id,
     downTokenId: r.down_token_id,
-    ticks: JSON.parse(r.ticks) as TickSnapshot[],
   }));
 }
 
@@ -219,14 +251,15 @@ interface EvalResult {
 }
 
 function evaluate(
-  windows: WindowSnapshot[],
+  windows: WindowMeta[],
   params: DirectionalMakerParams,
   objectiveType: ObjectiveType = "sharpe",
 ): EvalResult {
   const pnls: number[] = [];
   let totalFills = 0;
 
-  for (const snap of windows) {
+  for (const meta of windows) {
+    const snap = hydrateWindow(meta);
     const result = replayWindowSimulated(snap, params);
     pnls.push(result.netPnl);
     totalFills += result.fillCount;
@@ -284,7 +317,7 @@ interface ConvergencePoint {
 }
 
 function runTPE(
-  windows: WindowSnapshot[],
+  windows: WindowMeta[],
   iterations: number,
   objectiveType: ObjectiveType,
   label: string = "Global",
@@ -359,7 +392,7 @@ function runTPE(
 
 interface TimeBucket {
   label: string;
-  filter: (s: WindowSnapshot) => boolean;
+  filter: (s: WindowMeta) => boolean;
 }
 
 function getTimeBuckets(): TimeBucket[] {
@@ -373,19 +406,19 @@ function getTimeBuckets(): TimeBucket[] {
   ];
 }
 
-function getSymbolBuckets(windows: WindowSnapshot[]): TimeBucket[] {
+function getSymbolBuckets(windows: WindowMeta[]): TimeBucket[] {
   const symbols = [...new Set(windows.map(w => w.cryptoSymbol))];
   return symbols.map(sym => ({
     label: sym,
-    filter: (s: WindowSnapshot) => s.cryptoSymbol === sym,
+    filter: (s: WindowMeta) => s.cryptoSymbol === sym,
   }));
 }
 
-function getDurationBuckets(windows: WindowSnapshot[]): TimeBucket[] {
+function getDurationBuckets(windows: WindowMeta[]): TimeBucket[] {
   const durations = [...new Set(windows.map(w => w.windowDurationMs))].sort((a, b) => a - b);
   return durations.map(d => ({
     label: `${Math.round(d / 60_000)}min`,
-    filter: (s: WindowSnapshot) => s.windowDurationMs === d,
+    filter: (s: WindowMeta) => s.windowDurationMs === d,
   }));
 }
 
@@ -462,9 +495,9 @@ function main() {
   console.log(`Holdout: ${(holdoutPct * 100).toFixed(0)}% (chronological — last ${(holdoutPct * 100).toFixed(0)}% by time)`);
   console.log(`Objective: ${objective}`);
 
-  // Load snapshots (already sorted by window_open_time)
-  const allWindows = loadSnapshots(dbPath);
-  console.log(`Loaded ${allWindows.length} window snapshots`);
+  // Load snapshot metadata (ticks loaded lazily per-window to avoid OOM)
+  const allWindows = loadSnapshotMeta(dbPath);
+  console.log(`Loaded ${allWindows.length} window snapshots (ticks loaded lazily)`);
 
   if (allWindows.length === 0) {
     console.error("No snapshots found. Enable record_snapshots on a strategy and let it run.");
@@ -594,6 +627,7 @@ function main() {
     }
   }
 
+  if (_db) _db.close();
   console.log(`\nDone.`);
 }
 
