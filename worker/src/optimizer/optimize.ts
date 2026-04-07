@@ -250,15 +250,31 @@ interface EvalResult {
   profitFactor: number;
 }
 
+/** Shuffle array in-place (Fisher-Yates) */
+function shuffle<T>(arr: T[]): T[] {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 function evaluate(
   windows: WindowMeta[],
   params: DirectionalMakerParams,
   objectiveType: ObjectiveType = "sharpe",
+  sampleSize?: number,
 ): EvalResult {
   const pnls: number[] = [];
   let totalFills = 0;
 
-  for (const meta of windows) {
+  // Stochastic subsampling for speed during search
+  let evalWindows = windows;
+  if (sampleSize && sampleSize < windows.length) {
+    evalWindows = shuffle([...windows]).slice(0, sampleSize);
+  }
+
+  for (const meta of evalWindows) {
     const snap = hydrateWindow(meta);
     const result = replayWindowSimulated(snap, params);
     pnls.push(result.netPnl);
@@ -327,7 +343,11 @@ function runTPE(
   const TOP_PCT = 0.20; // top 20% = "good"
   const WARMUP = Math.min(50, Math.floor(iterations * 0.1));
 
-  console.log(`\n  [${label}] Running ${iterations} iterations on ${windows.length} windows (objective: ${objectiveType})...`);
+  // Subsample during search: use min(500, N) windows per iteration for speed,
+  // then re-evaluate top candidates on full dataset at the end
+  const SEARCH_SAMPLE = Math.min(500, windows.length);
+  const usingSubsample = SEARCH_SAMPLE < windows.length;
+  console.log(`\n  [${label}] Running ${iterations} iterations on ${windows.length} windows (objective: ${objectiveType}${usingSubsample ? `, sampling ${SEARCH_SAMPLE}/iter` : ""})...`);
 
   let bestObjective = -Infinity;
   let bestMeanPnl = 0;
@@ -351,7 +371,7 @@ function runTPE(
     }
 
     const params = mergeParams(overrides);
-    const result = evaluate(windows, params, objectiveType);
+    const result = evaluate(windows, params, objectiveType, SEARCH_SAMPLE);
 
     trials.push({
       params: overrides,
@@ -380,6 +400,26 @@ function runTPE(
     if ((i + 1) % 200 === 0 || i === iterations - 1) {
       console.log(`  [${label}] ${i + 1}/${iterations} — best ${objectiveType}=${bestObjective.toFixed(3)} mean=$${bestMeanPnl.toFixed(2)}`);
     }
+  }
+
+  // Re-evaluate top candidates on FULL dataset if we used subsampling
+  if (usingSubsample) {
+    const sorted = [...trials].sort((a, b) => b.objective - a.objective);
+    const topN = Math.min(50, sorted.length);
+    console.log(`  [${label}] Re-evaluating top ${topN} candidates on full ${windows.length} windows...`);
+    for (let i = 0; i < topN; i++) {
+      const t = sorted[i];
+      const params = mergeParams(t.params);
+      const full = evaluate(windows, params, objectiveType);
+      t.objective = full.objective;
+      t.sharpe = full.sharpe;
+      t.sortino = full.sortino;
+      t.meanPnl = full.meanPnl;
+      t.totalPnl = full.totalPnl;
+      t.fillRate = full.fillRate;
+      t.profitFactor = full.profitFactor;
+    }
+    console.log(`  [${label}] Re-evaluation complete`);
   }
 
   return {
