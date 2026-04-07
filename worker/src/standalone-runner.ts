@@ -567,27 +567,39 @@ function startServer(port: number, pythonApiUrl: string) {
       }
 
       if (url.pathname === "/api/strategy/statuses") {
-        const statuses = [];
-        // Load all configs from D1
+        // Return same format as DO version: Record<id, statusObj>
+        const statuses: Record<string, unknown> = {};
         const rows = sqliteDb.prepare("SELECT id FROM strategy_configs").all() as Array<{ id: string }>;
         for (const row of rows) {
           const inst = instances.get(row.id);
           if (inst) {
-            statuses.push({
-              config_id: row.id,
+            const { logs: _allLogs, ...stateWithoutLogs } = inst.state;
+            const recentLogs = (inst.state.logs ?? []).slice(-5);
+            const responseState = { ...stateWithoutLogs, logs: recentLogs };
+            const custom = responseState.custom as Record<string, unknown> | undefined;
+            if (custom?.activeWindows) {
+              custom.activeWindows = (custom.activeWindows as Array<Record<string, unknown>>).map(w => {
+                const { tickSnapshots: _, ...rest } = w;
+                return { ...rest, snapshotCount: Array.isArray(_) ? _.length : 0 };
+              });
+            }
+            statuses[row.id] = {
               running: true,
-              name: inst.config.name,
-              ticks: inst.state.ticks,
-              total_pnl: inst.state.total_pnl,
-              last_tick_at: inst.state.last_tick_at,
-            });
+              winding_down: inst.state.windingDown,
+              active_windows: ((inst.state.custom as Record<string, unknown>)?.activeWindows as unknown[] | undefined)?.length ?? 0,
+              config: inst.config,
+              state: responseState,
+              standalone: true,
+            };
           } else {
             const config = loadConfig(row.id);
-            statuses.push({
-              config_id: row.id,
+            const state = loadState(row.id) || emptyState();
+            statuses[row.id] = {
               running: false,
-              name: config?.name || row.id,
-            });
+              config,
+              state,
+              standalone: true,
+            };
           }
         }
         jsonResponse(res, statuses);
@@ -600,6 +612,43 @@ function startServer(port: number, pythonApiUrl: string) {
           jsonResponse(res, rows);
           return;
         }
+      }
+
+      // Trades endpoints
+      const tradesMatch = url.pathname.match(/^\/api\/strategy\/trades\/(.+)$/);
+      if (tradesMatch && method === "GET") {
+        const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+        const rows = sqliteDb.prepare(
+          "SELECT * FROM strategy_trades WHERE strategy_id = ? ORDER BY timestamp DESC LIMIT ?"
+        ).all(tradesMatch[1], limit);
+        jsonResponse(res, rows);
+        return;
+      }
+      if (url.pathname === "/api/strategy/trades" && method === "GET") {
+        const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+        const rows = sqliteDb.prepare(
+          "SELECT * FROM strategy_trades ORDER BY timestamp DESC LIMIT ?"
+        ).all(limit);
+        jsonResponse(res, rows);
+        return;
+      }
+
+      // Logs endpoint
+      const logsMatch = url.pathname.match(/^\/api\/strategy\/logs\/(.+)$/);
+      if (logsMatch && method === "GET") {
+        const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+        const level = url.searchParams.get("level");
+        let query = "SELECT * FROM strategy_logs WHERE strategy_id = ?";
+        const params: unknown[] = [logsMatch[1]];
+        if (level) {
+          query += " AND level = ?";
+          params.push(level);
+        }
+        query += " ORDER BY timestamp DESC LIMIT ?";
+        params.push(limit);
+        const rows = sqliteDb.prepare(query).all(...params);
+        jsonResponse(res, rows);
+        return;
       }
 
       jsonResponse(res, { error: "Not found" }, 404);
