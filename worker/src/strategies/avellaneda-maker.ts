@@ -761,7 +761,7 @@ class AvellanedaMakerStrategy implements Strategy {
     const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
     try {
       ctx.db.prepare(
-        `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, created_at)
+        `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, timestamp)
          VALUES (?, ?, ?, 'BUY', ?, ?, ?, 0, datetime('now'))`
       ).bind(
         `am-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1002,7 +1002,7 @@ class AvellanedaMakerStrategy implements Strategy {
     // D1 resolution trade
     try {
       ctx.db.prepare(
-        `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, created_at)
+        `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, timestamp)
          VALUES (?, ?, ?, 'RESOLVE', 0, 0, 0, ?, datetime('now'))`
       ).bind(
         `am-res-${Date.now()}`, ctx.config.id, w.market.upTokenId, totalNetPnl,

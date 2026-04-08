@@ -503,7 +503,7 @@ class CertaintyTakerStrategy implements Strategy {
           // Record trade to D1
           try {
             await ctx.db.prepare(
-              `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, created_at)
+              `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, timestamp)
                VALUES (?, ?, ?, 'BUY', ?, ?, ?, 0, datetime('now'))`
             ).bind(
               `ct-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -600,7 +600,7 @@ class CertaintyTakerStrategy implements Strategy {
     if (w.inventory > 0) {
       try {
         ctx.db.prepare(
-          `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, created_at)
+          `INSERT INTO strategy_trades (id, strategy_id, token_id, side, price, size, fee_amount, pnl, timestamp)
            VALUES (?, ?, ?, 'RESOLVE', ?, ?, ?, ?, datetime('now'))`
         ).bind(
           `ct-res-${Date.now()}`,
