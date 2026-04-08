@@ -235,7 +235,17 @@ export class PaperStrategyAPI implements StrategyAPI {
       : null;
 
     if (bestAsk !== null && bidPrice >= bestAsk) {
-      return { filled: true, fillPrice: bestAsk };
+      // Check available size at ask levels we can hit (same logic as placeOrder)
+      let availableSize = 0;
+      for (const level of book.asks) {
+        if (level.price <= bidPrice) {
+          availableSize += Math.floor(level.size * this.fillConfig.takerFillRate);
+        }
+      }
+      if (availableSize >= bidSize) {
+        return { filled: true, fillPrice: bestAsk };
+      }
+      // Not enough size at the ask — fall through to grounded tape check or prob model
     }
 
     if (this.grounded) {
