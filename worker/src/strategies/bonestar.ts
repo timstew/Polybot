@@ -742,7 +742,6 @@ class BoneStarStrategy implements Strategy {
       }
 
       // ── Snapshot recording ──
-      ctx.log(`SNAP_CHECK: record=${params.record_snapshots} hasTicks=${!!w.tickSnapshots} snapId=${w.snapshotId?.slice(0,20)} arrLen=${Array.isArray(w.tickSnapshots) ? w.tickSnapshots.length : 'N/A'}`, { level: "signal" });
       if (params.record_snapshots && w.tickSnapshots) {
        try {
         // Re-hydrate Map/Set if serialized (from DO storage)
