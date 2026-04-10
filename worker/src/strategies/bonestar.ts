@@ -743,6 +743,7 @@ class BoneStarStrategy implements Strategy {
 
       // ── Snapshot recording ──
       if (params.record_snapshots && w.tickSnapshots) {
+       try {
         // Re-hydrate Map/Set if serialized (from DO storage)
         if (!w.cumulativeTapeBuckets || !((w.cumulativeTapeBuckets as unknown) instanceof Map)) {
           const prev = w.cumulativeTapeBuckets as unknown;
@@ -873,8 +874,9 @@ class BoneStarStrategy implements Strategy {
               w.market.upTokenId, w.market.downTokenId,
               null, JSON.stringify(w.tickSnapshots)
             ).run();
-          } catch { /* best-effort flush */ }
+          } catch (e) { ctx.log(`SNAPSHOT FLUSH ERROR: ${e}`, { level: "error" }); }
         }
+       } catch (e) { ctx.log(`SNAPSHOT RECORD ERROR: ${e}`, { level: "error" }); }
       }
 
       // Merge is handled by the framework (autoMergeProfitablePairs) after tick()
