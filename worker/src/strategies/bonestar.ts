@@ -742,6 +742,9 @@ class BoneStarStrategy implements Strategy {
       }
 
       // ── Snapshot recording ──
+      if (params.record_snapshots && !w.tickSnapshots) {
+        ctx.log(`SNAPSHOT DEBUG: tickSnapshots missing, snapshotId=${w.snapshotId}, record_snapshots=${params.record_snapshots}`, { level: "error" });
+      }
       if (params.record_snapshots && w.tickSnapshots) {
        try {
         // Re-hydrate Map/Set if serialized (from DO storage)
