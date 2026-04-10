@@ -77,6 +77,18 @@ export interface TickSnapshot {
   /** Sell events executed since the previous tick.
    *  Recorded by the live strategy so replay can reproduce sell P&L exactly. */
   sells?: RecordedSell[];
+  /** Chainlink oracle spot price at tick time (when oracle feed is connected) */
+  oracleSpot?: number;
+  /** BoneStar-specific: current phase (1=balanced, 2=conviction, 3=sweep) */
+  phase?: 1 | 2 | 3;
+  /** BoneStar-specific: oracle-derived P_true at tick time */
+  pTrue?: number;
+  /** BoneStar-specific: locked sweep side in Phase 3 */
+  sweepSide?: "UP" | "DOWN" | null;
+  /** BoneStar-specific: current sweep bid price */
+  sweepPrice?: number;
+  /** BoneStar-specific: current sweep bid size */
+  sweepSize?: number;
 }
 
 export interface WindowSnapshot {

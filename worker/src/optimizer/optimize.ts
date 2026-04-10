@@ -6,8 +6,11 @@
  * runs Tree of Parzen Estimators (TPE) optimization over strategy parameters,
  * and outputs the best parameter sets by Sharpe ratio.
  *
+ * Supports multiple strategies via --strategy flag (default: safe-maker).
+ *
  * Usage:
  *   cd worker && npx tsx src/optimizer/optimize.ts
+ *   cd worker && npx tsx src/optimizer/optimize.ts --strategy bonestar
  *   cd worker && npx tsx src/optimizer/optimize.ts --iterations 5000
  *   cd worker && npx tsx src/optimizer/optimize.ts --db path/to/d1.sqlite
  *   cd worker && npx tsx src/optimizer/optimize.ts --objective sortino
@@ -17,9 +20,58 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { replayWindowSimulated } from "./replay";
-import type { WindowSnapshot, TickSnapshot } from "./types";
+import type { WindowSnapshot, ReplayResult, TickSnapshot } from "./types";
 import type { DirectionalMakerParams } from "../strategies/safe-maker";
-import { DEFAULT_PARAMS } from "../strategies/safe-maker";
+import { DEFAULT_PARAMS as SM_DEFAULT_PARAMS } from "../strategies/safe-maker";
+import { replayBoneStarWindow, BONESTAR_SEARCH_SPACE, BONESTAR_DEFAULT_PARAMS } from "./replay-bonestar";
+
+// ── Strategy config interface ──
+
+interface ParamSpec {
+  name: string;
+  type: "continuous" | "integer" | "boolean";
+  min?: number;
+  max?: number;
+}
+
+interface StrategyConfig {
+  name: string;
+  searchSpace: ParamSpec[];
+  defaultParams: Record<string, unknown>;
+  replay: (snap: WindowSnapshot, params: Record<string, unknown>) => ReplayResult;
+}
+
+// Safe-maker search space (extracted from inline)
+const SAFE_MAKER_SEARCH_SPACE: ParamSpec[] = [
+  { name: "bid_offset", type: "continuous", min: 0.01, max: 0.06 },
+  { name: "max_pair_cost", type: "continuous", min: 0.88, max: 0.96 },
+  { name: "conviction_bias", type: "continuous", min: 1.0, max: 3.0 },
+  { name: "min_signal_strength", type: "continuous", min: 0.30, max: 0.70 },
+  { name: "base_bid_size", type: "integer", min: 5, max: 60 },
+  { name: "max_flips_per_window", type: "integer", min: 1, max: 5 },
+  { name: "max_inventory_ratio", type: "continuous", min: 1.5, max: 4.0 },
+  { name: "max_bid_per_side", type: "continuous", min: 0.35, max: 0.55 },
+  { name: "vol_offset_scale_high", type: "continuous", min: 1.0, max: 2.5 },
+  { name: "vol_offset_scale_low", type: "continuous", min: 0.3, max: 1.0 },
+  { name: "tighten_start_pct", type: "continuous", min: 0.50, max: 0.90 },
+  { name: "dead_zone_pct", type: "continuous", min: 0, max: 0.05 },
+  { name: "sell_excess", type: "boolean" },
+];
+
+const STRATEGIES: Record<string, () => StrategyConfig> = {
+  "safe-maker": () => ({
+    name: "safe-maker",
+    searchSpace: SAFE_MAKER_SEARCH_SPACE,
+    defaultParams: SM_DEFAULT_PARAMS as unknown as Record<string, unknown>,
+    replay: (snap, params) => replayWindowSimulated(snap, { ...SM_DEFAULT_PARAMS, ...params } as DirectionalMakerParams),
+  }),
+  "bonestar": () => ({
+    name: "bonestar",
+    searchSpace: BONESTAR_SEARCH_SPACE,
+    defaultParams: BONESTAR_DEFAULT_PARAMS as unknown as Record<string, unknown>,
+    replay: replayBoneStarWindow,
+  }),
+};
 
 // ── CLI args ──
 
@@ -31,6 +83,7 @@ function parseArgs() {
   let dbPath = "";
   let holdoutPct = 0.20;
   let objective: ObjectiveType = "sharpe";
+  let strategyName = "safe-maker";
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--iterations" && args[i + 1]) {
@@ -48,6 +101,13 @@ function parseArgs() {
         objective = val;
       } else {
         console.error(`Unknown objective: ${val}. Use "sharpe" or "sortino".`);
+        process.exit(1);
+      }
+      i++;
+    } else if (args[i] === "--strategy" && args[i + 1]) {
+      strategyName = args[i + 1].toLowerCase();
+      if (!STRATEGIES[strategyName]) {
+        console.error(`Unknown strategy: ${strategyName}. Available: ${Object.keys(STRATEGIES).join(", ")}`);
         process.exit(1);
       }
       i++;
@@ -78,7 +138,7 @@ function parseArgs() {
     process.exit(1);
   }
 
-  return { iterations, dbPath, holdoutPct, objective };
+  return { iterations, dbPath, holdoutPct, objective, strategyName };
 }
 
 // ── Load snapshots ──
@@ -158,36 +218,16 @@ function loadSnapshotMeta(dbPath: string): WindowMeta[] {
   }));
 }
 
-// ── Parameter search space ──
+// ── Parameter search space (now driven by active strategy config) ──
 
-interface ParamSpec {
-  name: keyof DirectionalMakerParams;
-  type: "continuous" | "integer" | "boolean";
-  min?: number;
-  max?: number;
-}
+// ── Sample parameters (strategy-agnostic) ──
 
-const SEARCH_SPACE: ParamSpec[] = [
-  { name: "bid_offset", type: "continuous", min: 0.01, max: 0.06 },
-  { name: "max_pair_cost", type: "continuous", min: 0.88, max: 0.96 },
-  { name: "conviction_bias", type: "continuous", min: 1.0, max: 3.0 },
-  { name: "min_signal_strength", type: "continuous", min: 0.30, max: 0.70 },
-  { name: "base_bid_size", type: "integer", min: 5, max: 60 },
-  { name: "max_flips_per_window", type: "integer", min: 1, max: 5 },
-  { name: "max_inventory_ratio", type: "continuous", min: 1.5, max: 4.0 },
-  { name: "max_bid_per_side", type: "continuous", min: 0.35, max: 0.55 },
-  { name: "vol_offset_scale_high", type: "continuous", min: 1.0, max: 2.5 },
-  { name: "vol_offset_scale_low", type: "continuous", min: 0.3, max: 1.0 },
-  { name: "tighten_start_pct", type: "continuous", min: 0.50, max: 0.90 },
-  { name: "dead_zone_pct", type: "continuous", min: 0, max: 0.05 },
-  { name: "sell_excess", type: "boolean" },
-];
+// Active strategy config — set in main() before any sampling
+let activeConfig: StrategyConfig;
 
-// ── Sample parameters ──
-
-function sampleRandom(): Partial<DirectionalMakerParams> {
+function sampleRandom(): Record<string, number | boolean> {
   const params: Record<string, number | boolean> = {};
-  for (const spec of SEARCH_SPACE) {
+  for (const spec of activeConfig.searchSpace) {
     if (spec.type === "boolean") {
       params[spec.name] = Math.random() < 0.5;
     } else if (spec.type === "integer") {
@@ -196,16 +236,16 @@ function sampleRandom(): Partial<DirectionalMakerParams> {
       params[spec.name] = spec.min! + Math.random() * (spec.max! - spec.min!);
     }
   }
-  return params as unknown as Partial<DirectionalMakerParams>;
+  return params;
 }
 
 /** Sample from kernel density estimate of good samples (simple TPE) */
-function sampleFromGood(goodSamples: Record<string, number | boolean>[]): Partial<DirectionalMakerParams> {
+function sampleFromGood(goodSamples: Record<string, number | boolean>[]): Record<string, number | boolean> {
   const params: Record<string, number | boolean> = {};
   // Pick a random good sample, then perturb it
   const base = goodSamples[Math.floor(Math.random() * goodSamples.length)];
 
-  for (const spec of SEARCH_SPACE) {
+  for (const spec of activeConfig.searchSpace) {
     const baseVal = base[spec.name];
     if (spec.type === "boolean") {
       // Flip with 20% probability
@@ -222,17 +262,18 @@ function sampleFromGood(goodSamples: Record<string, number | boolean>[]): Partia
       params[spec.name] = Math.max(spec.min!, Math.min(spec.max!, perturbed));
     }
   }
-  return params as unknown as Partial<DirectionalMakerParams>;
+  return params;
 }
 
-function mergeParams(overrides: Partial<DirectionalMakerParams>): DirectionalMakerParams {
-  return { ...DEFAULT_PARAMS, ...overrides };
+function mergeParams(overrides: Record<string, unknown>): Record<string, unknown> {
+  return { ...activeConfig.defaultParams, ...overrides };
 }
 
-function paramsToRecord(p: Partial<DirectionalMakerParams>): Record<string, number | boolean> {
+function paramsToRecord(p: Record<string, unknown>): Record<string, number | boolean> {
   const rec: Record<string, number | boolean> = {};
-  for (const spec of SEARCH_SPACE) {
-    rec[spec.name] = (p as unknown as Record<string, number | boolean>)[spec.name] ?? (DEFAULT_PARAMS as unknown as Record<string, number | boolean>)[spec.name];
+  const defaults = activeConfig.defaultParams as Record<string, unknown>;
+  for (const spec of activeConfig.searchSpace) {
+    rec[spec.name] = (p[spec.name] ?? defaults[spec.name]) as number | boolean;
   }
   return rec;
 }
@@ -261,7 +302,7 @@ function shuffle<T>(arr: T[]): T[] {
 
 function evaluate(
   windows: WindowMeta[],
-  params: DirectionalMakerParams,
+  params: Record<string, unknown>,
   objectiveType: ObjectiveType = "sharpe",
   sampleSize?: number,
 ): EvalResult {
@@ -276,7 +317,7 @@ function evaluate(
 
   for (const meta of evalWindows) {
     const snap = hydrateWindow(meta);
-    const result = replayWindowSimulated(snap, params);
+    const result = activeConfig.replay(snap, params);
     pnls.push(result.netPnl);
     totalFills += result.fillCount;
   }
@@ -314,7 +355,7 @@ function evaluate(
 // ── TPE Optimizer ──
 
 interface Trial {
-  params: Partial<DirectionalMakerParams>;
+  params: Record<string, unknown>;
   paramsRec: Record<string, number | boolean>;
   objective: number;
   sharpe: number;
@@ -353,7 +394,7 @@ function runTPE(
   let bestMeanPnl = 0;
 
   for (let i = 0; i < iterations; i++) {
-    let overrides: Partial<DirectionalMakerParams>;
+    let overrides: Record<string, unknown>;
 
     if (i < WARMUP || trials.length < 10) {
       // Random exploration
@@ -472,7 +513,7 @@ function printTop10(label: string, trials: Trial[], objectiveType: ObjectiveType
   const top = trials.slice(0, 10);
   for (let i = 0; i < top.length; i++) {
     const t = top[i];
-    const paramStr = SEARCH_SPACE
+    const paramStr = activeConfig.searchSpace
       .map(s => {
         const v = t.paramsRec[s.name];
         if (s.type === "boolean") return `${s.name}=${v}`;
@@ -509,7 +550,7 @@ function printConvergence(convergence: ConvergencePoint[], objectiveType: Object
 function printJSON(label: string, trial: Trial) {
   console.log(`\n── Best params as JSON (${label}) ──`);
   const jsonParams: Record<string, unknown> = {};
-  for (const spec of SEARCH_SPACE) {
+  for (const spec of activeConfig.searchSpace) {
     const v = trial.paramsRec[spec.name];
     if (spec.type === "continuous") {
       jsonParams[spec.name] = Math.round((v as number) * 1000) / 1000;
@@ -527,9 +568,13 @@ function printJSON(label: string, trial: Trial) {
 const MIN_BUCKET_SIZE = 100;
 
 function main() {
-  const { iterations, dbPath, holdoutPct, objective } = parseArgs();
+  const { iterations, dbPath, holdoutPct, objective, strategyName } = parseArgs();
+
+  // Initialize active strategy config
+  activeConfig = STRATEGIES[strategyName]();
 
   console.log(`Strategy Parameter Optimizer`);
+  console.log(`Strategy: ${activeConfig.name}`);
   console.log(`Database: ${dbPath}`);
   console.log(`Iterations: ${iterations}`);
   console.log(`Holdout: ${(holdoutPct * 100).toFixed(0)}% (chronological — last ${(holdoutPct * 100).toFixed(0)}% by time)`);
@@ -559,9 +604,9 @@ function main() {
   console.log(`Train: ${trainWindows.length} windows (${new Date(trainWindows[0].windowOpenTime).toISOString()} → ${new Date(trainWindows[trainWindows.length - 1].windowEndTime).toISOString()})`);
   console.log(`Test:  ${testWindows.length} windows (${new Date(testWindows[0].windowOpenTime).toISOString()} → ${new Date(testWindows[testWindows.length - 1].windowEndTime).toISOString()})`);
 
-  // Baseline: evaluate with DEFAULT_PARAMS
-  const baseline = evaluate(trainWindows, DEFAULT_PARAMS, objective);
-  console.log(`\nBaseline (DEFAULT_PARAMS): ${objective}=${baseline.objective.toFixed(3)} sharpe=${baseline.sharpe.toFixed(3)} sortino=${baseline.sortino.toFixed(3)} pf=${baseline.profitFactor.toFixed(2)} mean=$${baseline.meanPnl.toFixed(2)} total=$${baseline.totalPnl.toFixed(2)}`);
+  // Baseline: evaluate with default params for the active strategy
+  const baseline = evaluate(trainWindows, activeConfig.defaultParams, objective);
+  console.log(`\nBaseline (${activeConfig.name} defaults): ${objective}=${baseline.objective.toFixed(3)} sharpe=${baseline.sharpe.toFixed(3)} sortino=${baseline.sortino.toFixed(3)} pf=${baseline.profitFactor.toFixed(2)} mean=$${baseline.meanPnl.toFixed(2)} total=$${baseline.totalPnl.toFixed(2)}`);
 
   // Global optimization
   const { trials: globalTrials, convergence: globalConvergence } = runTPE(trainWindows, iterations, objective, "Global");
@@ -573,7 +618,7 @@ function main() {
     const best = globalTrials[0];
     const bestParams = mergeParams(best.params);
     const oos = evaluate(testWindows, bestParams, objective);
-    const baselineOos = evaluate(testWindows, DEFAULT_PARAMS, objective);
+    const baselineOos = evaluate(testWindows, activeConfig.defaultParams, objective);
 
     console.log(`\n── Out-of-Sample Validation (chronological holdout) ──`);
     console.log(`Best params:  ${objective}=${oos.objective.toFixed(3)} sharpe=${oos.sharpe.toFixed(3)} sortino=${oos.sortino.toFixed(3)} pf=${oos.profitFactor.toFixed(2)} mean=$${oos.meanPnl.toFixed(2)} total=$${oos.totalPnl.toFixed(2)}`);
@@ -588,7 +633,7 @@ function main() {
 
     // Check boundary params — flag if optimal is within 10% of a boundary
     const boundaryWarnings: string[] = [];
-    for (const spec of SEARCH_SPACE) {
+    for (const spec of activeConfig.searchSpace) {
       if (spec.type === "boolean" || spec.min == null || spec.max == null) continue;
       const val = best.paramsRec[spec.name] as number;
       const range = spec.max - spec.min;
@@ -631,7 +676,7 @@ function main() {
     // Scale iterations proportionally to bucket size to prevent overfitting thin buckets
     const bucketIterations = Math.min(500, bucketWindows.length * 3);
     const { trials } = runTPE(bucketWindows, bucketIterations, objective, bucket.label);
-    const bucketBaseline = evaluate(bucketWindows, DEFAULT_PARAMS, objective);
+    const bucketBaseline = evaluate(bucketWindows, activeConfig.defaultParams, objective);
 
     bucketResults.push({
       label: bucket.label,

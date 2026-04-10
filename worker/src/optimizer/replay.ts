@@ -10,7 +10,7 @@ import type { DirectionalMakerParams } from "../strategies/safe-maker";
 import { calcFeePerShare, CRYPTO_FEES } from "../categories";
 
 /** Sum volume at or below bidPrice for a given token in the tape buckets */
-function volumeAtOrBelow(
+export function volumeAtOrBelow(
   buckets: TapeBucket[],
   tokenId: string,
   bidPrice: number,
@@ -30,7 +30,7 @@ function volumeAtOrBelow(
  * against volume at bid placement time. Only NEW volume since placement
  * counts toward fills — mirrors live checkTapeFill's placedAtMs filter.
  */
-function checkBucketFill(
+export function checkBucketFill(
   buckets: TapeBucket[],
   tokenId: string,
   bidPrice: number,
@@ -735,7 +735,7 @@ function sellExcessSimulated(
  *  Assume ~25% queue position (we're a fast requoter, not last in line).
  *  Only count bids at strictly better prices as fully ahead;
  *  bids at our price level are partially ahead. */
-function computeQueueAhead(
+export function computeQueueAhead(
   tick: TickSnapshot,
   bidPrice: number,
   _isUp: boolean,
