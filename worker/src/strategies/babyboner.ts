@@ -106,12 +106,13 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: P_true-proportional (Bonereaper avg pair cost ~$1.00)
-  // Bonereaper winning-side bids: up to $0.99, losing-side: $0.16
-  // Pair cost often slightly above $1.00 — profit from volume + merge
-  target_pair_cost: 1.00,      // Bonereaper avg pair cost ~$1.00
-  p_floor: 0.15,              // Bonereaper losing bids ~$0.16
-  p_ceil: 0.99,               // Bonereaper winning bids up to $0.99
+  // Pricing: compressed P_true-proportional
+  // p_floor/p_ceil compress P_true toward 0.50 so losing-side bids are
+  // high enough to actually fill in the CLOB (real market has thin books).
+  // Bonereaper winning avg ~$0.70, losing avg ~$0.28, pair cost ~$0.98
+  target_pair_cost: 0.98,      // Bonereaper avg pair cost ~$0.98
+  p_floor: 0.28,              // losing-side bid floor (Bonereaper avg ~$0.28)
+  p_ceil: 0.70,               // winning-side bid ceiling (Bonereaper avg ~$0.70)
 
   maker_bid_size: 50,          // Bonereaper: 3-220 per fill, median 26, mean 45
   taker_bid_size: 25,          // aggressive taker for missing side
@@ -128,10 +129,10 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   fire_sale_seconds: 30,
   fire_sale_min_price: 0.03,
 
-  max_inventory_per_side: 2000,  // Bonereaper accumulates 500-1600 per side
-  max_total_cost: 500,           // Bonereaper deploys ~$830/window avg
-  max_skew_ratio: 0.85,          // Bonereaper tolerates up to 83% skew
-  skew_guard_min_tokens: 200,    // don't activate until 200+ total tokens
+  max_inventory_per_side: 5000,  // Bonereaper goes 5050 tokens one-sided
+  max_total_cost: 2000,          // Bonereaper deploys ~$830-$5000/window
+  max_skew_ratio: 1.0,           // DISABLED — Bonereaper never stops bidding due to skew
+  skew_guard_min_tokens: 99999,  // effectively disabled
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
@@ -789,10 +790,9 @@ class BabyBoneRStrategy implements Strategy {
         continue;
       }
 
-      // ── P_true-proportional pricing (matches Bonereaper) ──────────
-      // Bonereaper dynamically prices based on probability:
-      //   winning bids $0.54-$0.94, losing bids $0.05-$0.49
-      // Cap P_true to avoid extreme bids (raw P_true often at 0.000 or 1.000)
+      // ── Compressed P_true pricing (matches Bonereaper avg) ──────────
+      // Raw P_true always extreme (0.000 or 1.000) due to low BTC vol.
+      // Compress via p_floor/p_ceil → winning ~$0.70, losing ~$0.28, PC ~$0.98
       const pCapped = clamp(pTrue, params.p_floor, params.p_ceil);
       let upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
       let dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
