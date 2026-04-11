@@ -329,9 +329,13 @@ export function replayBoneStarWindow(
 
       if (upWinning) {
         upSize = Math.round(p.base_bid_size_phase2 * sizeMultiplier);
+        // Cap losing-side bid price
+        dnBid = Math.min(dnBid, p.losing_side_max_bid);
         dnBid = Math.max(p.min_bid_per_side, dnBid - p.losing_side_discount);
       } else {
         dnSize = Math.round(p.base_bid_size_phase2 * sizeMultiplier);
+        // Cap losing-side bid price
+        upBid = Math.min(upBid, p.losing_side_max_bid);
         upBid = Math.max(p.min_bid_per_side, upBid - p.losing_side_discount);
       }
 
@@ -344,6 +348,10 @@ export function replayBoneStarWindow(
       // Inventory guards
       if (upInventory >= p.max_inventory_per_side) upSize = 0;
       if (downInventory >= p.max_inventory_per_side) dnSize = 0;
+
+      // One-sided guard: pause heavy side when other has 0
+      if (upInventory >= p.base_bid_size_phase2 && downInventory === 0) upSize = 0;
+      if (downInventory >= p.base_bid_size_phase2 && upInventory === 0) dnSize = 0;
 
       // Inventory ratio guard: suppress heavy side when too imbalanced
       const heavy2 = Math.max(upInventory, downInventory);

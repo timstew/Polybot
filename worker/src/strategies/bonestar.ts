@@ -112,7 +112,7 @@ export const DEFAULT_PARAMS: BoneStarParams = {
   max_pair_cost: 0.95,            // pair cost cap for Phase 1/2 (was 0.98 — tighter target)
 
   conviction_start_pct: 0.25,   // Bonereaper shows conviction from ~25% onward
-  conviction_size_mult: 2.0,
+  conviction_size_mult: 1.5,    // was 2.0 — Bonereaper does 5-15 tokens, not 80
   conviction_p_true_min: 0.55,  // lower bar — Bonereaper follows market, not strict P_true
   losing_side_discount: 0.05,
 
@@ -138,7 +138,7 @@ export const DEFAULT_PARAMS: BoneStarParams = {
   sweep_flip_threshold: 0.30,
   sweep_threshold_late: 0.92,
 
-  base_bid_size_phase2: 40,
+  base_bid_size_phase2: 15,     // was 40 — Bonereaper accumulates gradually (5-15 tokens/fill)
 
   max_inventory_per_side: 200,  // Conservative cap per side per window
   max_inventory_ratio: 3.0,    // Suppress heavy side when > 3:1
@@ -1036,9 +1036,13 @@ class BoneStarStrategy implements Strategy {
 
     if (upWinning) {
       upSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
+      // Cap losing-side bid price — Bonereaper buys losing side at $0.08-$0.34
+      dnBid = Math.min(dnBid, params.losing_side_max_bid);
       dnBid = Math.max(params.min_bid_per_side, dnBid - params.losing_side_discount);
     } else {
       dnSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
+      // Cap losing-side bid price
+      upBid = Math.min(upBid, params.losing_side_max_bid);
       upBid = Math.max(params.min_bid_per_side, upBid - params.losing_side_discount);
     }
 
@@ -1051,6 +1055,10 @@ class BoneStarStrategy implements Strategy {
     // Inventory guards
     if (w.upInventory >= params.max_inventory_per_side) upSize = 0;
     if (w.downInventory >= params.max_inventory_per_side) dnSize = 0;
+
+    // One-sided guard: if heavy side has base_bid_size_phase2 and other has 0, pause heavy side
+    if (w.upInventory >= params.base_bid_size_phase2 && w.downInventory === 0) upSize = 0;
+    if (w.downInventory >= params.base_bid_size_phase2 && w.upInventory === 0) dnSize = 0;
 
     // Inventory ratio guard: suppress heavy side when too imbalanced
     const heavy2 = Math.max(w.upInventory, w.downInventory);
