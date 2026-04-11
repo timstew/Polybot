@@ -323,7 +323,9 @@ class BabyBoneRStrategy implements Strategy {
 
     // 1. Discover markets
     if (now - this.lastDiscovery > params.discovery_interval_ms) {
-      this.marketCache = await discoverCryptoMarkets(params.target_cryptos, 30_000);
+      const allMarkets = await discoverCryptoMarkets(params.target_cryptos, 30_000);
+      // Only trade "Up or Down" markets (Bonereaper's target). Filter out "above/below" markets.
+      this.marketCache = allMarkets.filter(m => /up or down/i.test(m.title));
       this.lastDiscovery = now;
     }
 
