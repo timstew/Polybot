@@ -31,7 +31,7 @@ import {
   disableOrderFlow,
   CRYPTO_SYMBOL_MAP,
 } from "./price-feed";
-import { tryMerge } from "./merge";
+
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -150,7 +150,6 @@ interface DirectionalMakerParams {
   vol_offset_scale_high: number; // multiply bid_offset in high volatility (default 1.5)
   vol_offset_scale_low: number; // multiply bid_offset in low volatility (default 0.5)
   tighten_start_pct: number; // window progress % to start tightening offset (default 0.70)
-  merge_enabled?: boolean;
 }
 
 const DEFAULT_PARAMS: DirectionalMakerParams = {
@@ -179,7 +178,6 @@ const DEFAULT_PARAMS: DirectionalMakerParams = {
   vol_offset_scale_high: 1.5,
   vol_offset_scale_low: 0.5,
   tighten_start_pct: 0.70,
-  merge_enabled: true,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -695,14 +693,6 @@ class DirectionalMakerStrategy implements Strategy {
         if (w.downBidOrderId) {
           const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
-        }
-        // Merge matched pairs during wind-down — free capital before resolution
-        if (params.merge_enabled !== false) {
-          const mergeResult = await tryMerge(ctx, w);
-          if (mergeResult) {
-            w.realizedSellPnl += mergeResult.pnl;
-            this.custom.totalPnl = (this.custom.totalPnl as number || 0) + mergeResult.pnl;
-          }
         }
         await this.sellLosingInventory(ctx, w, params, "WIND DOWN");
         continue;

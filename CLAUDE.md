@@ -175,6 +175,7 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 | `worker/src/strategies/spread-sniper.ts` | Direction-agnostic spread strategy: neutral fair value, adaptive bid sizing, pair cost optimization |
 | `worker/src/strategies/directional-maker.ts` | Aggressive signal-biased maker: sells ALL losing-side inventory on flip |
 | `worker/src/strategies/safe-maker.ts` | Conservative signal-biased maker: protects paired inventory from being sold |
+| `worker/src/strategies/bonestar.ts` | Three-phase accumulation + certainty sweep: reverse-engineered from Bonereaper bot, oracle-driven phases, never sells |
 | `worker/src/strategies/conviction-maker.ts` | One-sided conviction bets: only bids when signal > 0.60, no hedging, hold to resolution |
 | `worker/src/strategies/directional-taker.ts` | Taker strategy (not viable for wide-spread crypto markets) |
 | `worker/src/strategies/unified-adaptive.ts` | Unified strategy: picks sniper/maker per window, adaptive bid sizing, wallet management |

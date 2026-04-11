@@ -55,7 +55,7 @@ import {
   getClobBook,
   isClobConnected,
 } from "./clob-feed";
-import { tryMerge } from "./merge";
+
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -167,7 +167,6 @@ interface AvellanedaMakerParams {
   max_concurrent_windows: number;
   max_pair_cost: number;
   bid_size: number;
-  merge_threshold: number;
   exit_buffer_ms: number;
   danger_zone_ms: number;
   maker_to_taker_threshold: number;
@@ -198,7 +197,6 @@ const DEFAULT_PARAMS: AvellanedaMakerParams = {
   max_concurrent_windows: 8,
   max_pair_cost: 0.96,
   bid_size: 20,
-  merge_threshold: 500,
   exit_buffer_ms: 60_000,
   danger_zone_ms: 120_000,
   maker_to_taker_threshold: 0.86,
@@ -685,19 +683,6 @@ class AvellanedaMakerStrategy implements Strategy {
           w.downBidOrderId = null;
         } else if (status.status === "CANCELLED") {
           w.downBidOrderId = null;
-        }
-      }
-
-      // ── Merge check (CTF exploit — batched) ──
-      if (timeRemaining > params.exit_buffer_ms) {
-        const mergeResult = await tryMerge(ctx, w, params.merge_threshold);
-        if (mergeResult) {
-          w.totalMerged += mergeResult.merged;
-          w.mergedPnl += mergeResult.pnl;
-          w.realizedPnl += mergeResult.pnl;
-          w.spreadsCaptured++;
-          this.custom.totalMerges++;
-          this.custom.totalPnl += mergeResult.pnl;
         }
       }
 

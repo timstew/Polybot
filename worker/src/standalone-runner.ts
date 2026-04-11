@@ -28,7 +28,9 @@ import {
   getStrategy,
   emptyState,
   buildProtectedConfig,
+  type StrategyContext,
 } from "./strategy-core";
+import { tryMerge, type MergeableWindow } from "./strategies/merge";
 
 // ── CLI args ──
 
@@ -162,6 +164,8 @@ async function ensureRegistered(): Promise<void> {
   await import("./strategies/enhanced-maker");
   await import("./strategies/orchestrator");
   await import("./strategies/scaling-safe-maker");
+  await import("./strategies/bonestar");
+  await import("./strategies/babyboner");
 }
 
 // ── Runner state ──
@@ -371,11 +375,34 @@ async function startStrategy(configId: string, pythonApiUrl: string): Promise<st
   return "started";
 }
 
+async function autoMergeProfitablePairs(inst: RunnerInstance, ctx: StrategyContext): Promise<void> {
+  const custom = inst.state.custom as Record<string, unknown> | undefined;
+  const windows = custom?.activeWindows as Array<MergeableWindow & Record<string, unknown>> | undefined;
+  if (!windows) return;
+
+  for (const w of windows) {
+    if (!w.upInventory || !w.downInventory) continue;
+    if (w.upAvgCost + w.downAvgCost >= 1.0) continue;
+    try {
+      const result = await tryMerge(ctx, w);
+      if (result) {
+        if (typeof w.realizedSellPnl === "number") w.realizedSellPnl += result.pnl;
+        if (typeof w.realizedPnl === "number") w.realizedPnl += result.pnl;
+        addLog(inst, `AUTO-MERGE: ${result.merged} pairs @ pc=${result.pairCost.toFixed(4)} → +$${result.pnl.toFixed(2)}`);
+      }
+    } catch { /* non-critical */ }
+  }
+}
+
 async function tick(inst: RunnerInstance) {
   const ctx = buildContext(inst);
 
   try {
     await inst.strategy.tick(ctx);
+
+    // Auto-merge profitable pairs across all active windows
+    await autoMergeProfitablePairs(inst, ctx);
+
     inst.state.ticks++;
     const now = Date.now();
     if (inst.state.last_tick_at) {
@@ -484,6 +511,35 @@ async function stopStrategy(configId: string): Promise<string> {
   return "stopped";
 }
 
+async function resetStrategy(configId: string): Promise<string> {
+  // Stop if running
+  if (instances.has(configId)) {
+    await stopStrategy(configId);
+  }
+
+  // Clear D1/SQLite data for this strategy
+  try {
+    sqliteDb.prepare("DELETE FROM strategy_trades WHERE strategy_id = ?").run(configId);
+    sqliteDb.prepare("DELETE FROM strategy_logs WHERE strategy_id = ?").run(configId);
+    sqliteDb.prepare("DELETE FROM strategy_orders WHERE strategy_id = ?").run(configId);
+    sqliteDb.prepare("DELETE FROM strategy_snapshots WHERE strategy_id = ?").run(configId);
+    sqliteDb.prepare(
+      "UPDATE strategy_configs SET updated_at = datetime('now') WHERE id = ?"
+    ).run(configId);
+  } catch (e) {
+    console.error("Reset DB cleanup error:", e);
+  }
+
+  // Delete persisted state JSON file
+  const statePath = path.join(path.dirname(sqliteDb.name), `standalone-state-${configId}.json`);
+  try {
+    if (fs.existsSync(statePath)) fs.unlinkSync(statePath);
+  } catch { /* ignore */ }
+
+  console.log(`[standalone-runner] Reset strategy ${configId}: cleared state, trades, logs, orders, snapshots`);
+  return "reset";
+}
+
 // ── HTTP server ──
 
 function jsonResponse(res: http.ServerResponse, data: unknown, status = 200) {
@@ -522,6 +578,13 @@ function startServer(port: number, pythonApiUrl: string) {
       const stopMatch = url.pathname.match(/^\/api\/strategy\/stop\/(.+)$/);
       if (stopMatch && method === "POST") {
         const result = await stopStrategy(stopMatch[1]);
+        jsonResponse(res, { status: result });
+        return;
+      }
+
+      const resetMatch = url.pathname.match(/^\/api\/strategy\/reset\/(.+)$/);
+      if (resetMatch && method === "POST") {
+        const result = await resetStrategy(resetMatch[1]);
         jsonResponse(res, { status: result });
         return;
       }
@@ -651,6 +714,74 @@ function startServer(port: number, pythonApiUrl: string) {
         return;
       }
 
+      // ── Orchestrator routes ──────────────────────────────────────────
+      if (url.pathname === "/api/strategy/tactics" && method === "GET") {
+        // Import orchestrator to trigger tactic registrations (side-effect imports)
+        await import("./strategies/orchestrator");
+        const { listTactics } = await import("./strategies/tactic");
+        jsonResponse(res, listTactics());
+        return;
+      }
+
+      const tacticScoresMatch = url.pathname.match(/^\/api\/strategy\/tactic-scores\/(.+)$/);
+      if (tacticScoresMatch && method === "GET") {
+        const stratId = tacticScoresMatch[1];
+        try {
+          const rows = sqliteDb.prepare(
+            `SELECT regime, tactic_id, n, total_pnl, avg_pnl, variance, wins, losses, last_updated_at
+             FROM tactic_scores WHERE strategy_id = ? ORDER BY regime, avg_pnl DESC`
+          ).all(stratId);
+          jsonResponse(res, rows);
+        } catch {
+          jsonResponse(res, []);
+        }
+        return;
+      }
+
+      const regimePerfMatch = url.pathname.match(/^\/api\/strategy\/regime-performance\/(.+)$/);
+      if (regimePerfMatch && method === "GET") {
+        const stratId = regimePerfMatch[1];
+        try {
+          const rows = sqliteDb.prepare(
+            `SELECT regime, tactic_id, COUNT(*) as windows, COALESCE(SUM(pnl), 0) as total_pnl, SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
+             FROM strategy_regime_log WHERE strategy_id = ? AND pnl IS NOT NULL
+             GROUP BY regime, tactic_id ORDER BY regime, total_pnl DESC`
+          ).all(stratId);
+          jsonResponse(res, rows);
+        } catch {
+          jsonResponse(res, []);
+        }
+        return;
+      }
+
+      // ── Wrangler dev proxy for non-strategy endpoints ──────────────
+      // Bot detection, firehose, copy trading, etc. live in wrangler dev (port 8788).
+      // Forward unrecognized /api/* requests to the local wrangler dev instance.
+      const cloudWorkerUrl = process.env.WORKER_PROXY_URL || "http://127.0.0.1:8788";
+      if (url.pathname.startsWith("/api/")) {
+        try {
+          const target = `${cloudWorkerUrl}${url.pathname}${url.search}`;
+          const fetchOpts: RequestInit = { method, headers: { "Content-Type": "application/json" } };
+          if (method === "POST") {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) chunks.push(chunk as Buffer);
+            const bodyStr = Buffer.concat(chunks).toString();
+            if (bodyStr) fetchOpts.body = bodyStr;
+          }
+          const proxyRes = await fetch(target, fetchOpts);
+          const data = await proxyRes.text();
+          res.writeHead(proxyRes.status, {
+            "Content-Type": proxyRes.headers.get("content-type") || "application/json",
+            "Access-Control-Allow-Origin": "*",
+          });
+          res.end(data);
+        } catch (proxyErr) {
+          console.error("[proxy] Cloud Worker proxy error:", proxyErr);
+          jsonResponse(res, { error: "Cloud Worker proxy failed" }, 502);
+        }
+        return;
+      }
+
       jsonResponse(res, { error: "Not found" }, 404);
     } catch (e) {
       console.error("HTTP error:", e);
@@ -681,6 +812,36 @@ async function main() {
   sqliteDb = new Database(dbPath);
   sqliteDb.pragma("journal_mode = WAL");
   d1Db = createD1Wrapper(sqliteDb);
+
+  // Enable oracle feed (Chainlink authenticated → RTDS fallback)
+  try {
+    const { enableOracleFeed } = await import("./strategies/oracle-feed");
+    const { CRYPTO_SYMBOL_MAP } = await import("./strategies/price-feed");
+    const allCryptos = new Set<string>();
+    const rows = sqliteDb.prepare("SELECT params FROM strategy_configs WHERE active = 1").all() as Array<{ params: string }>;
+    for (const row of rows) {
+      try {
+        const params = JSON.parse(row.params);
+        if (Array.isArray(params.target_cryptos)) {
+          for (const c of params.target_cryptos as string[]) {
+            const upper = c.toUpperCase();
+            // Already a Binance symbol (e.g. "BTCUSDT")
+            if (upper.endsWith("USDT")) { allCryptos.add(upper); continue; }
+            // Keyword (e.g. "Bitcoin", "btc") → map to Binance symbol
+            const mapped = CRYPTO_SYMBOL_MAP[c.toLowerCase()];
+            if (mapped) allCryptos.add(mapped);
+          }
+        }
+      } catch { /* skip malformed params */ }
+    }
+    if (allCryptos.size === 0) {
+      ["BTCUSDT", "ETHUSDT", "SOLUSDT"].forEach(s => allCryptos.add(s));
+    }
+    enableOracleFeed([...allCryptos]);
+    console.log(`Oracle feed: enabled for ${[...allCryptos].join(", ")}`);
+  } catch (e) {
+    console.log(`Oracle feed: unavailable (${e instanceof Error ? e.message : String(e)})`);
+  }
 
   // Start HTTP server
   startServer(port, pythonApiUrl);

@@ -1,14 +1,16 @@
 # Polybot Roadmap
 
-## Current State (March 2026)
+## Current State (April 2026)
 
 **Paper trading on two machines** — laptop (local dev) and always-on Mac mini (24/7 recording):
 - Worker (`wrangler dev`) — strategy execution, copy trading, D1 storage
+- Standalone runner (`standalone-runner.ts`) — no DO eviction, primary execution on Mac mini
 - Python API (`uvicorn`) — bot detection, CLOB order execution
-- Frontend (`next dev`) — dashboard with strategy monitoring
+- Frontend (`next dev`) — dashboard with strategy monitoring, orchestrator page
 
 Real trading infrastructure complete (CLOB orders, position redemption, balance protection).
-Safe-maker recording tick-level snapshots 24/7 on the Mac mini for offline optimization.
+**Chainlink Data Streams integrated** — authenticated access to the same oracle Polymarket uses for settlement. All 13 strategies benefit via oracle-aware `computeSignal()`. Safe-maker uses oracle P_true as primary fair value (zero basis risk).
+Safe-maker recording tick-level snapshots 24/7 on the Mac mini for offline optimization (now includes `oracleSpot` per tick).
 
 See [STRATEGY-IMPROVEMENTS.md](./STRATEGY-IMPROVEMENTS.md) for the top-10 improvement hitlist and per-strategy analysis.
 See [OPTIMIZER.md](./OPTIMIZER.md) for the offline replay and parameter optimization system.
@@ -32,7 +34,7 @@ Deploy existing paper trading to the cloud. No wallet or on-chain interaction ne
 - [ ] Add strategy dashboard page to frontend
 - [ ] Monitor paper PnL for 1+ week to validate cloud execution matches local results
 
-**Limitation:** No Binance WebSocket order flow in deployed Workers (CF can't hold outbound WS connections). Signal runs on 5 REST layers only — order flow bonus is 0. This is acceptable; order flow is layer 6 and optional.
+**Limitation:** No Binance WebSocket order flow or Chainlink Data Streams in deployed Workers (CF can't hold outbound WS connections or run Node.js crypto). Signal runs on 5 REST layers only — order flow bonus is 0, oracle falls back to Polymarket RTDS → Binance REST. This is acceptable for cloud; the Mac mini standalone runner has full Chainlink + Binance WS access.
 
 ---
 
@@ -41,11 +43,15 @@ Deploy existing paper trading to the cloud. No wallet or on-chain interaction ne
 Add a GCE e2-micro instance for services that need persistent connections or on-chain access.
 CF Workers and Cloud Run (request-based) can't maintain WebSocket clients or long-running processes.
 
-| Component | Host | Cost |
-|-----------|------|------|
-| Binance WebSocket order flow | GCE e2-micro | **Free tier** (1 e2-micro in us-central1/us-east1/us-west1) |
-| Position redemption service | GCE e2-micro | (same instance) |
-| Everything else | Unchanged | $0 |
+**Note:** The Mac mini standalone runner already provides most Phase 2 capabilities (Chainlink WS, Binance WS, CLOB WS). GCE is for cloud-hosted redundancy and production deployment.
+
+| Component | Host | Cost | Mac Mini Status |
+|-----------|------|------|-----------------|
+| Chainlink Data Streams | GCE e2-micro | **Free tier** | DONE (standalone runner) |
+| Binance WebSocket order flow | GCE e2-micro | (same) | DONE (standalone runner) |
+| Polymarket CLOB WebSocket | GCE e2-micro | (same) | DONE (clob-feed.ts) |
+| Position redemption service | GCE e2-micro | (same) | DONE (cron sweep) |
+| Everything else | Unchanged | $0 | — |
 
 **Total incremental cost: $0** (GCE free tier includes 1 e2-micro instance 24/7)
 
@@ -55,6 +61,11 @@ If free-tier e2-micro is insufficient (CPU/memory), upgrade to e2-small (~$7/mon
 
 ```
 GCE e2-micro (always-on, us-central1)
+  ├── Chainlink Data Streams WebSocket (BTC, ETH, SOL, XRP, DOGE, AVAX, LINK)
+  │     → Authenticated V3 reports: price, bid, ask (18 decimal precision)
+  │     → Primary settlement reference — zero basis risk
+  │     → GET /api/oracle/{symbol} — returns OracleTick with bid/ask
+  │
   ├── Binance aggTrade WebSocket (BTC, ETH, SOL, XRP)
   │     → GET /api/orderflow/{symbol} — returns OrderFlowSignal
   │
@@ -83,12 +94,13 @@ The microservice is a lightweight FastAPI app (can reuse existing `polybot/api.p
 - [ ] Fund EOA with POL (gas) + USDC.e on Polygon
 - [ ] Set contract allowances (6 approve txns, one-time)
 - [ ] Add `/api/orderflow/{symbol}` endpoint with background Binance WS thread
+- [ ] Add `/api/oracle/{symbol}` endpoint — proxy Chainlink ticks (for cloud Worker fallback)
 - [ ] Add `/api/book/{tokenId}` endpoint with background CLOB WS (live book + fill events)
 - [ ] Add `/api/tape?since={ms}` endpoint with background RTDS WS (continuous trade tape)
 - [ ] Add `/api/fills/{strategyId}` endpoint (buffers fill notifications from CLOB WS)
 - [ ] Add `/api/redeem` endpoint using py-clob-client or polymarket-apis
 - [ ] Deploy to GCE e2-micro with systemd service
-- [ ] Update Worker to poll GCE for order flow, book, tape, fills instead of REST APIs
+- [ ] Update Worker to poll GCE for order flow, oracle, book, tape, fills instead of REST APIs
 - [ ] Update Worker to call GCE for redemption after `resolveWindows()`
 
 ### Alternative: Cloud Run always-on
@@ -126,6 +138,8 @@ Switch from paper to real order execution. Requires EOA wallet from Phase 2.
 - [ ] Regime-conditional tactic behavior: conviction-only in trending, paired in oscillating
 - [ ] Per-tactic real-mode defaults: smaller bid sizes, faster fill-side cancellation
 - [ ] Paper vs real fill model comparison: log paper-predicted fills alongside real fills to calibrate
+- [ ] **Oracle spread-gated entry**: skip window entry when oracle bid/ask spread is wide (high uncertainty = adverse selection risk). See Phase 3a Layer 3.
+- [ ] **Binance-oracle divergence gate**: reduce bid sizes when Binance and oracle prices diverge (one source leading = directional move incoming). See Phase 3a Layer 4.
 
 **Remaining work — infrastructure:**
 - [ ] On-chain balance verification (compare wallet USDC to tracked balance)
@@ -141,6 +155,42 @@ See [redemption-code.md](./redemption-code.md) for detailed EOA wallet setup:
 2. Fund on Polygon: POL for gas + USDC.e for trading
 3. Approve Polymarket contracts (CTF Exchange, Neg Risk Exchange, Neg Risk Adapter)
 4. Set env vars: `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE=0`
+
+---
+
+## Phase 3a: Chainlink Data Streams — Deep Integration
+
+Authenticated Chainlink access is live (April 2026). Layer 1 (oracle-aware signals) and Layer 2 (safe-maker P_true) are complete. This phase extracts maximum value from the V3 report data.
+
+**Completed:**
+- [x] Chainlink SDK integration with authenticated WebSocket streaming
+- [x] Two-layer fallback: Chainlink → Polymarket RTDS → Binance REST
+- [x] `computeSignal()` uses oracle spot for direction/magnitude (all 13 strategies benefit)
+- [x] Safe-maker uses oracle P_true as primary fair value (zero basis risk)
+- [x] Oracle strike capture via WebSocket (instant) with REST fallback
+- [x] `oracleSpot` recorded in tick snapshots for offline replay
+- [x] Standalone runner auto-enables oracle feed from active strategy configs
+- [x] CF Worker compatibility via dynamic import (graceful fallback)
+
+**Layer 3 — Oracle bid/ask spread exploitation:**
+- [ ] **Spread-as-regime signal**: Feed oracle `(ask - bid) / mid` into `regime.ts` as a market quality feature. Narrow spread = confident market, widening spread = incoming volatility. Auto-widen maker bid offsets in degraded conditions.
+- [ ] **Spread-width volatility scaling**: Track EMA of oracle spread changes over time. Rapidly widening spread predicts vol spikes 1-5s before they show up in price — pull bids preemptively.
+- [ ] **Bid/ask asymmetry signal**: When `(mid - bid) > (ask - mid)`, oracle is skewed bearish. Add as a 7th signal layer in `computeSignal()` — independent from Binance price movement.
+- [ ] **P_true confidence bounds**: Compute `P_true_low` (pessimistic price) and `P_true_high` (optimistic price) from bid/ask. Wide range = uncertain → widen spreads. Tight range = confident → bid aggressively.
+- [ ] **Oracle-informed inventory urgency**: Late in window with unmatched inventory: if bid/ask tight and close to strike → coin flip, exit faster. If tight and far from strike → outcome certain, hold.
+
+**Layer 4 — Cross-source arbitrage signals:**
+- [ ] **Binance-oracle divergence**: Compare Binance spot vs Chainlink spot in real-time. When they diverge, one source is leading. If Binance moves first → oracle (settlement) will follow. If oracle moves first → Binance traders haven't reacted. Latency arbitrage signal. **Note (April 9 analysis):** Oracle lags Binance by ~$7 / ~14s on average. Neither predicts market token prices — tokens are driven by speculative flow, not spot price. The real divergence to exploit is oracle-vs-market-token, not oracle-vs-Binance.
+- [ ] **Cross-source confidence weighting**: When Binance and oracle agree on direction, conviction is high. When they diverge, reduce bid sizes and widen offsets.
+- [ ] **Oracle-vs-token divergence fading (B1)**: When market token price diverges from oracle P_true by >$0.20 (e.g., Up token=$0.83 but P_true=0.51), the cheap OTHER side is massively underpriced. Buy it. See STRATEGY-IMPROVEMENTS.md Bonereaper Correlation Findings.
+- [ ] **Balanced-window-only mode (B2)**: Skip windows where tokens diverge early. Only accumulate in windows where both sides stay near $0.45-$0.55 — these produce pair cost < $1.00 (guaranteed profit). See STRATEGY-IMPROVEMENTS.md "Oracle Correlation Findings & Future Strategy Concepts" for full analysis and B4 (anti-sweep contrarian) concept.
+
+**Layer 5 — Report metadata exploitation:**
+- [ ] **Staleness gating**: Capture `expiresAt` and `validFromTimestamp` from V3 reports. Skip P_true calculations when report is stale (>2s old). Prevents quoting on outdated settlement references during Chainlink latency spikes.
+- [ ] **Oracle freshness monitoring**: Track `observationsTimestamp - now` latency. Log alerts when oracle stale (>2s delay). Early warning for Chainlink infrastructure issues.
+- [ ] **Feed health dashboard**: Show oracle connection status, report frequency, average latency, and spread width per feed on the frontend.
+
+**Impact estimate**: Layers 3-4 target the two biggest P&L drags — adverse selection (wrong-side fills) and timing (entering/exiting at wrong moments). Oracle bid/ask spread is the most direct measure of market uncertainty available. Expected improvement: 5-15% fewer adverse fills, 2-5% better timing on bid placement.
 
 ---
 
@@ -163,6 +213,8 @@ See [OPTIMIZER.md](./OPTIMIZER.md) for full architecture, schema, operations, an
 - [ ] Deploy optimized params alongside default, compare live performance
 - [ ] Walk-forward validation (needs 2+ weeks of data)
 - [ ] Add recording to other strategies (orchestrator, avellaneda-maker)
+- [ ] Oracle-enhanced replay: use recorded `oracleSpot` in replay engine for oracle-referenced P_true backtesting
+- [ ] Replay with oracle bid/ask spread: test spread-gated strategies against historical oracle data
 - [ ] Multi-strategy replay: test same data through different strategy logic
 - [ ] Evaluate CMA-ES or Optuna if TPE convergence is poor
 - [ ] Multi-objective optimization (Sharpe + fill count Pareto frontier)
@@ -175,7 +227,7 @@ See [OPTIMIZER.md](./OPTIMIZER.md) for full architecture, schema, operations, an
 After real trading is validated, harden for unattended 24/7 operation.
 
 - [ ] Alerting: PagerDuty/Telegram on drawdown, DO stall, or API errors
-- [ ] Metrics: Grafana dashboard with PnL, fill rates, latency, wallet balance
+- [ ] Metrics: Grafana dashboard with PnL, fill rates, latency, wallet balance, oracle health
 - [ ] Auto-recovery: Worker cron already restarts DOs; add GCE systemd watchdog
 - [ ] Backup: Export D1 strategy_trades daily for audit trail
 - [ ] Rate limiting: Respect Polymarket CLOB API limits, back off on 429s

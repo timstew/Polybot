@@ -16,5 +16,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.7.0",
     "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "@chainlink/data-streams-sdk": "^1.2.1"
   }
 }

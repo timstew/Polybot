@@ -28,6 +28,7 @@ import {
   type StrategyTrade,
   type WalletOverview,
 } from "@/lib/api";
+import { StrategyCharts } from "@/components/strategy-charts";
 import {
   fmt, fmtInv, timeAgo,
   Tip, InventoryBar, SingleSideInventoryBar, PairPnl,
@@ -403,6 +404,7 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
     upInventory: number; downInventory: number; upAvgCost: number; downAvgCost: number;
     matchedPairs: number; netPnl: number; fillCount: number; sellCount: number;
     completedAt: string; priceMovePct: number; bidSize: number; windowDurationMs: number;
+    gammaConfirmed?: boolean;
   }>) ?? [];
 
   if (!stats) return null;
@@ -596,6 +598,7 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
               scale={w.bidSize ?? 1} pairCost={pairCost}
               netPnl={w.netPnl} fillCount={w.fillCount}
               durationMs={w.windowDurationMs} completedAt={w.completedAt}
+              gammaConfirmed={w.gammaConfirmed}
             />
           );
         })}
@@ -905,6 +908,7 @@ function StrategyDetail({
     fillCount?: number; flipCount: number; completedAt: string;
     upInventory: number; downInventory: number;
     upAvgCost: number; downAvgCost: number; bidSize?: number;
+    gammaConfirmed?: boolean;
   }>) ?? [];
   const windowsTraded = (custom?.windowsTraded as number) ?? 0;
   const windowsWon = (custom?.windowsWon as number) ?? 0;
@@ -1009,6 +1013,8 @@ function StrategyDetail({
           </Tip>
         </div>
       )}
+
+      <StrategyCharts strategyId={config.id} isActive={isActive} />
 
       {/* Strategy narration — winding down / drawdown / scaling state + scan status */}
       {isActive && (() => {
@@ -1756,6 +1762,7 @@ function StrategyDetail({
                   netPnl={w.netPnl ?? 0} fillCount={w.fillCount ?? 0}
                   flipCount={w.flipCount} maxFlips={maxFlips}
                   completedAt={w.completedAt}
+                  gammaConfirmed={w.gammaConfirmed}
                 />
               );
             })}

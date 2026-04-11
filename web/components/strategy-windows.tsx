@@ -437,6 +437,8 @@ export interface CompletedWindowRowProps {
   // Duration
   durationMs?: number;
   completedAt: string;
+  // Confirmation
+  gammaConfirmed?: boolean;
 }
 
 export function CompletedWindowRow(props: CompletedWindowRowProps) {
@@ -448,15 +450,16 @@ export function CompletedWindowRow(props: CompletedWindowRowProps) {
     totalMerged,
     durationMs,
     completedAt,
+    gammaConfirmed,
   } = props;
 
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1 text-xs">
       <Tip tip={title}><span className="font-medium cursor-help">{compact}</span></Tip>
-      <Tip tip="Market resolution outcome from Polymarket">
+      <Tip tip={gammaConfirmed ? "Confirmed by Polymarket" : gammaConfirmed === false ? "Oracle outcome (awaiting Polymarket confirmation)" : "Market resolution outcome"}>
         <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${
           outcome === "UP" ? "bg-green-100 text-green-800" : outcome === "DOWN" ? "bg-red-100 text-red-800" : "bg-gray-100"
-        }`}>{outcome}</span>
+        }`}>{outcome}{gammaConfirmed ? " \u2713" : gammaConfirmed === false ? " \u25CB" : ""}</span>
       </Tip>
       {chips}
       <InventoryBar up={up} down={dn} scale={scale} />

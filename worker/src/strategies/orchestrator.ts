@@ -47,7 +47,7 @@ import "./conviction-tactic";
 import "./enhanced-tactic";
 import "./certainty-tactic";
 import "./avellaneda-tactic";
-import { tryMerge } from "./merge";
+
 
 // ── Config ──
 
@@ -75,7 +75,6 @@ interface OrchestratorParams {
   // Inherited params passed through to tactics
   dead_zone_pct: number;
   grounded_fills: boolean;
-  merge_enabled?: boolean;
 }
 
 const DEFAULT_PARAMS: OrchestratorParams = {
@@ -106,7 +105,6 @@ const DEFAULT_PARAMS: OrchestratorParams = {
   bandit_cold_start_bonus: 0.5,
   dead_zone_pct: 0,
   grounded_fills: true,
-  merge_enabled: true,
 };
 
 // ── Bandit types ──
@@ -730,14 +728,6 @@ class OrchestratorStrategy implements Strategy {
         await tactic.onTick(tc);
       }
 
-      // Merge matched pairs during wind-down only — free capital before resolution
-      if (params.merge_enabled !== false && timeToEnd < stopQuotingMs) {
-        const mergeResult = await tryMerge(ctx, w);
-        if (mergeResult) {
-          w.realizedSellPnl += mergeResult.pnl;
-          this.custom.stats.totalPnl += mergeResult.pnl;
-        }
-      }
     }
   }
 
@@ -899,6 +889,7 @@ class OrchestratorStrategy implements Strategy {
             confidenceMultiplier: 1,
             orderFlowImbalance: 0,
             orderFlowAvailable: false,
+            oracleAvailable: false,
             rawDirection: outcome === "UNKNOWN" ? "UP" : outcome,
             inDeadZone: false,
           },
@@ -919,6 +910,7 @@ class OrchestratorStrategy implements Strategy {
             signalStrength: 0, velocity: 0, sampleCount: 0, momentum: 0, acceleration: 0,
             volatilityRegime: "normal", confidenceMultiplier: 1,
             orderFlowImbalance: 0, orderFlowAvailable: false,
+            oracleAvailable: false,
             rawDirection: outcome === "UNKNOWN" ? "UP" : outcome, inDeadZone: false,
           },
           w.market.strikePrice, w.windowOpenTime, w.windowEndTime,

@@ -32,7 +32,7 @@ import {
   disableOrderFlow,
   CRYPTO_SYMBOL_MAP,
 } from "./price-feed";
-import { tryMerge, isCapitalPressured } from "./merge";
+
 
 // ── Interfaces ────────────────────────────────────────────────────────
 
@@ -132,7 +132,6 @@ interface SniperParams {
   discovery_interval_ms: number;
   enable_order_flow: boolean;
   grounded_fills: boolean; // use trade tape instead of probabilistic model (default true)
-  merge_enabled?: boolean;
 }
 
 const DEFAULT_PARAMS: SniperParams = {
@@ -152,7 +151,6 @@ const DEFAULT_PARAMS: SniperParams = {
   discovery_interval_ms: 15_000,
   enable_order_flow: false,
   grounded_fills: true, // use observed trade tape for paper fills (realistic)
-  merge_enabled: true,
 };
 
 // ── Volatility Analysis ──────────────────────────────────────────────
@@ -732,14 +730,6 @@ class SpreadSniperStrategy implements Strategy {
       if (timeToEnd < stopQuotingMs) {
         if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price); w.upBidOrderId = null; } }
         if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price); w.downBidOrderId = null; } }
-        // Merge matched pairs before selling excess
-        if (params.merge_enabled !== false) {
-          const mergeResult = await tryMerge(ctx, w);
-          if (mergeResult) {
-            w.realizedSellPnl += mergeResult.pnl;
-            this.custom.totalPnl = (this.custom.totalPnl as number || 0) + mergeResult.pnl;
-          }
-        }
         const up = w.upInventory, dn = w.downInventory;
         const pc = (up > 0 && dn > 0) ? (w.upAvgCost + w.downAvgCost).toFixed(2) : "\u2014";
         w.tickAction = `Stop: holding ${up}\u2191/${dn}\u2193 pc=${pc}`;
@@ -762,15 +752,6 @@ class SpreadSniperStrategy implements Strategy {
 
       // Check fills (always — even when paused, fills on resting orders still need processing)
       await this.checkFills(ctx, w, params, signal);
-
-      // Capital-pressure merge: free capital mid-window if we can't afford new windows
-      if (params.merge_enabled !== false && isCapitalPressured(ctx, this.custom.activeWindows, params.bid_size * 0.92)) {
-        const mergeResult = await tryMerge(ctx, w);
-        if (mergeResult) {
-          w.realizedSellPnl += mergeResult.pnl;
-          this.custom.totalPnl = (this.custom.totalPnl as number || 0) + mergeResult.pnl;
-        }
-      }
 
       // Sell excess if imbalanced for too long
       await this.rebalanceInventory(ctx, w, params);

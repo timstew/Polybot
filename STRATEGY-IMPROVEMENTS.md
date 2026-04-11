@@ -1,8 +1,10 @@
 # Strategy Improvements
 
-> Last updated: March 23, 2026. Added data-driven improvement estimates from 24h safe-maker analysis (424 windows, $200 capital). Previous speculative estimates replaced with measured $ values.
+> Last updated: April 8, 2026. Added Chainlink Data Streams enhancements (oracle bid/ask spread, cross-source signals). Original data-driven estimates from 24h safe-maker analysis (424 windows, $200 capital) retained below.
 
-> **Automated optimization**: The [offline parameter optimizer](./OPTIMIZER.md) can now replay recorded market data with different parameter sets to find optimal configurations by Sharpe ratio — bucketed by crypto symbol, window duration, and time of day. Use it to test improvements below against real data before deploying.
+> **Chainlink Data Streams**: Authenticated oracle access is live (April 2026). All strategies use oracle spot for direction/magnitude signals. Safe-maker uses oracle P_true as primary fair value. V3 reports also provide bid/ask spread data that is captured but not yet exploited — see new improvements below.
+
+> **Automated optimization**: The [offline parameter optimizer](./OPTIMIZER.md) can now replay recorded market data with different parameter sets to find optimal configurations by Sharpe ratio — bucketed by crypto symbol, window duration, and time of day. Snapshots now include `oracleSpot` for oracle-referenced backtesting.
 
 ---
 
@@ -34,6 +36,66 @@ Based on 24.1 hours of safe-maker paper trading: 424 windows, +$23 net P&L, $200
 | 10 | **Window overlap exploitation** — use 5min resolution as signal for overlapping 15min | **+$30** | ~$450/yr | TODO | Medium |
 
 **Note:** Estimates 2-10 are not purely additive — some overlap (e.g., asymmetric fill detection + signal gate both reduce one-sided losses). Realistic combined improvement: $700-900/24h beyond the sell fix.
+
+### Bonereaper Correlation Findings (April 9, 2026)
+
+Cross-referenced 192 live Bonereaper trades (6 simultaneous BTC windows, April 9 04:30-04:52 UTC) against our oracle tick data recorded in the same time period. Key findings:
+
+**1. Market token prices diverge massively from fundamental P_true:**
+
+| Time | Market Token | Binance P_true | Oracle P_true | Gap |
+|------|-------------|----------------|---------------|-----|
+| 04:34:07 | Up=$0.83 | 0.46 | 0.51 | **+$0.32** |
+| 04:37:15 | Up=$0.77 | 0.53 | 0.59 | **+$0.18** |
+| 04:36:33 | Dn=$0.87 | (dn) 0.54 | (dn) 0.53 | **+$0.34** |
+
+Market tokens routinely trade $0.15-$0.35 away from any fundamental value calculation. This gap only resolves at window expiry.
+
+**2. Neither Binance nor Oracle predicts token prices:**
+- Oracle lags Binance by ~$7 / ~14 seconds on average (170 moves analyzed, 38% catch-up within 60s)
+- But BOTH lag market token prices by $0.20-$0.35 — token pricing is driven by speculative order flow, not spot price
+- Bonereaper follows market token prices (order book), not any price feed
+
+**3. Bonereaper's profit model (6-window sample):**
+
+| Window Type | Count | Avg Pair Cost | Profit Source |
+|-------------|-------|--------------|---------------|
+| Balanced (tokens near $0.50) | 2/6 | $0.94-$0.97 | Guaranteed (pair cost < $1) |
+| Sweep (one side $0.80+) | 4/6 | $1.02-$1.12 | Directional bet (must be right) |
+
+Bonereaper's all-time stats: $313K profit on $35M volume (0.89% margin), ~$4,120/day on $522K daily volume. Active ~76 days.
+
+**4. New strategy ideas from these findings:**
+
+| # | Strategy Concept | Mechanism | Expected Edge |
+|---|-----------------|-----------|---------------|
+| B1 | **Oracle divergence fading** | When market token price >> oracle P_true (e.g., Up=$0.83, P_true=0.51), buy the OTHER side cheap. Down at $0.17 when "worth" $0.49 = +$0.32/share EV. | Exploits speculative overshoot. Requires taker fills or early maker positioning. |
+| B2 | **Balanced-window-only accumulation** | Skip windows where tokens diverge early (one side > $0.70 within first 30s). Only trade windows where both sides stay near $0.45-$0.55. | These are the guaranteed-profit windows (pair cost < $1.00). Fewer trades but higher win rate. |
+| B3 | **Late-window oracle certainty** | In last 60s, oracle P_true converges to truth. When oracle says P_true > 0.95 but losing token still at $0.05+, buy winning side (even as taker). | Small edge per share but near-certain. Already partially implemented as certainty-taker. |
+| B4 | **Anti-sweep contrarian** | When token price spikes to $0.85+ but oracle P_true is only $0.55-0.65, the spike is speculative. Fade it by buying the cheap OTHER side at $0.15. If market reverts, token goes back to $0.40+ and we exit at profit. | Requires sell capability (against current BoneStar "never sell" rule). High reward if market reverts, small loss if it doesn't. |
+| B5 | **Cross-window cascade** | When a 5-min window resolves, immediately position in the overlapping 15-min window using the resolution as a strong signal. Bonereaper plays both simultaneously — we can use resolution info they don't have yet. | Free information from 5-min outcome. Already proposed as improvement #10, but now informed by Bonereaper's actual multi-window behavior. |
+
+**Priority ranking**: B2 (balanced-only) is lowest risk and directly addresses the pair cost problem. B1 (divergence fading) is highest potential reward but needs careful sizing. B3 is already partially built. B4/B5 are more speculative.
+
+### Chainlink Oracle Enhancements (April 2026)
+
+These leverage data already flowing from authenticated Chainlink Data Streams. Oracle `price` is used; `bid` and `ask` are captured in `OracleTick` but not yet wired into trading logic.
+
+| # | Enhancement | Mechanism | Expected Impact | Status | Complexity |
+|---|------------|-----------|-----------------|--------|------------|
+| C1 | **Oracle spread-as-regime signal** | Feed `(ask - bid) / mid` into `regime.ts`. Wide spread = uncertainty → auto-widen bid offsets. | Fewer adverse fills in volatile regimes | TODO | Medium |
+| C2 | **Spread-width vol predictor** | Track EMA of oracle spread changes. Rapidly widening spread → pull bids before vol spike arrives. | 1-5s early warning on vol spikes | TODO | Medium |
+| C3 | **Bid/ask asymmetry signal** | When `(mid - bid) > (ask - mid)`, oracle is skewed bearish. New signal layer in `computeSignal()`. | Independent directional edge from institutional data | TODO | Medium |
+| C4 | **P_true confidence bounds** | Compute P_true from bid (pessimistic) and ask (optimistic). Wide range → widen spreads. Tight → bid aggressively. | Better bid sizing in uncertain markets | TODO | Medium |
+| C5 | **Binance-oracle divergence** | Compare Binance spot vs Chainlink spot. Divergence = one source leading → latency arb signal. | Detect directional moves 1-3s early | TODO | Low |
+| C6 | **Cross-source confidence** | When Binance and oracle agree on direction → high conviction. Diverge → reduce sizes, widen offsets. | Reduce one-sided exposure in ambiguous markets | TODO | Low |
+| C7 | **Oracle-informed inventory urgency** | Late window + unmatched inventory: tight spread near strike → exit fast (coin flip). Tight spread far from strike → hold (outcome certain). | Better end-of-window decisions | TODO | Low |
+| C8 | **Staleness gating** | Capture `expiresAt`/`validFromTimestamp` from V3 reports. Skip P_true when stale (>2s). | Prevent bad quotes during Chainlink latency | TODO | Low |
+| C9 | **Oracle spread-gated entry** | Skip window entry when oracle spread is abnormally wide (>2x normal). High spread = low confidence = adverse selection risk. | Avoid worst-case entry conditions | TODO | Low |
+
+**Priority ranking:** C5 (Binance-oracle divergence) and C1 (spread-as-regime) are highest impact with lowest complexity. C5 requires no new data capture — both prices are already in memory every tick. C1 requires wiring `bid`/`ask` through `getOracleSpot()` to regime features.
+
+**Interaction with existing improvements:** C1/C2 strengthen the fill rate feedback loop (#6) by providing a real-time market quality input. C5/C6 strengthen cross-asset momentum cascade (#7) by adding a second cross-source dimension. C9 strengthens conditional entry timing (#9) with an institutional-grade entry gate.
 
 ---
 
@@ -170,6 +232,8 @@ Next window, compute target offset:
 
 **Interaction with volatility-adaptive offset**: The vol multiplier handles regime shifts within a window. The fill rate loop handles cross-window learning. They stack: `base_offset * vol_multiplier * fill_rate_adjustment`.
 
+**Chainlink enhancement (C1)**: Oracle bid/ask spread width provides a real-time market quality signal that can feed directly into this loop. When oracle spread widens mid-window, the fill rate feedback can react within ticks rather than waiting for cross-window EMA updates.
+
 ### 3. Cross-Asset Momentum Cascade
 
 **Problem**: BTC moves first, ALTs follow 5-30 seconds later. conviction-maker has `computeLeadLagBonus()` but safe-maker and directional-maker don't use it. When BTC spikes UP, our ALT DN bids fill (adverse selection) before the ALT price catches up.
@@ -184,6 +248,8 @@ For each ALT (ETH, SOL, XRP):
 ```
 
 **Expected impact**: Prevents the most common adverse selection pattern — BTC moves, ALT bids fill on the wrong side before the ALT signal updates.
+
+**Chainlink enhancement (C5)**: Binance-oracle divergence adds a second dimension. When BTC moves on Binance but the Chainlink oracle hasn't updated yet, the settlement reference is lagging — this is the exact window where adverse selection happens. Cancel ALT bids when BTC Binance-vs-oracle divergence exceeds a threshold.
 
 ### 4. Polymarket Tape Order Flow Signal
 
@@ -221,6 +287,8 @@ Wait to enter until ALL of:
 ```
 
 **Trade-off**: We miss the first 15-30s of fill opportunities. But we avoid the most dangerous entries (one-sided fills on opening momentum). Net positive for maker strategies, less important for sniper (which doesn't care about direction).
+
+**Chainlink enhancement (C9)**: Add oracle spread width as a 5th entry gate: `oracle spread < 2x normal`. Wide oracle spread at window open indicates institutional uncertainty — exactly when one-sided fills are most likely. This is a stronger gate than price-move checks because it captures market uncertainty directly.
 
 ### 6. Window Overlap Exploitation
 
@@ -261,6 +329,8 @@ Mitigation: Only enter when margin > 0.5%, stop-loss if margin drops < 0.2%.
 
 **Key difference from existing strategies**: This is a taker strategy (pays fees) but only enters with very high confidence. It works because the wide ask spread ($0.99) isn't the entry point — we're buying at $0.85-$0.92 from sellers who don't realize the outcome is almost locked.
 
+**Chainlink enhancement**: Use oracle spot (not Binance) for the threshold comparison — this is the exact price Polymarket uses for settlement. Also use oracle bid/ask tightness as a confidence multiplier: tight oracle spread near resolution = high confidence in the current price level. Implemented as the `certainty-taker` tactic in the orchestrator.
+
 ---
 
 ## Safe Maker
@@ -298,11 +368,14 @@ baseOffset (param: bid_offset = 0.02)
 | # | Improvement | Status | Notes |
 |---|------------|--------|-------|
 | 1 | Inventory-aware asymmetric offsets | TODO | Currently binary cancel; should use continuous offset scaling |
-| 2 | Fill rate feedback loop | TODO | Auto-tune offset from realized fill rates |
-| 3 | Cross-asset momentum cascade | TODO | Use BTC lead-lag to pre-adjust ALT offsets |
+| 2 | Fill rate feedback loop | TODO | Auto-tune offset from realized fill rates. **C1**: oracle spread as real-time quality input |
+| 3 | Cross-asset momentum cascade | TODO | Use BTC lead-lag to pre-adjust ALT offsets. **C5**: Binance-oracle divergence as 2nd dimension |
 | 4 | Multi-tier bids (2-3 levels) | TODO | Single bid per side currently |
 | 5 | Per-crypto bid sizing | TODO | Uniform sizing; BTC has more liquidity |
-| 6 | Conditional entry timing | TODO | Enters immediately on market discovery |
+| 6 | Conditional entry timing | TODO | Enters immediately on market discovery. **C9**: oracle spread-gated entry |
+| 7 | Oracle spread-adaptive offsets | TODO | **C1**: widen bid offset when oracle bid/ask spread widens (market uncertainty) |
+| 8 | Oracle P_true confidence bounds | TODO | **C4**: compute P_true from bid and ask separately → size bids by confidence width |
+| 9 | Oracle-informed wind-down | TODO | **C7**: tight spread near strike → exit faster; tight spread far from strike → hold |
 
 ---
 
@@ -420,6 +493,8 @@ All handled by `strategy.ts` — UA no longer has its own wallet system:
 | 4 | Tape order flow signal | TODO | Tape already fetched; not analyzing buy/sell imbalance |
 | 5 | Per-crypto conviction bias | TODO | Currently uniform 2.0x bias |
 | 6 | Window overlap exploitation | TODO | 5min resolution could inform overlapping 15min window |
+| 7 | Binance-oracle divergence mode switch | TODO | **C5/C6**: when sources diverge → force sniper mode (safer). When agree → allow maker mode |
+| 8 | Oracle spread-gated entry | TODO | **C9**: skip entry when oracle spread abnormally wide — UA's ask imbalance gate analog for the settlement reference |
 
 Previously proposed items that are now implemented:
 - ~~Mode switching mid-window~~ → implemented as "deferred upgrade" (sniper→maker after 3 ticks if signal strengthens)
@@ -504,6 +579,7 @@ Direction doesn't matter. As long as both sides fill equally, every window is pr
 | 8 | Window-end acceleration | TODO | Not yet ported from safe-maker (sniper uses fixed wind-down timing) |
 | 9 | Skip low-liquidity time slots | TODO | No time-of-day awareness |
 | 10 | Maker rebate tracking | DONE | fee_equivalent stored in D1 for all strategies |
+| 11 | Oracle spread-scaled offset | TODO | **C1**: sniper's fixed 0.04 offset could adapt to oracle spread width. Tight oracle → tight offset (more fills). Wide oracle → wider offset (avoid adverse selection). |
 
 Additional features implemented since original list:
 - **Ask imbalance gate** (0.15 threshold) — prevents one-sided entry
@@ -636,6 +712,7 @@ Key differences from directional-maker:
 | 1 | Port adaptive repricing | TODO | No vol-adaptive offset or time-decay yet (simpler single-side requoting) |
 | 2 | Dynamic conviction threshold by asset | TODO | Fixed 0.60 threshold; some assets need higher |
 | 3 | Partial exit on signal weakening | TODO | Currently all-or-nothing hold to resolution |
+| 4 | Oracle-derived conviction gate | TODO | **C3/C4**: use oracle bid/ask asymmetry as a conviction filter — only enter when oracle asymmetry confirms signal direction. **C7**: use oracle spread tightness near resolution for hold/exit decisions. |
 
 ---
 
@@ -836,28 +913,51 @@ Track fills per side per window:
   → Either: aggressively chase DN, or accept directional bet
 ```
 
+#### 5. Oracle Spread-Based Adverse Selection Defense (NEW — April 2026)
+
+The #1 real-mode loss source is one-sided fills in directional markets. Oracle bid/ask spread provides a direct indicator:
+
+```
+When oracle spread widens suddenly (>1.5x EMA):
+  → Market is uncertain / directional move incoming
+  → Cancel all bids for 2-3 ticks (avoid adverse fills)
+  → Resume only after spread normalizes
+
+When Binance price moves but oracle hasn't updated:
+  → Settlement reference is stale → our P_true is wrong
+  → Reduce bid sizes to minimum until oracle catches up
+  → This is the EXACT moment adverse selection happens most
+
+When oracle bid/ask is asymmetric:
+  → Oracle skew reveals institutional directional view
+  → If oracle skew agrees with our signal → normal bidding
+  → If oracle skew contradicts our signal → skip or reduce conviction side
+```
+
+**Why this is better than price-based detection:** Price-based adverse selection detection is reactive (waits for fills to happen). Oracle spread-based detection is **predictive** — spread widens BEFORE the directional move completes.
+
 ### New Strategy Ideas for Real Trading
 
-#### 5. Cross-Market Hedger
+#### 6. Cross-Market Hedger
 BTC and ETH are ~85% correlated. If you get one-sided BTC UP, hedge by bidding ETH DOWN.
 - Pairs across markets instead of within a single market
 - Requires correlation tracking and cross-market position management
 - Novel approach — not seen on Polymarket
 
-#### 6. Oscillation-Only Maker
+#### 7. Oscillation-Only Maker
 Only enters in confirmed oscillating regimes. Sits out trending/volatile entirely.
 - Lower throughput (fewer windows) but much higher win rate
 - Oscillating = price bounces → both sides fill naturally
 - Could be a "safe mode" for real trading
 
-#### 7. CLOB Depth Maker (Phase 2 — requires CLOB WebSocket)
+#### 8. CLOB Depth Maker (Phase 2 — requires CLOB WebSocket)
 Use Polymarket order book depth to identify which side has sell pressure:
 - More sell orders = more likely to fill our bids on that side
 - Balanced sell pressure on both sides = good for pairing
 - Unbalanced = skip or conviction-only
 - Needs live CLOB book data (GCE WebSocket service)
 
-#### 8. Micro-Scalper
+#### 9. Micro-Scalper
 Very short hold times within a window:
 - Buy during a dip, sell on the bounce (30-60 second holds)
 - Doesn't hold to resolution — takes profit on mean reversion
@@ -918,6 +1018,70 @@ Book mids are always $0.50/$0.50 (spreads are $0.98 wide — uninformative). Fai
 
 ---
 
+## BoneStar Strategy (April 2026)
+
+> **See also**: [BONEREAPER-ANALYSIS.md](./BONEREAPER-ANALYSIS.md) for consolidated Bonereaper analysis including verified facts, debunked claims, and external analysis evaluation.
+
+Three-phase accumulation + certainty sweep strategy, reverse-engineered from **Bonereaper** — a profitable bot observed on Polymarket's BTC "up or down" markets. Analysis based on 982 trades across 11 active windows, with 580 trades cross-referenced against our recorded tick data.
+
+### Origin: Bonereaper Trade Analysis
+
+Bonereaper plays **only 5-minute and 15-minute BTC windows**. Key observed behaviors:
+
+- **ZERO sells** — every position held to resolution, profits via MERGE (pairs → $1.00) and REDEEM (winning excess → $1.00)
+- **Plays both sides** — buys UP and DOWN tokens simultaneously, building paired inventory as structural insurance
+- **Three distinct phases** observable in trade patterns, driven by market outcome token prices (not an independent P_true)
+- **Same-side runs**: up to 50 consecutive trades on one side during sweeps; 2-6 during accumulation
+- **Trade cadence**: avg 1.4-6.9 seconds between trades; rapid-fire during sweeps
+
+### Three Phases
+
+**Phase 1 — Balanced Accumulation (0-25% of window)**
+- Alternating UP/DOWN buys at $0.35-0.60
+- Small fixed sizes (~25 shares per trade, ~$10 notional)
+- Switches sides every 2-6 trades; pair cost ~$1.00
+- Purpose: build cheap paired inventory as downside protection
+
+**Phase 2 — Directional Conviction (25%+ of window)**
+- Continues buying BOTH sides, but winning side at $0.65-0.85
+- Losing side picked up at $0.10-0.30 (bargain hunting)
+- Size scaling: 2x larger on winning side
+- Purpose: follow the market's conviction while still pairing
+
+**Phase 3 — Certainty Sweep (when P_true > 0.60, from 20%+ onward)**
+- Massive buys of winning side at $0.88-$0.99 (bursts of 200-5,557 shares)
+- Simultaneously picks up losing side at $0.05-$0.15 for cheap pair insurance
+- This is where ~75% of capital goes; profit = $0.01-0.02/share × thousands of shares
+- Phase transitions are **monotonic** — once in Phase 3, never drops back
+- Only triggers in ~55% of windows; the rest stay in Phase 1/2
+
+### Our Advantage Over Bonereaper
+
+Bonereaper follows **market outcome token prices** — sweeps when tokens trade at $0.85+. BoneStar uses the **Chainlink oracle** to compute P_true independently:
+
+- Can sweep when P_true > threshold **before** market tokens move (latency edge)
+- Avoids false sweeps when market tokens spike but oracle says outcome is uncertain
+- Has a principled Phase 2→3 transition instead of following the crowd
+
+### Key Parameters
+
+| Parameter | Default | Rationale |
+|-----------|---------|-----------|
+| `sweep_threshold` | 0.60 | Bonereaper sweeps at P_true 0.54-0.67 |
+| `sweep_window_pct` | 0.20 | Bonereaper swept as early as 23% of window |
+| `sweep_bid_price` | 0.98 | Match Bonereaper's aggressive sweep pricing |
+| `sweep_size` | 200 | Shares per sweep bid |
+| `conviction_start_pct` | 0.25 | Bonereaper shows conviction from ~25% onward |
+| `max_pair_cost` | 0.98 | Enforced in Phase 1/2 only; Phase 3 is uncapped (57% of Bonereaper windows have pair cost > 1.00) |
+| `max_window_duration_ms` | 15min | Bonereaper only plays 5m and 15m windows |
+| `base_bid_size` | 25 | Matches Bonereaper's ~25 shares/trade in accumulation |
+
+### File
+
+`worker/src/strategies/bonestar.ts` (~650 lines). Registered in `strategy.ts` and `standalone-runner.ts`.
+
+---
+
 ## Known Bugs
 
 | # | Bug | Observed | Severity |
@@ -927,3 +1091,48 @@ Book mids are always $0.50/$0.50 (spreads are $0.98 wide — uninformative). Fai
 | 3 | **Auto-redeem too early** — Polymarket needs ~2 min to mark redeemable. Fixed: deferred queue with 2-min delay and retry. | 2026-03-11 | Fixed |
 | 4 | **CLOB sell fails with "not enough balance"** — mismatch between tracked fills and actual wallet holdings. Workaround: poison window on sell failure. | 2026-03-12 | Medium |
 | 5 | **Nonce errors during batch redemption** — stale nonces after timeout-but-confirmed txns. Fixed: re-fetch nonce from chain after errors. | 2026-03-12 | Fixed |
+
+---
+
+## Oracle Correlation Findings & Future Strategy Concepts
+
+### April 9 Correlation Analysis: Bonereaper vs Oracle
+
+Correlated 192 live Bonereaper trades with oracle tick data. Key findings:
+
+**Market tokens diverge $0.15-$0.35 from oracle P_true.** Tokens at $0.83 when oracle P_true is only 0.53. The Polymarket token market is flow-driven — speculative momentum pushes prices far beyond fundamental value (oracle settlement probability).
+
+**Oracle lags Binance by ~14s on average.** Neither Binance spot nor Chainlink oracle predict token prices. Token prices are driven by speculative order flow, not by spot price movements. The oracle's advantage is that it provides settlement truth — the final outcome is determined by oracle price vs strike.
+
+**83% of BoneStar paper P&L comes from sweeps (RESOLVE), not pairs (MERGE).** This means the sweep engine efficiency is the dominant profit driver for the BoneStar strategy, more important than balanced accumulation.
+
+**Phase 3 losing-side bids were too cheap.** Hardcoded $0.15 cap vs actual Bonereaper trading at $0.23-$0.28. Fixed: parameterized `losing_side_max_bid` (default $0.30) and `losing_side_premium` (default $0.05).
+
+**Sweep capacity was too conservative.** 3 max sweeps with 30s cooldown left money on the table. Fixed: 10 max sweeps with 10s cooldown.
+
+### Revised Understanding of Oracle Advantage
+
+The oracle is NOT a prediction tool — it's a settlement reference. Its value comes from:
+1. **Settlement truth**: Final outcome is oracle price vs strike, not market sentiment
+2. **Late-window convergence**: As windows approach expiry, token prices MUST converge to oracle-implied values
+3. **Divergence detection**: When tokens diverge far from P_true, the mispriced side is exploitable
+
+### B2: Balanced Window Accumulation (Future Strategy)
+
+**Concept**: Only trade windows where both UP and DOWN tokens stay near $0.45-$0.55 throughout. In these balanced windows, pair cost is guaranteed < $1.00, meaning every matched pair is profitable regardless of outcome.
+
+**Key insight**: Skip high-divergence sweep windows entirely. Accept lower P&L per window in exchange for near-zero variance. Target: windows where max token price stays below $0.60.
+
+**Requirements**: Market token price feed (CLOB book mid or last trade), early-exit if tokens diverge beyond threshold, smaller bid sizes (no conviction scaling needed).
+
+**Tradeoff**: Lower variance and more consistent profits, but misses the large sweep P&L from high-conviction windows. Best as a complementary strategy to BoneStar.
+
+### B4: Anti-Sweep Contrarian (Future Strategy)
+
+**Concept**: When tokens spike to $0.85+ but oracle P_true is only $0.55-0.65, fade the market by buying the cheap other side. The market is overpricing one side due to speculative momentum, but the oracle says it's much closer to a coin flip.
+
+**Key insight**: The $0.15-$0.35 divergence between token price and oracle P_true creates a systematic edge. The cheap side (trading at $0.15-$0.20) has implied probability of 15-20% but oracle says 35-45%.
+
+**Requirements**: Real-time oracle P_true, CLOB book for token prices, minimum divergence threshold ($0.20+), inventory limits to avoid catching falling knives.
+
+**Tradeoff**: Contrarian — will feel wrong most of the time (buying into momentum). Needs careful position sizing and window selection. Best when combined with oracle P_true confidence.

@@ -34,7 +34,8 @@ import {
   CRYPTO_SYMBOL_MAP,
 } from "./price-feed";
 import { classifyRegime, computeRegimeFeatures, type RegimeType, type RegimeFeatures } from "./regime";
-import { tryMerge } from "./merge";
+
+import { getOracleStrike as getOracleStrikeWs, isOracleConnected, getOracleSpot } from "./oracle-feed";
 import type { TickSnapshot, BookConvictionSnapshot, TapeBucket, TapeMeta } from "../optimizer/types";
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -205,7 +206,6 @@ export interface DirectionalMakerParams {
   vol_offset_scale_high: number; // multiply bid_offset in high volatility (default 1.5)
   vol_offset_scale_low: number; // multiply bid_offset in low volatility (default 0.5)
   tighten_start_pct: number; // window progress % to start tightening offset (default 0.70)
-  merge_enabled?: boolean;
   // Multi-source conviction gates
   min_flip_sell_strength: number; // combined strength required for flip sell (default 0.55)
   flip_sell_cooldown_ms: number;  // min ms between flip sells on same window (default 15000)
@@ -240,7 +240,6 @@ export const DEFAULT_PARAMS: DirectionalMakerParams = {
   vol_offset_scale_high: 1.5, // widen offset in high volatility
   vol_offset_scale_low: 0.5, // tighten offset in low volatility
   tighten_start_pct: 0.70, // start tightening at 70% through window
-  merge_enabled: true,
   min_flip_sell_strength: 0.55,
   flip_sell_cooldown_ms: 15_000,
   sell_excess: true,
@@ -777,15 +776,22 @@ export class SafeMakerStrategy implements Strategy {
           : null;
 
       // Fetch oracle strike for settlement-referenced signal
+      // Try WebSocket (instant) first, then REST (1-min cache) as fallback
       let oracleStrike: number | null = null;
       try {
-        const eventStart = new Date(windowOpenTime).toISOString();
-        const oracleSymbol = toOracleSymbol(sym);
-        const variant = toVariant(windowDuration);
-        oracleStrike = await fetchOracleStrike(oracleSymbol, variant, eventStart);
+        oracleStrike = getOracleStrikeWs(sym, windowOpenTime);
         if (oracleStrike != null) {
           const drift = Math.abs(oracleStrike - openPrice).toFixed(2);
-          ctx.log(`Oracle strike: $${oracleStrike.toFixed(2)} (Binance: $${openPrice.toFixed(2)}, drift: $${drift})`);
+          ctx.log(`Oracle strike locked (WS): $${oracleStrike.toFixed(2)} (Binance: $${openPrice.toFixed(2)}, drift: $${drift})`);
+        } else {
+          const eventStart = new Date(windowOpenTime).toISOString();
+          const oracleSymbol = toOracleSymbol(sym);
+          const variant = toVariant(windowDuration);
+          oracleStrike = await fetchOracleStrike(oracleSymbol, variant, eventStart);
+          if (oracleStrike != null) {
+            const drift = Math.abs(oracleStrike - openPrice).toFixed(2);
+            ctx.log(`Oracle strike (REST): $${oracleStrike.toFixed(2)} (Binance: $${openPrice.toFixed(2)}, drift: $${drift})`);
+          }
         }
       } catch { /* oracle fetch is best-effort */ }
 
@@ -950,14 +956,6 @@ export class SafeMakerStrategy implements Strategy {
           const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
         }
-        // Merge matched pairs during wind-down — free capital before resolution
-        if (params.merge_enabled !== false) {
-          const mergeResult = await tryMerge(ctx, w);
-          if (mergeResult) {
-            w.realizedSellPnl += mergeResult.pnl;
-            this.custom.totalPnl = (this.custom.totalPnl as number || 0) + mergeResult.pnl;
-          }
-        }
         await this.sellLosingInventory(ctx, w, params, "WIND DOWN");
         await this.recordSellPhaseTick(ctx, w, now);
         {
@@ -968,17 +966,23 @@ export class SafeMakerStrategy implements Strategy {
         continue;
       }
 
-      // Retry oracle strike if not yet captured (1min cache makes this cheap)
+      // Retry oracle strike if not yet captured — try WS first, then REST
       if (w.oracleStrike == null) {
         try {
-          const eventStart = new Date(w.windowOpenTime).toISOString();
-          const oracleSymbol = toOracleSymbol(w.cryptoSymbol);
-          const wDurMs2 = w.windowEndTime - w.windowOpenTime;
-          const variant = toVariant(wDurMs2);
-          w.oracleStrike = await fetchOracleStrike(oracleSymbol, variant, eventStart);
+          w.oracleStrike = getOracleStrikeWs(w.cryptoSymbol, w.windowOpenTime);
           if (w.oracleStrike != null) {
             const drift = Math.abs(w.oracleStrike - w.priceAtWindowOpen).toFixed(2);
-            ctx.log(`Oracle strike (retry): $${w.oracleStrike.toFixed(2)} (Binance: $${w.priceAtWindowOpen.toFixed(2)}, drift: $${drift})`);
+            ctx.log(`Oracle strike locked (WS retry): $${w.oracleStrike.toFixed(2)} (Binance: $${w.priceAtWindowOpen.toFixed(2)}, drift: $${drift})`);
+          } else {
+            const eventStart = new Date(w.windowOpenTime).toISOString();
+            const oracleSymbol = toOracleSymbol(w.cryptoSymbol);
+            const wDurMs2 = w.windowEndTime - w.windowOpenTime;
+            const variant = toVariant(wDurMs2);
+            w.oracleStrike = await fetchOracleStrike(oracleSymbol, variant, eventStart);
+            if (w.oracleStrike != null) {
+              const drift = Math.abs(w.oracleStrike - w.priceAtWindowOpen).toFixed(2);
+              ctx.log(`Oracle strike (REST retry): $${w.oracleStrike.toFixed(2)} (Binance: $${w.priceAtWindowOpen.toFixed(2)}, drift: $${drift})`);
+            }
           }
         } catch { /* best-effort */ }
       }
@@ -1013,13 +1017,16 @@ export class SafeMakerStrategy implements Strategy {
       if (params.record_snapshots && w.tickSnapshots) {
         const tapeNow = await fetchTradeTape();
 
-        // Initialize cumulative tape tracker on first tick
-        if (!w.cumulativeTapeBuckets) {
-          w.cumulativeTapeBuckets = new Map();
-          w.cumulativeTapeWallets = new Set();
-          w.cumulativeTapeVolume = 0;
-          w.cumulativeTapeCount = 0;
-          w.lastTapeTimestamp = 0;
+        // Initialize cumulative tape tracker on first tick.
+        // Also re-hydrate Map/Set if state was serialized to JSON (DO storage or standalone runner).
+        if (!w.cumulativeTapeBuckets || !((w.cumulativeTapeBuckets as unknown) instanceof Map)) {
+          const prev = w.cumulativeTapeBuckets as unknown;
+          w.cumulativeTapeBuckets = new Map(prev && typeof prev === "object" && !(prev instanceof Map) ? Object.entries(prev as Record<string, number>) : undefined);
+          const prevWallets = w.cumulativeTapeWallets as unknown;
+          w.cumulativeTapeWallets = new Set(prevWallets instanceof Set ? prevWallets : Array.isArray(prevWallets) ? prevWallets : undefined);
+          w.cumulativeTapeVolume = w.cumulativeTapeVolume ?? 0;
+          w.cumulativeTapeCount = w.cumulativeTapeCount ?? 0;
+          w.lastTapeTimestamp = w.lastTapeTimestamp ?? 0;
         }
 
         // Accumulate NEW token-specific trades since last tick.
@@ -1083,6 +1090,7 @@ export class SafeMakerStrategy implements Strategy {
           downBidOrderId: w.downBidOrderId, downBidPrice: w.downBidPrice, downBidSize: w.downBidSize,
           upInventory: w.upInventory, downInventory: w.downInventory,
           upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
+          oracleSpot: signal.oracleSpot,
         });
 
         // Clear pending events after recording them in the tick snapshot
@@ -1515,15 +1523,26 @@ export class SafeMakerStrategy implements Strategy {
       regime === "calm"        ? 0.12 :  // standard
       0.12; // near-strike, late-window, etc.
 
-    // Primary: book mids (market consensus). Fallback: P_true (binary option CDF).
-    // Last resort: old signal model.
+    // Fair value hierarchy:
+    //   1. Oracle P_true (zero basis risk — uses settlement reference price)
+    //   2. Book mids (market consensus)
+    //   3. Binance P_true (existing fallback)
     let fairUp: number;
     let fairDown: number;
-    if (book.upMid != null && book.downMid != null) {
+    const oracleTick = getOracleSpot(w.cryptoSymbol);
+    if (oracleTick && isOracleConnected()) {
+      // PRIMARY: oracle-derived P_true (Chainlink spot = settlement reference)
+      const vol = estimateVolatility5min(priceHistory);
+      const timeRemaining = w.windowEndTime - now;
+      const pTrue = calculatePTrue(oracleTick.price, effectiveStrike, "above", timeRemaining, vol);
+      fairUp = pTrue;
+      fairDown = 1.0 - pTrue;
+    } else if (book.upMid != null && book.downMid != null) {
+      // Secondary: book mids (market consensus)
       fairUp = book.upMid;
       fairDown = book.downMid;
     } else {
-      // P_true fallback: uses vol estimate + time remaining for proper binary pricing
+      // Tertiary: Binance P_true fallback
       const vol = estimateVolatility5min(priceHistory);
       const timeRemaining = w.windowEndTime - now;
       const pTrue = calculatePTrue(signal.currentPrice, effectiveStrike, "above", timeRemaining, vol);
@@ -2084,7 +2103,7 @@ export class SafeMakerStrategy implements Strategy {
     w.tickSnapshots.push({
       t: now,
       price: lastTick?.price ?? w.priceAtWindowOpen,
-      signal: lastTick?.signal ?? { symbol: w.cryptoSymbol, windowOpenPrice: w.priceAtWindowOpen, currentPrice: w.priceAtWindowOpen, priceChangePct: 0, direction: "UP" as const, signalStrength: 0, velocity: 0, sampleCount: 0, momentum: 0, acceleration: 0, volatilityRegime: "low" as const, confidenceMultiplier: 1, orderFlowImbalance: 0, orderFlowAvailable: false, rawDirection: "UP" as const, inDeadZone: false },
+      signal: lastTick?.signal ?? { symbol: w.cryptoSymbol, windowOpenPrice: w.priceAtWindowOpen, currentPrice: w.priceAtWindowOpen, priceChangePct: 0, direction: "UP" as const, signalStrength: 0, velocity: 0, sampleCount: 0, momentum: 0, acceleration: 0, volatilityRegime: "low" as const, confidenceMultiplier: 1, orderFlowImbalance: 0, orderFlowAvailable: false, oracleAvailable: false, rawDirection: "UP" as const, inDeadZone: false },
       regime: w.lastRegime ?? "calm",
       regimeFeatures: lastTick?.regimeFeatures ?? { choppiness: 0, trendStrength: 0, realizedVol: 0, momentum: 0, signalStrength: 0, distanceToStrike: 1, timeRemainingPct: 1, flipCount: 0, orderFlowImbalance: 0 },
       regimeScores: lastTick?.regimeScores ?? {},
@@ -2102,6 +2121,7 @@ export class SafeMakerStrategy implements Strategy {
       downBidOrderId: null, downBidPrice: 0, downBidSize: 0,
       upInventory: w.upInventory, downInventory: w.downInventory,
       upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
+      oracleSpot: lastTick?.oracleSpot,
     });
     if (w.pendingSells) w.pendingSells = [];
     if (w.pendingFills) w.pendingFills = [];
@@ -2161,17 +2181,23 @@ export class SafeMakerStrategy implements Strategy {
         // Gamma API failure
       }
 
-      // 2. If Polymarket hasn't resolved yet, wait for +30s then use Binance
-      // Compute Binance prediction for UI (never used for actual outcome)
-      let closePrice: number | null = null;
-      const history = this.custom.priceHistory[w.cryptoSymbol] || [];
-      closePrice = findPriceAtTime(history, w.windowEndTime);
-      if (!closePrice) {
-        const snap = await fetchSpotPrice(w.cryptoSymbol);
-        closePrice = snap?.price ?? null;
-      }
-      if (closePrice !== null && w.priceAtWindowOpen > 0) {
-        w.binancePrediction = closePrice >= w.priceAtWindowOpen ? "UP" : "DOWN";
+      // 2. Oracle prediction (use Chainlink if available — it's the settlement reference)
+      const effectiveStrike = w.oracleStrike ?? w.priceAtWindowOpen;
+      const oracleTick = getOracleSpot(w.cryptoSymbol);
+      if (oracleTick && isOracleConnected()) {
+        w.binancePrediction = oracleTick.price >= effectiveStrike ? "UP" : "DOWN";
+      } else {
+        // Fallback to Binance if oracle unavailable
+        let closePrice: number | null = null;
+        const history = this.custom.priceHistory[w.cryptoSymbol] || [];
+        closePrice = findPriceAtTime(history, w.windowEndTime);
+        if (!closePrice) {
+          const snap = await fetchSpotPrice(w.cryptoSymbol);
+          closePrice = snap?.price ?? null;
+        }
+        if (closePrice !== null) {
+          w.binancePrediction = closePrice >= effectiveStrike ? "UP" : "DOWN";
+        }
       }
 
       if (outcome === "UNKNOWN") {
@@ -2202,8 +2228,13 @@ export class SafeMakerStrategy implements Strategy {
       const correct =
         outcome !== "UNKNOWN" && w.convictionSide === outcome;
 
-      const priceMovePct = closePrice !== null && w.priceAtWindowOpen > 0
-        ? ((closePrice - w.priceAtWindowOpen) / w.priceAtWindowOpen) * 100
+      // Price move: use oracle spot if available, else Binance
+      const spotPrice = (oracleTick && isOracleConnected()) ? oracleTick.price
+        : (this.custom.priceHistory[w.cryptoSymbol]?.length
+          ? this.custom.priceHistory[w.cryptoSymbol][this.custom.priceHistory[w.cryptoSymbol].length - 1].price
+          : null);
+      const priceMovePct = spotPrice !== null && effectiveStrike > 0
+        ? ((spotPrice - effectiveStrike) / effectiveStrike) * 100
         : 0;
 
       const completed: CompletedMakerWindow = {

@@ -35,7 +35,7 @@ import {
   realtimeVolatility,
   estimateVolatility5min,
 } from "./price-feed";
-import { tryMerge } from "./merge";
+
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -173,7 +173,6 @@ interface EnhancedMakerParams {
   delta_pause_threshold: number;  // normalized |d|*S*0.01 → cancel all bids
   delta_widen_threshold: number;  // normalized delta → double spread
   delta_widen_multiplier: number; // spread multiplier in delta_wide zone
-  merge_enabled?: boolean;
 }
 
 const DEFAULT_PARAMS: EnhancedMakerParams = {
@@ -210,7 +209,6 @@ const DEFAULT_PARAMS: EnhancedMakerParams = {
   delta_pause_threshold: 5.0,
   delta_widen_threshold: 3.0,
   delta_widen_multiplier: 2.0,
-  merge_enabled: true,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -717,14 +715,6 @@ class EnhancedMakerStrategy implements Strategy {
         if (w.downBidOrderId) {
           const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
           if (r.cleared) { if (r.fill) this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price, params); w.downBidOrderId = null; }
-        }
-        // Merge matched pairs during wind-down — free capital before resolution
-        if (params.merge_enabled !== false) {
-          const mergeResult = await tryMerge(ctx, w);
-          if (mergeResult) {
-            w.realizedSellPnl += mergeResult.pnl;
-            this.custom.totalPnl = (this.custom.totalPnl as number || 0) + mergeResult.pnl;
-          }
         }
         await this.sellLosingInventory(ctx, w, params, "WIND DOWN");
         {

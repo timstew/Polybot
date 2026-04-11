@@ -52,6 +52,7 @@ import {
   emptyState,
   buildProtectedConfig,
 } from "./strategy-core";
+import { tryMerge, type MergeableWindow } from "./strategies/merge";
 
 // ── Strategy Registration (DO-specific dynamic imports) ─────────────
 
@@ -73,6 +74,8 @@ async function ensureRegistered(): Promise<void> {
   await import("./strategies/enhanced-maker");
   await import("./strategies/orchestrator");
   await import("./strategies/scaling-safe-maker");
+  await import("./strategies/bonestar");
+  await import("./strategies/babyboner");
 }
 
 // ── StrategyDO (Durable Object) ─────────────────────────────────────
@@ -610,6 +613,11 @@ export class StrategyDO implements DurableObject {
 
       try {
         await this.strategy.tick(ctx);
+
+        // Auto-merge: any profitable pairs (cost < $1.00) across all active windows.
+        // This is free money — merging locks in profit and frees capital immediately.
+        await this.autoMergeProfitablePairs(ctx);
+
         this.state.ticks++;
         const now = Date.now();
         // Accumulate wall-clock runtime, counting gaps up to 10 min
@@ -976,6 +984,36 @@ export class StrategyDO implements DurableObject {
       duration_ms: result.duration_ms,
       tx_hash: result.tx_hash,
     });
+  }
+
+  /**
+   * Auto-merge profitable pairs across all active windows.
+   * Called every tick after strategy.tick(). Any matched pair with cost < $1.00
+   * is guaranteed profit — merging immediately frees capital.
+   */
+  private async autoMergeProfitablePairs(ctx: StrategyContext): Promise<void> {
+    const custom = this.state.custom as Record<string, unknown> | undefined;
+    const windows = custom?.activeWindows as Array<MergeableWindow & Record<string, unknown>> | undefined;
+    if (!windows) return;
+
+    for (const w of windows) {
+      if (!w.upInventory || !w.downInventory) continue;
+      if (w.upAvgCost + w.downAvgCost >= 1.0) continue;
+
+      try {
+        const result = await tryMerge(ctx, w);
+        if (result) {
+          // Credit per-window P&L so resolution accounting stays accurate.
+          // Strategies use different field names for realized P&L:
+          if (typeof w.realizedSellPnl === "number") w.realizedSellPnl += result.pnl;
+          if (typeof w.realizedPnl === "number") w.realizedPnl += result.pnl;
+          this.addLog(
+            `AUTO-MERGE: ${result.merged} pairs @ pc=${result.pairCost.toFixed(4)} → +$${result.pnl.toFixed(2)}`,
+            { level: "trade" },
+          );
+        }
+      } catch { /* non-critical */ }
+    }
   }
 
   private async persistState(): Promise<void> {

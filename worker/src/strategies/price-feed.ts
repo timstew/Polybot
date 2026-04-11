@@ -43,6 +43,9 @@ export interface WindowSignal {
   // Order flow (when WebSocket enabled)
   orderFlowImbalance: number; // -1 to +1: net buy/sell pressure
   orderFlowAvailable: boolean;
+  // Oracle
+  oracleSpot?: number;       // Chainlink spot price if available
+  oracleAvailable: boolean;  // whether oracle was used for this signal
   // Hysteresis
   rawDirection: "UP" | "DOWN"; // direction before dead zone filtering
   inDeadZone: boolean; // true when |priceChangePct| < dead zone threshold
@@ -185,8 +188,22 @@ export function computeSignal(
   priceHistory: PriceSnapshot[],
   options?: ComputeSignalOptions
 ): WindowSignal {
+  // Oracle-aware: use Chainlink spot for magnitude if available (zero basis risk)
+  let oracleSpot: number | undefined;
+  let oracleAvailable = false;
+  try {
+    const { getOracleSpot } = require("./oracle-feed") as typeof import("./oracle-feed");
+    const oracleTick = getOracleSpot(symbol);
+    if (oracleTick) {
+      oracleSpot = oracleTick.price;
+      oracleAvailable = true;
+    }
+  } catch { /* oracle-feed not available */ }
+
+  // For direction/magnitude: use oracle spot if available (settlement reference)
+  const effectiveCurrentPrice = oracleSpot ?? currentPrice;
   const priceChangePct =
-    ((currentPrice - windowOpenPrice) / windowOpenPrice) * 100;
+    ((effectiveCurrentPrice - windowOpenPrice) / windowOpenPrice) * 100;
   const threshold = SIGNAL_THRESHOLDS[symbol] ?? 0.15;
   const elapsedSec = Math.max(1, elapsedMs / 1000);
   const velocity = priceChangePct / elapsedSec;
@@ -359,6 +376,8 @@ export function computeSignal(
     confidenceMultiplier,
     orderFlowImbalance: flow.imbalance10s,
     orderFlowAvailable: flow.available,
+    oracleSpot,
+    oracleAvailable,
     rawDirection,
     inDeadZone,
   };
@@ -558,6 +577,8 @@ export interface MarketResolution {
 /**
  * Check if a Polymarket market has resolved and what the outcome was.
  * Fetches from Gamma API by slug, checks outcomePrices to determine winner.
+ * Falls back to /events endpoint when /markets returns no results (needed for
+ * newer slug formats like "btc-updown-5m-*" which disappear from /markets on close).
  */
 export async function checkMarketResolution(
   slug: string,
@@ -565,41 +586,61 @@ export async function checkMarketResolution(
   downTokenId: string
 ): Promise<MarketResolution> {
   const empty: MarketResolution = { closed: false, outcome: null, outcomePrices: [] };
-  try {
-    const resp = await fetch(
-      `https://gamma-api.polymarket.com/markets?slug=${slug}`
-    );
-    if (!resp.ok) return empty;
-    const markets = (await resp.json()) as Array<{
-      closed: boolean;
-      outcomePrices: string;
-      outcomes: string;
-      clobTokenIds: string;
-    }>;
-    if (markets.length === 0) return empty;
-    const m = markets[0];
-    if (!m.closed) return { closed: false, outcome: null, outcomePrices: [] };
 
+  function parseResolution(m: { closed: boolean; outcomePrices: string; clobTokenIds: string }): MarketResolution {
+    if (!m.closed) return { closed: false, outcome: null, outcomePrices: [] };
     const prices = JSON.parse(m.outcomePrices || "[]") as number[];
     const tokens = JSON.parse(m.clobTokenIds || "[]") as string[];
     if (prices.length < 2 || tokens.length < 2) {
       return { closed: true, outcome: null, outcomePrices: prices };
     }
-
     const upIdx = tokens.indexOf(upTokenId);
     const downIdx = tokens.indexOf(downTokenId);
     if (upIdx === -1 || downIdx === -1) {
       return { closed: true, outcome: null, outcomePrices: prices };
     }
-
     const upPrice = prices[upIdx];
     const downPrice = prices[downIdx];
-
     let outcome: "UP" | "DOWN" | null = null;
     if (upPrice >= 0.99) outcome = "UP";
     else if (downPrice >= 0.99) outcome = "DOWN";
-
     return { closed: true, outcome, outcomePrices: [upPrice, downPrice] };
+  }
+
+  try {
+    // 1. Try /markets?slug= (works for most markets)
+    const resp = await fetch(
+      `https://gamma-api.polymarket.com/markets?slug=${slug}`
+    );
+    if (resp.ok) {
+      const markets = (await resp.json()) as Array<{
+        closed: boolean;
+        outcomePrices: string;
+        outcomes: string;
+        clobTokenIds: string;
+      }>;
+      if (markets.length > 0) return parseResolution(markets[0]);
+    }
+
+    // 2. Fallback: /events?slug= (needed for btc-updown-5m-* slugs that vanish from /markets on close)
+    const evResp = await fetch(
+      `https://gamma-api.polymarket.com/events?slug=${slug}`
+    );
+    if (!evResp.ok) return empty;
+    const events = (await evResp.json()) as Array<{
+      markets: Array<{
+        slug: string;
+        closed: boolean;
+        outcomePrices: string;
+        clobTokenIds: string;
+      }>;
+    }>;
+    for (const ev of events) {
+      for (const m of ev.markets || []) {
+        if (m.slug === slug) return parseResolution(m);
+      }
+    }
+    return empty;
   } catch {
     return empty;
   }

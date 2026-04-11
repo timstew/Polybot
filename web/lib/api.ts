@@ -634,6 +634,14 @@ export const api = {
         ? `/api/strategy/trades/${configId}`
         : "/api/strategy/trades"
     ),
+  strategyChartData: (configId: string, since?: number, until?: number, maxPoints?: number) => {
+    const params = new URLSearchParams();
+    if (since) params.set("since", String(since));
+    if (until) params.set("until", String(until));
+    if (maxPoints) params.set("max_points", String(maxPoints));
+    const qs = params.toString();
+    return fetchJSON<StrategyChartData>(`/api/strategy/chart-data/${configId}${qs ? `?${qs}` : ""}`);
+  },
 };
 
 // ── Orchestrator types ──────────────────────────────────────────────
@@ -725,4 +733,54 @@ export interface StrategyTrade {
   fee_amount: number;
   timestamp: string;
   pnl: number;
+}
+
+export interface ChartPnlPoint {
+  t: number;
+  cumulative_pnl: number;
+  trade_pnl: number;
+  symbol: string;
+  window_duration_ms: number;
+}
+
+export interface ChartTickPoint {
+  t: number;
+  price: number;
+  symbol: string;
+  window_duration_ms: number;
+  signal_strength: number;
+  signal_direction: string;
+  regime: string;
+  unique_wallets: number;
+  total_volume: number;
+  fair_up: number;
+  fair_down: number;
+  up_inventory: number;
+  down_inventory: number;
+  up_avg_cost: number;
+  down_avg_cost: number;
+  book_strength: number;
+  up_volume: number;
+  down_volume: number;
+}
+
+export interface ChartBookLevel {
+  price: number;
+  size: number;
+  token_id: string;
+}
+
+export interface ChartWindowBand {
+  open_time: number;
+  end_time: number;
+  symbol: string;
+  duration_ms: number;
+  outcome: string | null;
+}
+
+export interface StrategyChartData {
+  pnl_series: ChartPnlPoint[];
+  tick_series: ChartTickPoint[];
+  book_depth: ChartBookLevel[];
+  windows: ChartWindowBand[];
 }

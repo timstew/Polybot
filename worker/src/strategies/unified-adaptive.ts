@@ -29,7 +29,7 @@ import {
   disableOrderFlow,
   CRYPTO_SYMBOL_MAP,
 } from "./price-feed";
-import { tryMerge } from "./merge";
+
 
 // ── Interfaces ────────────────────────────────────────────────────────
 
@@ -86,7 +86,6 @@ interface UnifiedParams {
   upgrade_after_ticks: number;       // min ticks before considering upgrade
   upgrade_signal_threshold: number;  // signal strength needed to upgrade
   grounded_fills: boolean; // use trade tape instead of probabilistic model (default true)
-  merge_enabled?: boolean;
 }
 
 const DEFAULT_PARAMS: UnifiedParams = {
@@ -122,7 +121,6 @@ const DEFAULT_PARAMS: UnifiedParams = {
   upgrade_after_ticks: 3,
   upgrade_signal_threshold: 0.55,
   grounded_fills: true,
-  merge_enabled: true,
 };
 
 interface AdaptiveState {
@@ -895,14 +893,6 @@ class UnifiedAdaptiveStrategy implements Strategy {
       if (timeToEnd < stopQuotingMs) {
         if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "UP", r.fill.size, r.fill.price); w.upBidOrderId = null; } }
         if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) await this.recordFillFromCancel(ctx, w, "DOWN", r.fill.size, r.fill.price); w.downBidOrderId = null; } }
-        // Merge matched pairs during wind-down — free capital before resolution
-        if (params.merge_enabled !== false) {
-          const mergeResult = await tryMerge(ctx, w);
-          if (mergeResult) {
-            w.realizedSellPnl += mergeResult.pnl;
-            this.custom.stats.totalPnl = (this.custom.stats.totalPnl || 0) + mergeResult.pnl;
-          }
-        }
         if (w.mode === "sniper") {
           if (ctx.config.mode !== "real") await this.sniperSellExcess(ctx, w, params, "WIND DOWN");
         } else {
