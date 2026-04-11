@@ -843,13 +843,16 @@ class BabyBoneRStrategy implements Strategy {
       for (const side of ["UP", "DOWN"] as const) {
         const bid = side === "UP" ? upBid : dnBid;
         const inv = side === "UP" ? w.upInventory : w.dnInventory;
-        if (bid <= 0 || inv >= params.max_inventory_per_side || w.totalBuyCost >= params.max_total_cost) continue;
+        if (bid <= 0 || inv >= params.max_inventory_per_side || w.totalBuyCost >= params.max_total_cost) {
+          if (bid > 0) ctx.log(`TAKER ${side} blocked: inv=${inv}/${params.max_inventory_per_side} cost=$${w.totalBuyCost.toFixed(0)}/${params.max_total_cost}`);
+          continue;
+        }
 
         try {
           const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
           const book = await this.getBookCached(ctx, tokenId);
           const ask = this.getBestAsk(book);
-          if (ask === null) continue;
+          if (ask === null) { ctx.log(`TAKER ${side} no asks in book`); continue; }
 
           // Take asks up to taker_max_price on BOTH sides.
           // Bonereaper buys both sides aggressively — winning side at ~$0.89,
@@ -863,7 +866,11 @@ class BabyBoneRStrategy implements Strategy {
               const fillPrice = result.price || ask;
               this.recordBuyFill(ctx, w, side, result.size, fillPrice, "taker", true);
               await this.persistTradeToD1(ctx, w, side, "BUY", fillPrice, result.size, 0, "taker");
+            } else {
+              ctx.log(`TAKER ${side} miss: ask=$${ask.toFixed(2)} max=$${params.taker_max_price} result=${result.status}`);
             }
+          } else {
+            ctx.log(`TAKER ${side} skip: ask=$${ask.toFixed(2)} > max=$${params.taker_max_price}`);
           }
         } catch { /* best-effort */ }
       }
