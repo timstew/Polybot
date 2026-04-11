@@ -66,6 +66,7 @@ export interface BabyBoneRParams {
   maker_bid_size: number;      // GTC resting bid size
   taker_bid_size: number;      // FOK taker order size
   taker_ask_discount: number;  // only take if ask <= our bid - discount
+  taker_max_price: number;     // max price to pay for winning-side taker (Bonereaper pays ~$0.89)
 
   // Exit mode
   merge_exit: boolean;           // true = hold to resolution, merge/redeem (Bonereaper-style)
@@ -109,16 +110,17 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: P_true-proportional with vol floor moderation
-  // Bonereaper buys winning @$0.79-$0.89, losing @$0.11-$0.23, PC~$1.00
-  // No p_floor/p_ceil compression — vol floor (0.20%) keeps P_true moderate.
-  target_pair_cost: 0.98,
+  // Pricing: P_true drives bids directly. Winning ~$0.80, losing ~$0.20, PC=$1.00.
+  // Vol floor (0.20%) keeps P_true moderate. Taker overpays on winning (up to $0.92),
+  // so avg winning cost ~$0.86-$0.90 like Bonereaper.
+  target_pair_cost: 1.00,
   p_floor: 0.01,              // effectively disabled — vol floor handles moderation
   p_ceil: 0.99,               // effectively disabled
 
   maker_bid_size: 50,          // Bonereaper: 3-220 per fill, median 26, mean 45
   taker_bid_size: 25,          // aggressive taker for missing side
   taker_ask_discount: 0.02,    // legacy param, taker now takes at bid price
+  taker_max_price: 0.92,       // Bonereaper pays up to ~$0.89 on winning side
 
   merge_exit: true,             // Bonereaper-style: hold to resolution, merge/redeem
 
@@ -834,7 +836,10 @@ class BabyBoneRStrategy implements Strategy {
       await this.updateBid(ctx, w, "UP", upBid, params.maker_bid_size, params);
       await this.updateBid(ctx, w, "DOWN", dnBid, params.maker_bid_size, params);
 
-      // ── Taker: hit asks at or below our bid (Bonereaper does ~100 taker trades per 2hr) ──
+      // ── Taker: aggressively hit asks (Bonereaper does ~100 taker trades per 2hr) ──
+      // Bonereaper buys winning side at $0.89 where asks are $0.85-$0.90 — they overpay
+      // vs P_true but profit because winning resolves at $1.00. Take asks up to P_true
+      // (winning side) or up to our losing-side bid price (losing side).
       for (const side of ["UP", "DOWN"] as const) {
         const bid = side === "UP" ? upBid : dnBid;
         const inv = side === "UP" ? w.upInventory : w.dnInventory;
@@ -844,8 +849,14 @@ class BabyBoneRStrategy implements Strategy {
           const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
           const book = await this.getBookCached(ctx, tokenId);
           const ask = this.getBestAsk(book);
-          // Take any ask at or below our bid price (no discount — be aggressive like Bonereaper)
-          if (ask !== null && ask <= bid) {
+          if (ask === null) continue;
+
+          // Winning side: take asks up to taker_max_price (Bonereaper pays ~$0.89)
+          // Losing side: take asks up to our bid price (cheap accumulation)
+          const sideP = side === "UP" ? pCapped : (1 - pCapped);
+          const isWinningSide = sideP > 0.50;
+          const maxTakePrice = isWinningSide ? params.taker_max_price : bid;
+          if (ask <= maxTakePrice) {
             const result = await ctx.api.placeOrder({
               token_id: tokenId, side: "BUY",
               size: params.taker_bid_size, price: ask,
