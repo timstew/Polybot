@@ -710,7 +710,11 @@ class BabyBoneRStrategy implements Strategy {
         continue; // no price data
       }
 
-      const vol = estimateVolatility5min(history);
+      // Volatility floor: realized vol drops to ~0.01% in calm BTC periods, making
+      // the CDF model overreact to $14 moves (P_true=0.25 instead of 0.50).
+      // Bonereaper treats near-strike as ~50/50 — requires vol >= 0.20%.
+      const rawVol = estimateVolatility5min(history);
+      const vol = Math.max(rawVol, 0.20); // floor at 0.20% 5-min vol
       const timeRemaining = w.windowEndTime - now;
       const pTrue = calculatePTrue(currentPrice, effectiveStrike, "above", timeRemaining, vol);
       const upWinning = pTrue > 0.50;
