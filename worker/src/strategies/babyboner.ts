@@ -106,16 +106,16 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: P_true-proportional (Bonereaper avg pair cost ~$0.997)
-  // Bonereaper winning-side bids: $0.54-$0.94, losing-side: $0.05-$0.49
-  // Must be aggressive enough to cross winning-side asks ($0.91-$0.95)
-  target_pair_cost: 0.99,
-  p_floor: 0.05,              // never bid below 5% probability → $0.05 min
-  p_ceil: 0.95,               // never bid above 95% probability → $0.94 max
+  // Pricing: P_true-proportional (Bonereaper avg pair cost ~$1.00)
+  // Bonereaper winning-side bids: up to $0.99, losing-side: $0.16
+  // Pair cost often slightly above $1.00 — profit from volume + merge
+  target_pair_cost: 1.00,      // Bonereaper avg pair cost ~$1.00
+  p_floor: 0.15,              // Bonereaper losing bids ~$0.16
+  p_ceil: 0.99,               // Bonereaper winning bids up to $0.99
 
-  maker_bid_size: 25,          // Bonereaper median fill: 26 tokens
-  taker_bid_size: 10,          // FOK taker size
-  taker_ask_discount: 0.02,    // take if ask is 2c below our bid
+  maker_bid_size: 50,          // Bonereaper: 3-220 per fill, median 26, mean 45
+  taker_bid_size: 25,          // aggressive taker for missing side
+  taker_ask_discount: 0.02,    // legacy param, taker now takes at bid price
 
   merge_exit: true,             // Bonereaper-style: hold to resolution, merge/redeem
 
