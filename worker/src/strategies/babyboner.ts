@@ -88,6 +88,9 @@ export interface BabyBoneRParams {
   max_skew_ratio: number;        // 0.75 = pause heavy side when ratio exceeds 75/25
   skew_guard_min_tokens: number; // min total tokens before skew guard activates
 
+  // Market price guard — don't bid on sides the market values as near-worthless
+  min_ask_to_bid: number;        // skip bidding when best ask < this (default 0.25)
+
   // Requote timing
   requote_interval_ms: number;   // min ms between requotes
   p_true_min_conviction: number; // don't trade when P_true near 0.50
@@ -129,10 +132,11 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   fire_sale_seconds: 30,
   fire_sale_min_price: 0.03,
 
-  max_inventory_per_side: 5000,  // Bonereaper goes 5050 tokens one-sided
-  max_total_cost: 2000,          // Bonereaper deploys ~$830-$5000/window
-  max_skew_ratio: 1.0,           // DISABLED — Bonereaper never stops bidding due to skew
-  skew_guard_min_tokens: 99999,  // effectively disabled
+  max_inventory_per_side: 800,   // Bonereaper: ~500-600 per side per window
+  max_total_cost: 600,           // Bonereaper: ~$500-$600/window
+  max_skew_ratio: 0.75,          // pause heavy side at 75/25 skew
+  skew_guard_min_tokens: 100,    // activate after 100 tokens accumulated
+  min_ask_to_bid: 0.25,          // don't bid when market values side < $0.25
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
@@ -809,7 +813,7 @@ class BabyBoneRStrategy implements Strategy {
         // Skew factor: 0 when balanced, positive toward light side
         // Scale bid by (1 + skew_shade * imbalance) on light side
         // and (1 - skew_shade * imbalance) on heavy side
-        const skewShade = 0.30;  // 30% max bid adjustment for skew
+        const skewShade = 0.50;  // 50% max bid adjustment for skew (stronger to match Bonereaper 49/51)
         const imbalance = Math.abs(upShare - 0.5) * 2;  // 0 = balanced, 1 = fully skewed
         if (upShare < 0.5) {
           // UP is light → boost UP bid, reduce DN bid
@@ -839,6 +843,25 @@ class BabyBoneRStrategy implements Strategy {
 
       upBid = upBid > 0 ? Math.max(0.01, upBid) : 0;
       dnBid = dnBid > 0 ? Math.max(0.01, dnBid) : 0;
+
+      // ── Market price guard ───────────────────────────────────────
+      // Don't bid on a side the market values as near-worthless.
+      // When UP is winning, DN asks drop to $0.05-$0.15 — our $0.39 bid would
+      // cross the ask and flood inventory with cheap losing tokens.
+      // Bonereaper fills at ~$0.50 on BOTH sides — they don't accumulate near-worthless tokens.
+      for (const side of ["UP", "DOWN"] as const) {
+        const bid = side === "UP" ? upBid : dnBid;
+        if (bid <= 0) continue;
+        try {
+          const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
+          const book = await this.getBookCached(ctx, tokenId);
+          const bestAsk = this.getBestAsk(book);
+          if (bestAsk !== null && bestAsk < params.min_ask_to_bid) {
+            if (side === "UP") upBid = 0;
+            else dnBid = 0;
+          }
+        } catch { /* best effort */ }
+      }
 
       // ── Place/update GTC resting bids ─────────────────────────────
       await this.updateBid(ctx, w, "UP", upBid, params.maker_bid_size, params);
