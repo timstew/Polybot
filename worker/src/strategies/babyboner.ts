@@ -132,11 +132,11 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   fire_sale_seconds: 30,
   fire_sale_min_price: 0.03,
 
-  max_inventory_per_side: 800,   // Bonereaper: ~500-600 per side per window
-  max_total_cost: 600,           // Bonereaper: ~$500-$600/window
-  max_skew_ratio: 0.65,          // pause heavy side at 65/35 skew (tighter to match Bonereaper 49/51)
-  skew_guard_min_tokens: 50,     // activate after 50 tokens accumulated
-  min_ask_to_bid: 0.35,          // don't bid when market values side < $0.35
+  max_inventory_per_side: 3000,  // Bonereaper goes 5000+ on winning side
+  max_total_cost: 3000,          // Bonereaper deploys $5000+/window
+  max_skew_ratio: 1.0,           // DISABLED — Bonereaper goes 97% one-sided when direction is clear
+  skew_guard_min_tokens: 99999,  // disabled — market price guard handles safety
+  min_ask_to_bid: 0.35,          // don't bid when market values side < $0.35 (prevents losing-side flooding)
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
@@ -803,28 +803,9 @@ class BabyBoneRStrategy implements Strategy {
       let upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
       let dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
 
-      // ── Inventory-aware bid shading (Bonereaper achieves 49/51 balance) ──
-      // Shade bids toward the lighter side to achieve balanced accumulation.
-      // When DN-heavy: boost UP bid, reduce DN bid. Vice versa.
-      const totalInv = w.upInventory + w.dnInventory;
-      if (totalInv > 0) {
-        const upShare = w.upInventory / totalInv;  // 0.0 to 1.0
-        const dnShare = w.dnInventory / totalInv;
-        // Skew factor: 0 when balanced, positive toward light side
-        // Scale bid by (1 + skew_shade * imbalance) on light side
-        // and (1 - skew_shade * imbalance) on heavy side
-        const skewShade = 0.15;  // 15% max bid adjustment (50% was too aggressive, pushed bids to $0.74)
-        const imbalance = Math.abs(upShare - 0.5) * 2;  // 0 = balanced, 1 = fully skewed
-        if (upShare < 0.5) {
-          // UP is light → boost UP bid, reduce DN bid
-          upBid = Math.round(upBid * (1 + skewShade * imbalance) * 100) / 100;
-          dnBid = Math.round(dnBid * (1 - skewShade * imbalance) * 100) / 100;
-        } else if (dnShare < 0.5) {
-          // DN is light → boost DN bid, reduce UP bid
-          dnBid = Math.round(dnBid * (1 + skewShade * imbalance) * 100) / 100;
-          upBid = Math.round(upBid * (1 - skewShade * imbalance) * 100) / 100;
-        }
-      }
+      // NOTE: No bid shading. Bonereaper goes 97% one-sided when direction is clear
+      // (DN 5188@$0.985 vs UP 176@$0.148 in one window). Balance is an average across
+      // windows, not enforced within windows. The market price guard handles safety.
 
       // Inventory suppression — hard caps
       if (w.upInventory >= params.max_inventory_per_side) upBid = 0;
