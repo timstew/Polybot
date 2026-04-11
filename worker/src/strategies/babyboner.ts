@@ -145,7 +145,7 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   min_ask_to_bid: 0.01,          // effectively disabled — Bonereaper buys losing side at $0.11
 
   seed_seconds: 45,              // first 45s: bid $0.50 on both sides to seed inventory
-  seed_bid_price: 0.50,          // aggressive bid during seeding (crosses asks near open)
+  seed_bid_price: 0.55,          // aggressive bid during seeding (crosses asks that sit above $0.50)
   seed_min_tokens: 300,          // seed until at least 300 tokens per side
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
@@ -821,13 +821,27 @@ class BabyBoneRStrategy implements Strategy {
 
       // ── Compute P_true pricing ──────────────────────────────────────
       const pCapped = clamp(pTrue, params.p_floor, params.p_ceil);
-      let upBid: number;
-      let dnBid: number;
+      let upBid = 0;
+      let dnBid = 0;
 
       if (inSeedPhase) {
-        // Seed phase: bid at fixed price on both sides to ensure both-sided fills
-        upBid = needsSeedUp ? params.seed_bid_price : 0;
-        dnBid = needsSeedDn ? params.seed_bid_price : 0;
+        // Seed phase: bid at best ask to guarantee crossing → fills.
+        // Fall back to seed_bid_price if no book data.
+        for (const side of ["UP", "DOWN"] as const) {
+          const need = side === "UP" ? needsSeedUp : needsSeedDn;
+          if (!need) { if (side === "UP") upBid = 0; else dnBid = 0; continue; }
+          let seedPrice = params.seed_bid_price;
+          try {
+            const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
+            const book = await this.getBookCached(ctx, tokenId);
+            const bestAsk = this.getBestAsk(book);
+            if (bestAsk !== null && bestAsk <= params.taker_max_price) {
+              seedPrice = bestAsk; // bid at ask → guaranteed cross
+            }
+          } catch { /* use default */ }
+          if (side === "UP") upBid = seedPrice;
+          else dnBid = seedPrice;
+        }
       } else {
         // Normal phase: fixed-offset pricing like Bonereaper.
         // Winning ~$0.72, Losing ~$0.28. PC = $1.00.
