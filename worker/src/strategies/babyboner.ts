@@ -136,7 +136,7 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   max_total_cost: 600,           // Bonereaper: ~$500-$600/window
   max_skew_ratio: 0.75,          // pause heavy side at 75/25 skew
   skew_guard_min_tokens: 100,    // activate after 100 tokens accumulated
-  min_ask_to_bid: 0.25,          // don't bid when market values side < $0.25
+  min_ask_to_bid: 0.35,          // don't bid when market values side < $0.35
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
@@ -850,15 +850,27 @@ class BabyBoneRStrategy implements Strategy {
       // cross the ask and flood inventory with cheap losing tokens.
       // Bonereaper fills at ~$0.50 on BOTH sides — they don't accumulate near-worthless tokens.
       for (const side of ["UP", "DOWN"] as const) {
-        const bid = side === "UP" ? upBid : dnBid;
+        let bid = side === "UP" ? upBid : dnBid;
         if (bid <= 0) continue;
         try {
           const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
           const book = await this.getBookCached(ctx, tokenId);
           const bestAsk = this.getBestAsk(book);
-          if (bestAsk !== null && bestAsk < params.min_ask_to_bid) {
-            if (side === "UP") upBid = 0;
-            else dnBid = 0;
+          if (bestAsk !== null) {
+            // Guard 1: skip sides the market values as near-worthless
+            if (bestAsk < params.min_ask_to_bid) {
+              if (side === "UP") upBid = 0;
+              else dnBid = 0;
+              continue;
+            }
+            // Guard 2: cap bid at best_ask - 0.01 to be a true resting maker
+            // Bonereaper fills at ~$0.50 on both sides = resting maker, never crosses spread
+            if (bid > bestAsk) {
+              bid = Math.round((bestAsk - 0.01) * 100) / 100;
+              if (bid <= 0) bid = 0;
+              if (side === "UP") upBid = bid;
+              else dnBid = bid;
+            }
           }
         } catch { /* best effort */ }
       }
