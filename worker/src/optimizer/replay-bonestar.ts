@@ -432,10 +432,13 @@ export function replayBoneStarWindow(
         }
       }
 
-      // Paired base check: limit sweep until enough paired inventory
+      // Paired base check: limit or stop sweep when insufficient paired inventory
       if (newSweepSize > 0) {
         const pairedCount = Math.min(upInventory, downInventory);
-        if (pairedCount < p.sweep_require_paired_base) {
+        const sweepSideInv = sweepSide === "UP" ? upInventory : downInventory;
+        if (pairedCount === 0 && sweepSideInv >= p.base_bid_size) {
+          newSweepSize = 0;
+        } else if (pairedCount < p.sweep_require_paired_base) {
           newSweepSize = Math.min(newSweepSize, p.sweep_min_size);
         }
       }
@@ -485,6 +488,9 @@ export function replayBoneStarWindow(
       const unpaired = Math.max(0, actualWinningInv - actualLosingInv);
       if (!actualUpWinning && unpaired === 0) upSize = 0;
       if (actualUpWinning && unpaired === 0) dnSize = 0;
+      // One-sided guard: pause winning-side bids when no paired inventory
+      if (upInventory >= p.base_bid_size && downInventory === 0) upSize = 0;
+      if (downInventory >= p.base_bid_size && upInventory === 0) dnSize = 0;
       if (upInventory >= p.max_inventory_per_side) upSize = 0;
       if (downInventory >= p.max_inventory_per_side) dnSize = 0;
 

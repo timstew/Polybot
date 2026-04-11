@@ -1150,10 +1150,14 @@ class BoneStarStrategy implements Strategy {
       }
     }
 
-    // Paired base check: limit sweep until enough paired inventory
+    // Paired base check: limit or stop sweep when insufficient paired inventory
     if (sweepSize > 0) {
       const pairedCount = Math.min(w.upInventory, w.downInventory);
-      if (pairedCount < params.sweep_require_paired_base) {
+      const sweepSideInv = sweepSide === "UP" ? w.upInventory : w.downInventory;
+      if (pairedCount === 0 && sweepSideInv >= params.base_bid_size) {
+        // Already one-sided — don't pile on more via sweep
+        sweepSize = 0;
+      } else if (pairedCount < params.sweep_require_paired_base) {
         sweepSize = Math.min(sweepSize, params.sweep_min_size);
       }
     }
@@ -1197,13 +1201,15 @@ class BoneStarStrategy implements Strategy {
     dnBid = Math.max(0.01, dnBid);
 
     // Inventory guards — use actual P_true direction for "winning" side
-    const actualWinningSide = actualUpWinning ? "UP" : "DOWN";
     const actualWinningInv = actualUpWinning ? w.upInventory : w.downInventory;
     const actualLosingInv = actualUpWinning ? w.downInventory : w.upInventory;
     // Losing side: only buy enough to pair with winning side inventory
     const unpaired = Math.max(0, actualWinningInv - actualLosingInv);
     if (!actualUpWinning && unpaired === 0) upSize = 0; // UP is losing, fully paired
     if (actualUpWinning && unpaired === 0) dnSize = 0;  // DOWN is losing, fully paired
+    // One-sided guard: pause winning-side bids when no paired inventory
+    if (w.upInventory >= params.base_bid_size && w.downInventory === 0) upSize = 0;
+    if (w.downInventory >= params.base_bid_size && w.upInventory === 0) dnSize = 0;
     // Cap both sides at absolute max
     if (w.upInventory >= params.max_inventory_per_side) upSize = 0;
     if (w.downInventory >= params.max_inventory_per_side) dnSize = 0;
