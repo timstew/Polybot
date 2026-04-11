@@ -851,12 +851,10 @@ class BabyBoneRStrategy implements Strategy {
           const ask = this.getBestAsk(book);
           if (ask === null) continue;
 
-          // Winning side: take asks up to taker_max_price (Bonereaper pays ~$0.89)
-          // Losing side: take asks up to our bid price (cheap accumulation)
-          const sideP = side === "UP" ? pCapped : (1 - pCapped);
-          const isWinningSide = sideP > 0.50;
-          const maxTakePrice = isWinningSide ? params.taker_max_price : bid;
-          if (ask <= maxTakePrice) {
+          // Take asks up to taker_max_price on BOTH sides.
+          // Bonereaper buys both sides aggressively — winning side at ~$0.89,
+          // losing side at $0.11-$0.45. They profit from paired inventory.
+          if (ask <= params.taker_max_price) {
             const result = await ctx.api.placeOrder({
               token_id: tokenId, side: "BUY",
               size: params.taker_bid_size, price: ask,
