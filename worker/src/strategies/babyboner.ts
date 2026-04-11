@@ -135,7 +135,7 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   max_total_cost: 3000,          // Bonereaper deploys $5000+/window
   max_skew_ratio: 1.0,           // DISABLED — Bonereaper goes 97% one-sided when direction is clear
   skew_guard_min_tokens: 99999,  // disabled — market price guard handles safety
-  min_ask_to_bid: 0.40,          // don't bid when market values side < $0.40 (prevents losing-side flooding)
+  min_ask_to_bid: 0.30,          // don't bid when market values side < $0.30 (allow losing-side at $0.30-$0.40)
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
