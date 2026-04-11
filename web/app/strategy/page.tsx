@@ -898,6 +898,8 @@ function StrategyDetail({
     rebalanceSold?: boolean;
     binancePrediction?: "UP" | "DOWN" | null;
     tickAction?: string;
+    peakUpInventory?: number; peakDownInventory?: number;
+    totalMerged?: number; totalMergePnl?: number;
   }>) ?? [];
   const activeWindows = allActiveWindows.filter(w => w.windowEndTime > Date.now());
   const resolvingWindows = allActiveWindows.filter(w => w.windowEndTime <= Date.now());
@@ -1683,9 +1685,16 @@ function StrategyDetail({
           <WindowSection
             sectionTip="Binary prediction windows currently being traded. Each window is a crypto up-or-down market with a fixed time range"
             active={activeWindows.map((w, i) => {
-              const up = w.upInventory ?? 0;
-              const dn = w.downInventory ?? 0;
-              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+              // Use peak inventory when current is 0 (auto-merge recycled everything)
+              const rawUp = w.upInventory ?? 0;
+              const rawDn = w.downInventory ?? 0;
+              const peakUp = w.peakUpInventory ?? 0;
+              const peakDn = w.peakDownInventory ?? 0;
+              const up = (rawUp === 0 && rawDn === 0 && (peakUp > 0 || peakDn > 0)) ? peakUp : rawUp;
+              const dn = (rawUp === 0 && rawDn === 0 && (peakUp > 0 || peakDn > 0)) ? peakDn : rawDn;
+              const pairCost = (rawUp > 0 && rawDn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0)
+                : (w.totalMerged ?? 0) > 0 && (w.totalBuyCost ?? 0) > 0 ? (w.totalBuyCost ?? 0) / (w.totalMerged ?? 1)
+                : null;
               const phase = w.phase || "active";
               return (
                 <ActiveWindowRow key={i}
@@ -1712,9 +1721,10 @@ function StrategyDetail({
                     )}
                   </>}
                   up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
-                  scale={w.upBidSize ?? w.downBidSize ?? w.bidSize ?? 30} pairCost={pairCost}
+                  scale={w.upBidSize ?? w.downBidSize ?? w.bidSize ?? Math.max(up + dn, 30)} pairCost={pairCost}
                   upBidActive={!!w.upBidOrderId} dnBidActive={!!w.downBidOrderId}
                   fillCount={w.fillCount ?? 0}
+                  totalMerged={w.totalMerged} mergedPnl={w.totalMergePnl}
                   flipCount={w.flipCount} maxFlips={maxFlips}
                   tickAction={w.tickAction ? <TickAction text={w.tickAction} /> : undefined}
                   narrative={!w.tickAction ? windowNarrative({ ...w, fillCount: w.fillCount ?? 0, sellCount: w.sellCount ?? 0, upBidPrice: w.upBidPrice ?? 0, downBidPrice: w.downBidPrice ?? 0 }, { windingDown: isWindingDown }) : undefined}
