@@ -144,9 +144,9 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   skew_guard_min_tokens: 99999,  // disabled — market price guard handles safety
   min_ask_to_bid: 0.01,          // effectively disabled — Bonereaper buys losing side at $0.11
 
-  seed_seconds: 30,              // first 30s: bid $0.50 on both sides to seed inventory
+  seed_seconds: 45,              // first 45s: bid $0.50 on both sides to seed inventory
   seed_bid_price: 0.50,          // aggressive bid during seeding (crosses asks near open)
-  seed_min_tokens: 200,          // seed until at least 200 tokens per side
+  seed_min_tokens: 300,          // seed until at least 300 tokens per side
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
