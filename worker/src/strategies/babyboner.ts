@@ -55,9 +55,12 @@ import type { TickSnapshot, TapeBucket, TapeMeta } from "../optimizer/types";
 export interface BabyBoneRParams {
   target_cryptos: string[];
 
-  // Pricing — fixed offsets, 1 penny above Bonereaper to front-run
-  target_pair_cost: number;    // winning_bid + losing_bid target
-  winning_share: number;       // winning side gets this fraction of pair cost
+  // Pricing — P_true-proportional (matches Bonereaper's dynamic pricing)
+  // upBid = clamp(pTrue, p_floor, p_ceil) * target_pair_cost
+  // dnBid = clamp(1-pTrue, p_floor, p_ceil) * target_pair_cost
+  target_pair_cost: number;    // winning_bid + losing_bid target (~0.97)
+  p_floor: number;             // min probability used for pricing (0.05)
+  p_ceil: number;              // max probability used for pricing (0.92)
 
   // Bid sizing
   maker_bid_size: number;      // GTC resting bid size
@@ -82,7 +85,8 @@ export interface BabyBoneRParams {
   // Inventory limits
   max_inventory_per_side: number;
   max_total_cost: number;        // max $ committed per window
-  max_skew_ratio: number;        // 0.80 = pause heavy side when ratio exceeds 80/20
+  max_skew_ratio: number;        // 0.75 = pause heavy side when ratio exceeds 75/25
+  skew_guard_min_tokens: number; // min total tokens before skew guard activates
 
   // Requote timing
   requote_interval_ms: number;   // min ms between requotes
@@ -102,13 +106,15 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  target_pair_cost: 0.99,
-  winning_share: 0.72,
-  // → winning_bid = 0.99 * 0.72 ≈ $0.71, losing_bid = 0.99 * 0.28 ≈ $0.28
+  // Pricing: P_true-proportional (Bonereaper avg pair cost ~$0.97)
+  // Bonereaper winning-side bids: $0.54-$0.94, losing-side: $0.05-$0.49
+  target_pair_cost: 0.97,
+  p_floor: 0.05,              // never bid below 5% probability → $0.05 min
+  p_ceil: 0.92,               // never bid above 92% probability → $0.89 max
 
-  maker_bid_size: 15,
-  taker_bid_size: 5,
-  taker_ask_discount: 0.05,
+  maker_bid_size: 25,          // Bonereaper median fill: 26 tokens
+  taker_bid_size: 10,          // FOK taker size
+  taker_ask_discount: 0.02,    // take if ask is 2c below our bid
 
   merge_exit: true,             // Bonereaper-style: hold to resolution, merge/redeem
 
@@ -121,12 +127,13 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   fire_sale_seconds: 30,
   fire_sale_min_price: 0.03,
 
-  max_inventory_per_side: 500,
-  max_total_cost: 200,
-  max_skew_ratio: 0.80,          // pause heavy side at 80/20 split
+  max_inventory_per_side: 2000,  // Bonereaper accumulates 500-1600 per side
+  max_total_cost: 500,           // Bonereaper deploys ~$830/window avg
+  max_skew_ratio: 0.75,          // pause heavy side at 75/25 split
+  skew_guard_min_tokens: 50,     // don't activate until 50+ total tokens
 
-  requote_interval_ms: 3000,
-  p_true_min_conviction: 0.52,  // lowered: trade more aggressively near 50/50
+  requote_interval_ms: 2000,    // requote every 2s (match tick rate)
+  p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
 
   max_window_duration_ms: 15 * 60_000,
   observation_seconds: 3,
@@ -771,16 +778,6 @@ class BabyBoneRStrategy implements Strategy {
         continue;
       }
 
-      // ── Skip uncertain — P_true too close to 0.50 ────────────────
-      if (Math.abs(pTrue - 0.50) < (1 - params.p_true_min_conviction)) {
-        if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "UP", r.fill.size, r.fill.price, "uncertain", false); w.upBidOrderId = null; } }
-        if (w.dnBidOrderId) { const r = await safeCancelOrder(ctx.api, w.dnBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "uncertain", false); w.dnBidOrderId = null; } }
-        w.tickAction = `Uncertain: P_true=${pTrue.toFixed(3)}`;
-        this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
-        acknowledgePriceChange(w.cryptoSymbol);
-        continue;
-      }
-
       // ── Throttle requotes ─────────────────────────────────────────
       const priceChanged = hasPriceChanged(w.cryptoSymbol);
       const forceRequote = w.lastRequoteAt === 0; // first tick for this window
@@ -791,11 +788,13 @@ class BabyBoneRStrategy implements Strategy {
         continue;
       }
 
-      // ── Fixed-offset pricing ──────────────────────────────────────
-      const winBid = Math.round(params.target_pair_cost * params.winning_share * 100) / 100;
-      const loseBid = Math.round(params.target_pair_cost * (1 - params.winning_share) * 100) / 100;
-      let upBid = upWinning ? winBid : loseBid;
-      let dnBid = upWinning ? loseBid : winBid;
+      // ── P_true-proportional pricing (matches Bonereaper) ──────────
+      // Bonereaper dynamically prices based on probability:
+      //   winning bids $0.54-$0.94, losing bids $0.05-$0.49
+      // Cap P_true to avoid extreme bids (raw P_true often at 0.000 or 1.000)
+      const pCapped = clamp(pTrue, params.p_floor, params.p_ceil);
+      let upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
+      let dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
 
       // Pair cost guard: cap bid when opposite side already has inventory
       if (w.dnInventory > 0 && w.dnAvgCost > 0) upBid = Math.min(upBid, params.target_pair_cost - w.dnAvgCost);
@@ -807,8 +806,9 @@ class BabyBoneRStrategy implements Strategy {
       if (w.totalBuyCost >= params.max_total_cost) { upBid = 0; dnBid = 0; }
 
       // Skew guard — pause heavy side to force pairing
+      // Only activates after minimum tokens accumulated (avoids blocking on first fill)
       const totalInvTokens = w.upInventory + w.dnInventory;
-      if (totalInvTokens > 0 && params.max_skew_ratio < 1.0) {
+      if (totalInvTokens >= params.skew_guard_min_tokens && params.max_skew_ratio < 1.0) {
         const upRatio = w.upInventory / totalInvTokens;
         const dnRatio = w.dnInventory / totalInvTokens;
         if (upRatio > params.max_skew_ratio) upBid = 0;
@@ -896,11 +896,12 @@ class BabyBoneRStrategy implements Strategy {
       if (ctx.state.ticks % 5 === 0) {
         const pc = (w.upInventory > 0 && w.dnInventory > 0) ? (w.upAvgCost + w.dnAvgCost).toFixed(2) : "—";
         const skew = totalInvTokens > 0 ? `${Math.round(w.upInventory / totalInvTokens * 100)}/${Math.round(w.dnInventory / totalInvTokens * 100)}` : "—";
-        const skewGuarded = (totalInvTokens > 0 && params.max_skew_ratio < 1.0 &&
-          (w.upInventory / totalInvTokens > params.max_skew_ratio || w.dnInventory / totalInvTokens > params.max_skew_ratio))
+        const skewActive = totalInvTokens >= params.skew_guard_min_tokens && params.max_skew_ratio < 1.0;
+        const skewGuarded = skewActive &&
+          (w.upInventory / totalInvTokens > params.max_skew_ratio || w.dnInventory / totalInvTokens > params.max_skew_ratio)
           ? " [SKEW-GUARD]" : "";
         ctx.log(
-          `TICK: ${w.market.title.slice(0, 25)} P_true=${pTrue.toFixed(3)} spot=$${currentPrice.toFixed(0)} strike=$${effectiveStrike.toFixed(0)} inv=${w.upInventory}↑/${w.dnInventory}↓ skew=${skew}${skewGuarded} pc=${pc} fills=${w.fillCount}`,
+          `TICK: ${w.market.title.slice(0, 25)} P=${pCapped.toFixed(2)} spot=$${currentPrice.toFixed(0)} strike=$${effectiveStrike.toFixed(0)} bid=↑$${upBid.toFixed(2)}/↓$${dnBid.toFixed(2)} inv=${w.upInventory}↑/${w.dnInventory}↓ skew=${skew}${skewGuarded} pc=${pc} fills=${w.fillCount}`,
           { level: "signal", symbol: w.cryptoSymbol, signalStrength: pTrue, phase: "tick" },
         );
       }
