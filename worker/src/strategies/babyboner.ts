@@ -55,12 +55,12 @@ import type { TickSnapshot, TapeBucket, TapeMeta } from "../optimizer/types";
 export interface BabyBoneRParams {
   target_cryptos: string[];
 
-  // Pricing — P_true-proportional (matches Bonereaper's dynamic pricing)
-  // upBid = clamp(pTrue, p_floor, p_ceil) * target_pair_cost
-  // dnBid = clamp(1-pTrue, p_floor, p_ceil) * target_pair_cost
-  target_pair_cost: number;    // winning_bid + losing_bid target (~0.97)
-  p_floor: number;             // min probability used for pricing (0.05)
-  p_ceil: number;              // max probability used for pricing (0.92)
+  // Pricing — fixed-offset like Bonereaper (winning ~$0.72, losing ~$0.28)
+  // P_true only determines which side is winning, not the bid price.
+  target_pair_cost: number;    // winning_bid + losing_bid target ($1.00)
+  winning_share: number;       // winning side gets this share (0.72 = $0.72 of $1.00 pair cost)
+  p_floor: number;             // min P_true (for extreme filtering, effectively disabled)
+  p_ceil: number;              // max P_true (effectively disabled)
 
   // Bid sizing
   maker_bid_size: number;      // GTC resting bid size
@@ -115,10 +115,10 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: P_true drives bids directly. Winning ~$0.80, losing ~$0.20, PC=$1.00.
-  // Vol floor (0.20%) keeps P_true moderate. Taker overpays on winning (up to $0.92),
-  // so avg winning cost ~$0.86-$0.90 like Bonereaper.
+  // Pricing: fixed-offset like Bonereaper. Winning ~$0.72, losing ~$0.28, PC=$1.00.
+  // P_true only determines direction, not price level.
   target_pair_cost: 1.00,
+  winning_share: 0.72,          // Bonereaper avg winning-side cost ~$0.72
   p_floor: 0.01,              // effectively disabled — vol floor handles moderation
   p_ceil: 0.99,               // effectively disabled
 
@@ -829,9 +829,15 @@ class BabyBoneRStrategy implements Strategy {
         upBid = needsSeedUp ? params.seed_bid_price : 0;
         dnBid = needsSeedDn ? params.seed_bid_price : 0;
       } else {
-        // Normal phase: P_true-driven pricing
-        upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
-        dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
+        // Normal phase: fixed-offset pricing like Bonereaper.
+        // Winning ~$0.72, Losing ~$0.28. PC = $1.00.
+        // P_true only determines which side is winning, not the bid level.
+        // Fixed winning bid ($0.72) crosses winning-side asks (~$0.60-$0.70) → fills.
+        const upWinning = pCapped > 0.50;
+        const winPrice = Math.round(params.target_pair_cost * params.winning_share * 100) / 100;
+        const losePrice = Math.round(params.target_pair_cost * (1 - params.winning_share) * 100) / 100;
+        upBid = upWinning ? winPrice : losePrice;
+        dnBid = upWinning ? losePrice : winPrice;
       }
 
       // Inventory suppression — hard caps
