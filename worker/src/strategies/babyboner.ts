@@ -109,12 +109,12 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: wide range matching Bonereaper's actual fill prices
-  // Bonereaper: winning side @$0.73 (crosses asks), losing side @$0.28 (cheap)
-  // p_floor/p_ceil maps P_true extremes to these levels via clamping.
+  // Pricing: P_true-proportional with vol floor moderation
+  // Bonereaper buys winning @$0.79-$0.89, losing @$0.11-$0.23, PC~$1.00
+  // No p_floor/p_ceil compression — vol floor (0.20%) keeps P_true moderate.
   target_pair_cost: 0.98,
-  p_floor: 0.25,              // losing bids at ~$0.245 (Bonereaper: $0.28 avg)
-  p_ceil: 0.75,               // winning bids at ~$0.735 (Bonereaper: $0.73 avg)
+  p_floor: 0.01,              // effectively disabled — vol floor handles moderation
+  p_ceil: 0.99,               // effectively disabled
 
   maker_bid_size: 50,          // Bonereaper: 3-220 per fill, median 26, mean 45
   taker_bid_size: 25,          // aggressive taker for missing side
@@ -135,7 +135,7 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   max_total_cost: 3000,          // Bonereaper deploys $5000+/window
   max_skew_ratio: 1.0,           // DISABLED — Bonereaper goes 97% one-sided when direction is clear
   skew_guard_min_tokens: 99999,  // disabled — market price guard handles safety
-  min_ask_to_bid: 0.30,          // don't bid when market values side < $0.30 (allow losing-side at $0.30-$0.40)
+  min_ask_to_bid: 0.01,          // effectively disabled — Bonereaper buys losing side at $0.11
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
@@ -828,28 +828,9 @@ class BabyBoneRStrategy implements Strategy {
       upBid = upBid > 0 ? Math.max(0.01, upBid) : 0;
       dnBid = dnBid > 0 ? Math.max(0.01, dnBid) : 0;
 
-      // ── Market price guard ───────────────────────────────────────
-      // Don't bid on a side the market values as near-worthless.
-      // When UP is winning, DN asks drop to $0.05-$0.15 — our $0.39 bid would
-      // cross the ask and flood inventory with cheap losing tokens.
-      // Bonereaper fills at ~$0.50 on BOTH sides — they don't accumulate near-worthless tokens.
-      for (const side of ["UP", "DOWN"] as const) {
-        let bid = side === "UP" ? upBid : dnBid;
-        if (bid <= 0) continue;
-        try {
-          const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
-          const book = await this.getBookCached(ctx, tokenId);
-          const bestAsk = this.getBestAsk(book);
-          if (bestAsk !== null && bestAsk < params.min_ask_to_bid) {
-            // Skip sides the market values as near-worthless.
-            // No bid cap — Bonereaper crosses the ask on winning side (taker).
-            if (side === "UP") upBid = 0;
-            else dnBid = 0;
-          }
-        } catch { /* best effort */ }
-      }
-
       // ── Place/update GTC resting bids ─────────────────────────────
+      // No market price guard — Bonereaper buys losing side at $0.11-$0.23.
+      // P_true drives pricing: winning side ~$0.89, losing side ~$0.11.
       await this.updateBid(ctx, w, "UP", upBid, params.maker_bid_size, params);
       await this.updateBid(ctx, w, "DOWN", dnBid, params.maker_bid_size, params);
 
