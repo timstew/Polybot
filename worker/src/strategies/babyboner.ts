@@ -797,9 +797,28 @@ class BabyBoneRStrategy implements Strategy {
       let upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
       let dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
 
-      // No pair cost guard — Bonereaper bids based on current probability regardless
-      // of what it paid on the other side. Pair cost falls out naturally.
-      // Protection comes from max_total_cost and max_inventory_per_side caps.
+      // ── Inventory-aware bid shading (Bonereaper achieves 49/51 balance) ──
+      // Shade bids toward the lighter side to achieve balanced accumulation.
+      // When DN-heavy: boost UP bid, reduce DN bid. Vice versa.
+      const totalInv = w.upInventory + w.dnInventory;
+      if (totalInv > 0) {
+        const upShare = w.upInventory / totalInv;  // 0.0 to 1.0
+        const dnShare = w.dnInventory / totalInv;
+        // Skew factor: 0 when balanced, positive toward light side
+        // Scale bid by (1 + skew_shade * imbalance) on light side
+        // and (1 - skew_shade * imbalance) on heavy side
+        const skewShade = 0.30;  // 30% max bid adjustment for skew
+        const imbalance = Math.abs(upShare - 0.5) * 2;  // 0 = balanced, 1 = fully skewed
+        if (upShare < 0.5) {
+          // UP is light → boost UP bid, reduce DN bid
+          upBid = Math.round(upBid * (1 + skewShade * imbalance) * 100) / 100;
+          dnBid = Math.round(dnBid * (1 - skewShade * imbalance) * 100) / 100;
+        } else if (dnShare < 0.5) {
+          // DN is light → boost DN bid, reduce UP bid
+          dnBid = Math.round(dnBid * (1 + skewShade * imbalance) * 100) / 100;
+          upBid = Math.round(upBid * (1 - skewShade * imbalance) * 100) / 100;
+        }
+      }
 
       // Inventory suppression — hard caps
       if (w.upInventory >= params.max_inventory_per_side) upBid = 0;
