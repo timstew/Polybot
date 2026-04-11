@@ -388,6 +388,8 @@ async function autoMergeProfitablePairs(inst: RunnerInstance, ctx: StrategyConte
       if (result) {
         if (typeof w.realizedSellPnl === "number") w.realizedSellPnl += result.pnl;
         if (typeof w.realizedPnl === "number") w.realizedPnl += result.pnl;
+        if (typeof w.totalMerged === "number") w.totalMerged += result.merged;
+        if (typeof w.totalMergePnl === "number") w.totalMergePnl += result.pnl;
         addLog(inst, `AUTO-MERGE: ${result.merged} pairs @ pc=${result.pairCost.toFixed(4)} → +$${result.pnl.toFixed(2)}`);
       }
     } catch { /* non-critical */ }

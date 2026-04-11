@@ -1007,6 +1007,9 @@ export class StrategyDO implements DurableObject {
           // Strategies use different field names for realized P&L:
           if (typeof w.realizedSellPnl === "number") w.realizedSellPnl += result.pnl;
           if (typeof w.realizedPnl === "number") w.realizedPnl += result.pnl;
+          // Track merge stats for UI display (babyboner etc.)
+          if (typeof w.totalMerged === "number") w.totalMerged += result.merged;
+          if (typeof w.totalMergePnl === "number") w.totalMergePnl += result.pnl;
           this.addLog(
             `AUTO-MERGE: ${result.merged} pairs @ pc=${result.pairCost.toFixed(4)} → +$${result.pnl.toFixed(2)}`,
             { level: "trade" },

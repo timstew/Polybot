@@ -92,6 +92,10 @@ export interface BabyBoneRParams {
   // Market price guard — don't bid on sides the market values as near-worthless
   min_ask_to_bid: number;        // skip bidding when best ask < this (default 0.25)
 
+  // Fill rate control — paper model fills crossing GTC instantly every tick,
+  // creating 100:0 skew. Cooldown limits fills to 1 per N ms per side.
+  buy_cooldown_ms: number;       // min ms between fills per side (default 15000)
+
   // Early seeding — Bonereaper ALWAYS buys both sides. Seed both early before P drifts.
   seed_seconds: number;          // seed phase duration after window open (e.g., 30s)
   seed_bid_price: number;        // bid price during seeding (e.g., 0.50 for both sides)
@@ -103,6 +107,7 @@ export interface BabyBoneRParams {
 
   // Window management
   max_window_duration_ms: number;
+  min_window_duration_ms: number;  // skip short windows (5min) where balance is hard
   observation_seconds: number;
   max_concurrent_windows: number;
   discovery_interval_ms: number;
@@ -122,8 +127,8 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   p_floor: 0.01,              // effectively disabled — vol floor handles moderation
   p_ceil: 0.99,               // effectively disabled
 
-  maker_bid_size: 50,          // Bonereaper: 3-220 per fill, median 26, mean 45
-  taker_bid_size: 25,          // aggressive taker for missing side
+  maker_bid_size: 25,          // Bonereaper: 3-30 per fill, median ~15
+  taker_bid_size: 15,          // crossing taker fills (smaller to limit exposure)
   taker_ask_discount: 0.02,    // legacy param, taker now takes at bid price
   taker_max_price: 0.92,       // Bonereaper pays up to ~$0.89 on winning side
 
@@ -140,9 +145,10 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
 
   max_inventory_per_side: 3000,  // Bonereaper goes 5000+ on winning side
   max_total_cost: 3000,          // Bonereaper deploys $5000+/window
-  max_skew_ratio: 1.0,           // DISABLED — Bonereaper goes 97% one-sided when direction is clear
-  skew_guard_min_tokens: 99999,  // disabled — market price guard handles safety
+  max_skew_ratio: 0.75,           // losing side can't exceed 75% of total (prevents dead-weight tokens at resolution)
+  skew_guard_min_tokens: 500,    // activate after 500 total tokens accumulated
   min_ask_to_bid: 0.01,          // effectively disabled — Bonereaper buys losing side at $0.11
+  buy_cooldown_ms: 15_000,       // 15s between fills per side (paper model rate limiter)
 
   seed_seconds: 45,              // first 45s: bid $0.50 on both sides to seed inventory
   seed_bid_price: 0.55,          // aggressive bid during seeding (crosses asks that sit above $0.50)
@@ -152,6 +158,7 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
 
   max_window_duration_ms: 15 * 60_000,
+  min_window_duration_ms: 10 * 60_000,  // skip 5-min windows — too short for balanced inventory
   observation_seconds: 3,
   max_concurrent_windows: 6,
   discovery_interval_ms: 30_000,
@@ -174,19 +181,25 @@ interface BabyBoneRWindow {
   upBidOrderId: string | null;
   upBidPrice: number;
   upBidSize: number;
-  dnBidOrderId: string | null;
-  dnBidPrice: number;
-  dnBidSize: number;
+  downBidOrderId: string | null;
+  downBidPrice: number;
+  downBidSize: number;
 
   // Sell orders
   upSellOrderId: string | null;
-  dnSellOrderId: string | null;
+  downSellOrderId: string | null;
 
   // Inventory (FIFO avg cost)
   upInventory: number;
   upAvgCost: number;   // avg cost per token
-  dnInventory: number;
-  dnAvgCost: number;
+  downInventory: number;
+  downAvgCost: number;
+
+  // Peak inventory (for UI — auto-merge reduces current inventory to 0)
+  peakUpInventory: number;
+  peakDownInventory: number;
+  totalMerged: number;       // total pairs merged
+  totalMergePnl: number;     // total P&L from merges
 
   // Tracking
   fillCount: number;
@@ -197,6 +210,10 @@ interface BabyBoneRWindow {
   enteredAt: number;
   lastRequoteAt: number;
   tickAction: string;
+
+  // Fill cooldown (paper model rate limiting)
+  lastUpBuyAt: number;
+  lastDownBuyAt: number;
 
   // Signal tracking
   confirmedDirection: "UP" | "DOWN" | null;
@@ -220,7 +237,7 @@ interface CompletedWindow {
   cryptoSymbol: string;
   outcome: "UP" | "DOWN" | "UNKNOWN";
   upInventory: number;
-  dnInventory: number;
+  downInventory: number;
   totalBuyCost: number;
   totalSellRevenue: number;
   realizedSellPnl: number;
@@ -230,11 +247,16 @@ interface CompletedWindow {
   sellCount: number;
   completedAt: string;
   upAvgCost: number;
-  dnAvgCost: number;
+  downAvgCost: number;
   gammaConfirmed: boolean;
   slug?: string;
   upTokenId?: string;
   downTokenId?: string;
+  // Peak/merge stats (for UI display — final inventory is 0/0 after auto-merge)
+  peakUpInventory?: number;
+  peakDownInventory?: number;
+  totalMerged?: number;
+  totalMergePnl?: number;
 }
 
 interface CustomState {
@@ -322,6 +344,36 @@ class BabyBoneRStrategy implements Strategy {
 
     const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as BabyBoneRParams;
 
+    // Migrate old dn* field names to down* (frontend expects downInventory etc.)
+    for (const w of this.custom.activeWindows) {
+      const a = w as any;
+      if (a.dnInventory !== undefined && !w.downInventory) { w.downInventory = a.dnInventory; delete a.dnInventory; }
+      if (a.dnAvgCost !== undefined && !w.downAvgCost) { w.downAvgCost = a.dnAvgCost; delete a.dnAvgCost; }
+      if (a.dnBidOrderId !== undefined) { w.downBidOrderId = a.dnBidOrderId; delete a.dnBidOrderId; }
+      if (a.dnBidPrice !== undefined) { w.downBidPrice = a.dnBidPrice; delete a.dnBidPrice; }
+      if (a.dnBidSize !== undefined) { w.downBidSize = a.dnBidSize; delete a.dnBidSize; }
+      if (a.dnSellOrderId !== undefined) { w.downSellOrderId = a.dnSellOrderId; delete a.dnSellOrderId; }
+      if (a.lastDnBuyAt !== undefined) { w.lastDownBuyAt = a.lastDnBuyAt; delete a.lastDnBuyAt; }
+    }
+    for (const c of this.custom.completedWindows) {
+      const a = c as any;
+      if (a.dnInventory !== undefined) { c.downInventory = a.dnInventory; delete a.dnInventory; }
+      if (a.dnAvgCost !== undefined) { c.downAvgCost = a.dnAvgCost; delete a.dnAvgCost; }
+    }
+
+    // Initialize peak/merge tracking on existing windows missing these fields
+    for (const w of this.custom.activeWindows) {
+      if (w.peakUpInventory == null) w.peakUpInventory = w.upInventory;
+      if (w.peakDownInventory == null) w.peakDownInventory = w.downInventory;
+      if (w.totalMerged == null) w.totalMerged = 0;
+      if (w.totalMergePnl == null) w.totalMergePnl = 0;
+    }
+
+    // Recover from NaN corruption (old code stored NaN as null in JSON)
+    if (!Number.isFinite(this.custom.totalPnl)) this.custom.totalPnl = 0;
+    if (!Number.isFinite(this.custom.totalFills)) this.custom.totalFills = 0;
+    if (!Number.isFinite(this.custom.totalSells)) this.custom.totalSells = 0;
+
     // Enable reactive Binance WebSocket feed
     const binanceSymbols = params.target_cryptos.map(toBinanceSymbol);
     enableReactiveFeed(binanceSymbols);
@@ -396,7 +448,7 @@ class BabyBoneRStrategy implements Strategy {
     if (ctx.windingDown) {
       const before = this.custom.activeWindows.length;
       this.custom.activeWindows = this.custom.activeWindows.filter(
-        w => w.upInventory + w.dnInventory > 0 || w.totalBuyCost > 0,
+        w => w.upInventory + w.downInventory > 0 || w.totalBuyCost > 0,
       );
       if (this.custom.activeWindows.length < before) {
         ctx.log(`Wind-down: dropped ${before - this.custom.activeWindows.length} empty window(s)`);
@@ -405,7 +457,7 @@ class BabyBoneRStrategy implements Strategy {
 
     // 7. Scan status
     const totalInv = this.custom.activeWindows.reduce(
-      (s, w) => s + w.upInventory + w.dnInventory, 0,
+      (s, w) => s + w.upInventory + w.downInventory, 0,
     );
     if (ctx.windingDown) {
       this.custom.scanStatus = this.custom.activeWindows.length > 0
@@ -421,8 +473,11 @@ class BabyBoneRStrategy implements Strategy {
 
     // 8. Persist
     ctx.state.custom = this.custom as unknown as Record<string, unknown>;
+    // Capital deployed: current inventory cost (what's still at risk right now)
+    // Auto-merge keeps this low, but it's the accurate "money in play" number.
+    // We also report totalBuyCost via custom state for the UI to show total volume.
     ctx.state.capital_deployed = this.custom.activeWindows.reduce(
-      (sum, w) => sum + w.upInventory * w.upAvgCost + w.dnInventory * w.dnAvgCost, 0,
+      (sum, w) => sum + w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost, 0,
     );
     ctx.state.total_pnl = this.custom.totalPnl;
   }
@@ -449,7 +504,7 @@ class BabyBoneRStrategy implements Strategy {
     isTaker: boolean,
   ): void {
     const fee = isTaker ? calcFeePerShare(price, DEFAULT_PARAMS.fee_params) * size : 0;
-    const costBasis = price + (isTaker ? fee / size : 0);
+    const costBasis = price + (isTaker && size > 0 ? fee / size : 0);
 
     if (side === "UP") {
       if (w.upInventory > 0) {
@@ -461,22 +516,29 @@ class BabyBoneRStrategy implements Strategy {
         w.upAvgCost = costBasis;
       }
     } else {
-      if (w.dnInventory > 0) {
-        const totalCost = w.dnAvgCost * w.dnInventory + costBasis * size;
-        w.dnInventory += size;
-        w.dnAvgCost = totalCost / w.dnInventory;
+      if (w.downInventory > 0) {
+        const totalCost = w.downAvgCost * w.downInventory + costBasis * size;
+        w.downInventory += size;
+        w.downAvgCost = totalCost / w.downInventory;
       } else {
-        w.dnInventory = size;
-        w.dnAvgCost = costBasis;
+        w.downInventory = size;
+        w.downAvgCost = costBasis;
       }
     }
     w.fillCount++;
     w.totalBuyCost += costBasis * size;
     this.custom.totalFills++;
+    // Track peak inventory for UI (auto-merge reduces current to 0)
+    if (w.upInventory > (w.peakUpInventory ?? 0)) w.peakUpInventory = w.upInventory;
+    if (w.downInventory > (w.peakDownInventory ?? 0)) w.peakDownInventory = w.downInventory;
     if (w.pendingFills) w.pendingFills.push({ side, price: costBasis, size });
+    // Update cooldown on ALL fill types (maker, taker, requote, etc.)
+    const fillNow = Date.now();
+    if (side === "UP") w.lastUpBuyAt = fillNow;
+    else w.lastDownBuyAt = fillNow;
 
     ctx.log(
-      `FILL ${side} [${label}]: ${w.market.title.slice(0, 25)} ${size}@${price.toFixed(3)} inv=${w.upInventory}↑/${w.dnInventory}↓`,
+      `FILL ${side} [${label}]: ${w.market.title.slice(0, 25)} ${size}@${price.toFixed(3)} inv=${w.upInventory}↑/${w.downInventory}↓`,
       { level: "trade", symbol: w.cryptoSymbol, direction: side, phase: label },
     );
   }
@@ -493,14 +555,14 @@ class BabyBoneRStrategy implements Strategy {
   ): void {
     const fee = calcFeePerShare(price, DEFAULT_PARAMS.fee_params) * size;
     const revenue = price * size - fee;
-    const avgCost = side === "UP" ? w.upAvgCost : w.dnAvgCost;
+    const avgCost = side === "UP" ? w.upAvgCost : w.downAvgCost;
     const pnl = revenue - avgCost * size;
 
     // Reduce inventory
     if (side === "UP") {
       w.upInventory = Math.max(0, Math.round((w.upInventory - size) * 1e6) / 1e6);
     } else {
-      w.dnInventory = Math.max(0, Math.round((w.dnInventory - size) * 1e6) / 1e6);
+      w.downInventory = Math.max(0, Math.round((w.downInventory - size) * 1e6) / 1e6);
     }
 
     w.sellCount++;
@@ -509,7 +571,7 @@ class BabyBoneRStrategy implements Strategy {
     this.custom.totalSells++;
 
     ctx.log(
-      `SELL ${side} [${label}]: ${w.market.title.slice(0, 25)} ${size}@${price.toFixed(3)} pnl=$${pnl.toFixed(2)} inv=${w.upInventory}↑/${w.dnInventory}↓`,
+      `SELL ${side} [${label}]: ${w.market.title.slice(0, 25)} ${size}@${price.toFixed(3)} pnl=$${pnl.toFixed(2)} inv=${w.upInventory}↑/${w.downInventory}↓`,
       { level: "trade", symbol: w.cryptoSymbol, direction: side, phase: label },
     );
   }
@@ -552,20 +614,20 @@ class BabyBoneRStrategy implements Strategy {
         w.upBidOrderId = null;
       }
     }
-    if (w.dnBidOrderId) {
-      const r = await safeCancelOrder(ctx.api, w.dnBidOrderId);
+    if (w.downBidOrderId) {
+      const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
       if (r.cleared) {
         if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "cancel", false);
-        w.dnBidOrderId = null;
+        w.downBidOrderId = null;
       }
     }
     if (w.upSellOrderId) {
       const r = await safeCancelOrder(ctx.api, w.upSellOrderId);
       if (r.cleared) w.upSellOrderId = null;
     }
-    if (w.dnSellOrderId) {
-      const r = await safeCancelOrder(ctx.api, w.dnSellOrderId);
-      if (r.cleared) w.dnSellOrderId = null;
+    if (w.downSellOrderId) {
+      const r = await safeCancelOrder(ctx.api, w.downSellOrderId);
+      if (r.cleared) w.downSellOrderId = null;
     }
   }
 
@@ -587,6 +649,7 @@ class BabyBoneRStrategy implements Strategy {
       const windowOpenTime = endMs - windowDuration;
 
       if (windowDuration > params.max_window_duration_ms) continue;
+      if (windowDuration < params.min_window_duration_ms) continue;
       if (now < windowOpenTime) continue;
       if (endMs - now < 30_000) continue;
 
@@ -625,11 +688,14 @@ class BabyBoneRStrategy implements Strategy {
         oracleStrike,
 
         upBidOrderId: null, upBidPrice: 0, upBidSize: 0,
-        dnBidOrderId: null, dnBidPrice: 0, dnBidSize: 0,
-        upSellOrderId: null, dnSellOrderId: null,
+        downBidOrderId: null, downBidPrice: 0, downBidSize: 0,
+        upSellOrderId: null, downSellOrderId: null,
 
         upInventory: 0, upAvgCost: 0,
-        dnInventory: 0, dnAvgCost: 0,
+        downInventory: 0, downAvgCost: 0,
+
+        peakUpInventory: 0, peakDownInventory: 0,
+        totalMerged: 0, totalMergePnl: 0,
 
         fillCount: 0, sellCount: 0,
         totalBuyCost: 0, totalSellRevenue: 0,
@@ -638,6 +704,8 @@ class BabyBoneRStrategy implements Strategy {
         lastRequoteAt: 0,
         tickAction: "",
         confirmedDirection: null,
+        lastUpBuyAt: 0,
+        lastDownBuyAt: 0,
       };
 
       if (params.record_snapshots) {
@@ -669,8 +737,8 @@ class BabyBoneRStrategy implements Strategy {
       // Wind-down: cancel bids, but let sell logic run
       if (ctx.windingDown) {
         if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "UP", r.fill.size, r.fill.price, "cancel", false); w.upBidOrderId = null; } }
-        if (w.dnBidOrderId) { const r = await safeCancelOrder(ctx.api, w.dnBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "cancel", false); w.dnBidOrderId = null; } }
-        w.tickAction = `Wind-down: ${w.upInventory}↑/${w.dnInventory}↓`;
+        if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "cancel", false); w.downBidOrderId = null; } }
+        w.tickAction = `Wind-down: ${w.upInventory}↑/${w.downInventory}↓`;
         continue;
       }
 
@@ -739,11 +807,11 @@ class BabyBoneRStrategy implements Strategy {
       if (!params.merge_exit && timeLeftSec < params.wind_down_seconds) {
         // Cancel all buy bids during wind-down
         if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "UP", r.fill.size, r.fill.price, "winddown", false); w.upBidOrderId = null; } }
-        if (w.dnBidOrderId) { const r = await safeCancelOrder(ctx.api, w.dnBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "winddown", false); w.dnBidOrderId = null; } }
+        if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "winddown", false); w.downBidOrderId = null; } }
 
         // Sell inventory
         for (const side of ["UP", "DOWN"] as const) {
-          const tokens = side === "UP" ? w.upInventory : w.dnInventory;
+          const tokens = side === "UP" ? w.upInventory : w.downInventory;
           if (tokens <= 0) continue;
           const marketPrice = side === "UP" ? pTrue : (1 - pTrue);
 
@@ -760,7 +828,7 @@ class BabyBoneRStrategy implements Strategy {
               const fillPrice = result.price || sellPrice;
               this.recordSellFill(ctx, w, side, sellSize, fillPrice, "firesale");
               await this.persistTradeToD1(ctx, w, side, "SELL", fillPrice, sellSize,
-                fillPrice * sellSize - (side === "UP" ? w.upAvgCost : w.dnAvgCost) * sellSize, "firesale");
+                fillPrice * sellSize - (side === "UP" ? w.upAvgCost : w.downAvgCost) * sellSize, "firesale");
             }
           } else {
             // Progressive unwind — sell at slightly below market
@@ -775,14 +843,14 @@ class BabyBoneRStrategy implements Strategy {
               const fillPrice = result.price || sellPrice;
               this.recordSellFill(ctx, w, side, sellSize, fillPrice, "winddown");
               await this.persistTradeToD1(ctx, w, side, "SELL", fillPrice, sellSize,
-                fillPrice * sellSize - (side === "UP" ? w.upAvgCost : w.dnAvgCost) * sellSize, "winddown");
+                fillPrice * sellSize - (side === "UP" ? w.upAvgCost : w.downAvgCost) * sellSize, "winddown");
             }
           }
         }
 
         w.tickAction = timeLeftSec < params.fire_sale_seconds
-          ? `Fire sale: ${w.upInventory}↑/${w.dnInventory}↓`
-          : `Wind-down: selling ${w.upInventory}↑/${w.dnInventory}↓`;
+          ? `Fire sale: ${w.upInventory}↑/${w.downInventory}↓`
+          : `Wind-down: selling ${w.upInventory}↑/${w.downInventory}↓`;
         this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
         acknowledgePriceChange(w.cryptoSymbol);
         continue;
@@ -793,8 +861,8 @@ class BabyBoneRStrategy implements Strategy {
       // to avoid getting filled right at expiry with no time for pairs
       if (params.merge_exit && timeLeftSec < 30) {
         if (w.upBidOrderId) { const r = await safeCancelOrder(ctx.api, w.upBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "UP", r.fill.size, r.fill.price, "endstop", false); w.upBidOrderId = null; } }
-        if (w.dnBidOrderId) { const r = await safeCancelOrder(ctx.api, w.dnBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "endstop", false); w.dnBidOrderId = null; } }
-        w.tickAction = `Merge exit: holding ${w.upInventory}↑/${w.dnInventory}↓ to resolution`;
+        if (w.downBidOrderId) { const r = await safeCancelOrder(ctx.api, w.downBidOrderId); if (r.cleared) { if (r.fill) this.recordBuyFill(ctx, w, "DOWN", r.fill.size, r.fill.price, "endstop", false); w.downBidOrderId = null; } }
+        w.tickAction = `Merge exit: holding ${w.upInventory}↑/${w.downInventory}↓ to resolution`;
         this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
         acknowledgePriceChange(w.cryptoSymbol);
         continue;
@@ -810,115 +878,106 @@ class BabyBoneRStrategy implements Strategy {
         continue;
       }
 
-      // ── Early seeding — Bonereaper ALWAYS buys both sides ──────────
-      // In the first N seconds, bid aggressively at $0.50 on both sides.
-      // This seeds inventory before direction becomes clear and asks drift.
-      // Without seeding, the losing side gets 0 fills in 50% of windows.
-      const windowAge = now - w.enteredAt;
-      const needsSeedUp = w.upInventory < params.seed_min_tokens;
-      const needsSeedDn = w.dnInventory < params.seed_min_tokens;
-      const inSeedPhase = windowAge < params.seed_seconds * 1000 && (needsSeedUp || needsSeedDn);
-
-      // ── Compute P_true pricing ──────────────────────────────────────
+      // ── Fixed-offset pricing from tick 1 (no seed phase) ──────────
+      // Bonereaper uses fixed bids ($0.72 winning, $0.28 losing) from the start.
+      // The old ask-based seed caused 0/100 skew by overpaying for stale asks.
       const pCapped = clamp(pTrue, params.p_floor, params.p_ceil);
       let upBid = 0;
       let dnBid = 0;
 
-      if (inSeedPhase) {
-        // Seed phase: bid at best ask to guarantee crossing → fills.
-        // Fall back to seed_bid_price if no book data.
-        for (const side of ["UP", "DOWN"] as const) {
-          const need = side === "UP" ? needsSeedUp : needsSeedDn;
-          if (!need) { if (side === "UP") upBid = 0; else dnBid = 0; continue; }
-          let seedPrice = params.seed_bid_price;
-          try {
-            const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
-            const book = await this.getBookCached(ctx, tokenId);
-            const bestAsk = this.getBestAsk(book);
-            if (bestAsk !== null && bestAsk <= params.taker_max_price) {
-              seedPrice = bestAsk; // bid at ask → guaranteed cross
-            }
-          } catch { /* use default */ }
-          if (side === "UP") upBid = seedPrice;
-          else dnBid = seedPrice;
-        }
-      } else {
-        // Normal phase: fixed-offset pricing like Bonereaper.
-        // Winning ~$0.72, Losing ~$0.28. PC = $1.00.
-        // P_true only determines which side is winning, not the bid level.
-        // Fixed winning bid ($0.72) crosses winning-side asks (~$0.60-$0.70) → fills.
-        const upWinning = pCapped > 0.50;
-        const winPrice = Math.round(params.target_pair_cost * params.winning_share * 100) / 100;
-        const losePrice = Math.round(params.target_pair_cost * (1 - params.winning_share) * 100) / 100;
-        upBid = upWinning ? winPrice : losePrice;
-        dnBid = upWinning ? losePrice : winPrice;
-      }
+      // Fixed-offset pricing — Bonereaper uses fixed bids regardless of inventory.
+      // winning ~$0.72, losing ~$0.28. No skew adjustment — let inventory imbalance be.
+      const winPrice = Math.round(params.target_pair_cost * params.winning_share * 100) / 100;
+      const losePrice = Math.round(params.target_pair_cost * (1 - params.winning_share) * 100) / 100;
+      upBid = upWinning ? winPrice : losePrice;
+      dnBid = upWinning ? losePrice : winPrice;
 
       // Inventory suppression — hard caps
       if (w.upInventory >= params.max_inventory_per_side) upBid = 0;
-      if (w.dnInventory >= params.max_inventory_per_side) dnBid = 0;
-      if (w.totalBuyCost >= params.max_total_cost) { upBid = 0; dnBid = 0; }
+      if (w.downInventory >= params.max_inventory_per_side) dnBid = 0;
 
-      // Skew guard — pause heavy side to force pairing
-      // Only activates after minimum tokens accumulated (avoids blocking on first fill)
-      const totalInvTokens = w.upInventory + w.dnInventory;
-      if (totalInvTokens >= params.skew_guard_min_tokens && params.max_skew_ratio < 1.0) {
-        const upRatio = w.upInventory / totalInvTokens;
-        const dnRatio = w.dnInventory / totalInvTokens;
-        if (upRatio > params.max_skew_ratio) upBid = 0;
-        if (dnRatio > params.max_skew_ratio) dnBid = 0;
+      // Capital gate — use current inventory cost (not cumulative totalBuyCost).
+      // Current cost DECREASES when auto-merge recycles pairs, allowing reinvestment.
+      // This enables small-balance bots to continuously trade within their budget.
+      const currentInvCost = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
+      if (currentInvCost >= params.max_total_cost) { upBid = 0; dnBid = 0; }
+
+      // Directional skew guard — prevent LOSING side overweight.
+      // In merge-exit, excess losing tokens are worth $0 at resolution.
+      // Only caps the losing side; winning side can accumulate freely.
+      const totalInvTokens = w.upInventory + w.downInventory;
+      if (totalInvTokens >= params.skew_guard_min_tokens) {
+        const loseSideInv = upWinning ? w.downInventory : w.upInventory;
+        const loseRatio = loseSideInv / totalInvTokens;
+        if (loseRatio > params.max_skew_ratio) {
+          // Stop buying losing side — let winning side catch up
+          if (upWinning) dnBid = 0; else upBid = 0;
+        }
       }
 
       upBid = upBid > 0 ? Math.max(0.01, upBid) : 0;
       dnBid = dnBid > 0 ? Math.max(0.01, dnBid) : 0;
 
-      // ── Place/update GTC resting bids ─────────────────────────────
-      // No market price guard — Bonereaper buys losing side at $0.11-$0.23.
-      // P_true drives pricing: winning side ~$0.89, losing side ~$0.11.
-      await this.updateBid(ctx, w, "UP", upBid, params.maker_bid_size, params);
-      await this.updateBid(ctx, w, "DOWN", dnBid, params.maker_bid_size, params);
+      // ── Fill simulation: all fills via cooldown, no GTC orders ──────
+      // Paper model GTC can't accurately simulate Bonereaper's maker fills
+      // (our bids aren't on the real CLOB). Instead, all fills come from
+      // cooldown-gated direct simulation at the bid price.
+      // Fetch book asks to determine crossing (taker) vs non-crossing (maker) fill price.
+      let upAsk: number | null = null;
+      let dnAsk: number | null = null;
+      try { upAsk = this.getBestAsk(await this.getBookCached(ctx, w.market.upTokenId)); } catch {}
+      try { dnAsk = this.getBestAsk(await this.getBookCached(ctx, w.market.downTokenId)); } catch {}
 
-      // ── Taker: aggressively hit asks (Bonereaper does ~100 taker trades per 2hr) ──
-      // Bonereaper buys winning side at $0.89 where asks are $0.85-$0.90 — they overpay
-      // vs P_true but profit because winning resolves at $1.00. Take asks up to P_true
-      // (winning side) or up to our losing-side bid price (losing side).
+      const upCrosses = upBid > 0 && upAsk !== null && upBid >= upAsk;
+      const dnCrosses = dnBid > 0 && dnAsk !== null && dnBid >= dnAsk;
+
+      // Cancel any lingering GTC orders from before this change
+      if (w.upBidOrderId) { await safeCancelOrder(ctx.api, w.upBidOrderId); w.upBidOrderId = null; w.upBidPrice = 0; w.upBidSize = 0; }
+      if (w.downBidOrderId) { await safeCancelOrder(ctx.api, w.downBidOrderId); w.downBidOrderId = null; w.downBidPrice = 0; w.downBidSize = 0; }
+      const upGtcBid = upBid;  // for display only
+      const dnGtcBid = dnBid;  // for display only
+      const upGtcSize = 0;     // no GTC orders placed
+      const dnGtcSize = 0;
+
+      // ── Cooldown-gated fills on BOTH sides ───────────────────────
+      // Crossing side (bid >= ask): fill at ask price (taker).
+      // Non-crossing side (bid < ask): fill at bid price (simulates maker fill).
+      // Rate limited by buy_cooldown_ms. Models Bonereaper's ~200 maker + ~100 taker.
+      if (ctx.state.ticks % 10 === 0) {
+        ctx.log(`TAKER-CHECK: upBid=${upBid.toFixed(2)} dnBid=${dnBid.toFixed(2)} upX=${upCrosses} dnX=${dnCrosses} upAsk=${upAsk?.toFixed(2) ?? "nil"} dnAsk=${dnAsk?.toFixed(2) ?? "nil"} inv=${w.upInventory}/${w.downInventory} cdU=${Math.round((now - (w.lastUpBuyAt || 0)) / 1000)}s cdD=${Math.round((now - (w.lastDownBuyAt || 0)) / 1000)}s`,
+          { level: "signal" });
+      }
       for (const side of ["UP", "DOWN"] as const) {
         const bid = side === "UP" ? upBid : dnBid;
-        const inv = side === "UP" ? w.upInventory : w.dnInventory;
+        const inv = side === "UP" ? w.upInventory : w.downInventory;
         if (bid <= 0 || inv >= params.max_inventory_per_side || w.totalBuyCost >= params.max_total_cost) continue;
 
-        try {
-          const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
-          const book = await this.getBookCached(ctx, tokenId);
-          const ask = this.getBestAsk(book);
-          if (ask === null) continue;
+        // Cooldown check (|| 0 for windows created before this field existed)
+        const lastBuy = side === "UP" ? (w.lastUpBuyAt || 0) : (w.lastDownBuyAt || 0);
+        const cdRemain = params.buy_cooldown_ms - (now - lastBuy);
+        if (cdRemain > 0) continue;
 
-          // Take asks up to taker_max_price on BOTH sides.
-          // Bonereaper buys both sides aggressively — winning side at ~$0.89,
-          // losing side at $0.11-$0.45. They profit from paired inventory.
-          if (ask <= params.taker_max_price) {
-            // Use FAK sweeping above best ask — crypto books are thin (1-5 tokens per level)
-            // Price at ask+0.05 to hit multiple levels; FAK cancels unfilled remainder
-            const sweepPrice = Math.min(ask + 0.05, params.taker_max_price);
-            const result = await ctx.api.placeOrder({
-              token_id: tokenId, side: "BUY",
-              size: params.taker_bid_size, price: sweepPrice,
-              order_type: "FAK",
-            });
-            if (result.status === "filled") {
-              const fillPrice = result.price || ask;
-              this.recordBuyFill(ctx, w, side, result.size, fillPrice, "taker", true);
-              await this.persistTradeToD1(ctx, w, side, "BUY", fillPrice, result.size, 0, "taker");
-            }
-          }
-        } catch { /* best-effort */ }
+        const sideAsk = side === "UP" ? upAsk : dnAsk;
+        const crosses = (side === "UP" && upCrosses) || (side === "DOWN" && dnCrosses);
+
+        // Fill simulation: Bonereaper gets fills on BOTH sides at their bid price.
+        // Crossing side (bid >= ask): fill at ask price (taker — cheaper than bid).
+        // Non-crossing side (bid < ask): fill at bid price (simulates resting maker fill).
+        // Both rate-limited by cooldown. This models Bonereaper's ~200 maker + ~100 taker per 2hr.
+        const fillPrice = (crosses && sideAsk !== null) ? sideAsk : bid;
+        const fillType = crosses ? "taker" : "maker";
+        const fillSize = crosses ? params.taker_bid_size : params.maker_bid_size;
+        this.recordBuyFill(ctx, w, side, fillSize, fillPrice, fillType, crosses);
+        await this.persistTradeToD1(ctx, w, side, "BUY", fillPrice, fillSize, 0, fillType);
+        if (side === "UP") w.lastUpBuyAt = now;
+        else w.lastDownBuyAt = now;
       }
 
       // ── Mean-reversion sells (only when merge_exit=false) ───────────
       if (!params.merge_exit && params.sell_enabled) {
         for (const side of ["UP", "DOWN"] as const) {
-          const tokens = side === "UP" ? w.upInventory : w.dnInventory;
-          const avgCost = side === "UP" ? w.upAvgCost : w.dnAvgCost;
+          const tokens = side === "UP" ? w.upInventory : w.downInventory;
+          const avgCost = side === "UP" ? w.upAvgCost : w.downAvgCost;
           if (tokens <= 0 || avgCost <= 0) continue;
 
           const marketPrice = side === "UP" ? pTrue : (1 - pTrue);
@@ -945,20 +1004,26 @@ class BabyBoneRStrategy implements Strategy {
 
       // Periodic log
       if (ctx.state.ticks % 5 === 0) {
-        const pc = (w.upInventory > 0 && w.dnInventory > 0) ? (w.upAvgCost + w.dnAvgCost).toFixed(2) : "—";
-        const skew = totalInvTokens > 0 ? `${Math.round(w.upInventory / totalInvTokens * 100)}/${Math.round(w.dnInventory / totalInvTokens * 100)}` : "—";
-        const skewActive = totalInvTokens >= params.skew_guard_min_tokens && params.max_skew_ratio < 1.0;
-        const skewGuarded = skewActive &&
-          (w.upInventory / totalInvTokens > params.max_skew_ratio || w.dnInventory / totalInvTokens > params.max_skew_ratio)
-          ? " [SKEW-GUARD]" : "";
-        const seedTag = inSeedPhase ? " [SEED]" : "";
+        const pc = (w.upInventory > 0 && w.downInventory > 0) ? (w.upAvgCost + w.downAvgCost).toFixed(2) : "—";
+        const skew = totalInvTokens > 0 ? `${Math.round(w.upInventory / totalInvTokens * 100)}/${Math.round(w.downInventory / totalInvTokens * 100)}` : "—";
+        const loseSideInvLog = upWinning ? w.downInventory : w.upInventory;
+        const loseRatioLog = totalInvTokens > 0 ? loseSideInvLog / totalInvTokens : 0;
+        const skewGuarded = totalInvTokens >= params.skew_guard_min_tokens && loseRatioLog > params.max_skew_ratio
+          ? " [LOSE-CAP]" : "";
+        // Show per-side state: X=crossing (fills at ask), M=maker (fills at bid)
+        const upTag = upCrosses ? "X" : (upBid > 0 ? "M" : "-");
+        const dnTag = dnCrosses ? "X" : (dnBid > 0 ? "M" : "-");
+        const upCdLeft = Math.max(0, Math.round((params.buy_cooldown_ms - (now - (w.lastUpBuyAt || 0))) / 1000));
+        const dnCdLeft = Math.max(0, Math.round((params.buy_cooldown_ms - (now - (w.lastDownBuyAt || 0))) / 1000));
+        const upAskStr = upAsk !== null ? `a${upAsk.toFixed(2)}` : "a—";
+        const dnAskStr = dnAsk !== null ? `a${dnAsk.toFixed(2)}` : "a—";
         ctx.log(
-          `TICK: ${w.market.title.slice(0, 25)} P=${pCapped.toFixed(2)} spot=$${currentPrice.toFixed(0)} strike=$${effectiveStrike.toFixed(0)} bid=↑$${upBid.toFixed(2)}/↓$${dnBid.toFixed(2)} inv=${w.upInventory}↑/${w.dnInventory}↓ skew=${skew}${skewGuarded}${seedTag} pc=${pc} fills=${w.fillCount}`,
+          `TICK: ${w.market.title.slice(0, 25)} P=${pCapped.toFixed(2)} spot=$${currentPrice.toFixed(0)} strike=$${effectiveStrike.toFixed(0)} ↑${upTag}$${upBid.toFixed(2)}(${upAskStr} cd${upCdLeft})/↓${dnTag}$${dnBid.toFixed(2)}(${dnAskStr} cd${dnCdLeft}) inv=${w.upInventory}↑/${w.downInventory}↓ skew=${skew}${skewGuarded} pc=${pc} fills=${w.fillCount}`,
           { level: "signal", symbol: w.cryptoSymbol, signalStrength: pTrue, phase: "tick" },
         );
       }
 
-      w.tickAction = `Quoting: up=${upBid.toFixed(2)} dn=${dnBid.toFixed(2)}`;
+      w.tickAction = `Quoting: up=${upBid.toFixed(2)}(${upGtcSize}) dn=${dnBid.toFixed(2)}(${dnGtcSize})`;
 
       this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
       acknowledgePriceChange(w.cryptoSymbol);
@@ -975,8 +1040,8 @@ class BabyBoneRStrategy implements Strategy {
     targetSize: number,
     params: BabyBoneRParams,
   ): Promise<void> {
-    const orderId = side === "UP" ? w.upBidOrderId : w.dnBidOrderId;
-    const currentPrice = side === "UP" ? w.upBidPrice : w.dnBidPrice;
+    const orderId = side === "UP" ? w.upBidOrderId : w.downBidOrderId;
+    const currentPrice = side === "UP" ? w.upBidPrice : w.downBidPrice;
     const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
 
     // Cancel if target is 0 or price changed significantly
@@ -988,12 +1053,12 @@ class BabyBoneRStrategy implements Strategy {
           await this.persistTradeToD1(ctx, w, side, "BUY", r.fill.price, r.fill.size, 0, "requote");
         }
         if (side === "UP") { w.upBidOrderId = null; w.upBidPrice = 0; w.upBidSize = 0; }
-        else { w.dnBidOrderId = null; w.dnBidPrice = 0; w.dnBidSize = 0; }
+        else { w.downBidOrderId = null; w.downBidPrice = 0; w.downBidSize = 0; }
       }
     }
 
     // Place new bid
-    const curOrderId = side === "UP" ? w.upBidOrderId : w.dnBidOrderId;
+    const curOrderId = side === "UP" ? w.upBidOrderId : w.downBidOrderId;
     if (!curOrderId && targetPrice > 0) {
       const result = await ctx.api.placeOrder({
         token_id: tokenId, side: "BUY", size: targetSize, price: targetPrice,
@@ -1005,9 +1070,9 @@ class BabyBoneRStrategy implements Strategy {
           w.upBidPrice = targetPrice;
           w.upBidSize = targetSize;
         } else {
-          w.dnBidOrderId = result.order_id;
-          w.dnBidPrice = targetPrice;
-          w.dnBidSize = targetSize;
+          w.downBidOrderId = result.order_id;
+          w.downBidPrice = targetPrice;
+          w.downBidSize = targetSize;
         }
         // Immediate fill check (GTC can match immediately)
         if (result.status === "filled") {
@@ -1015,7 +1080,7 @@ class BabyBoneRStrategy implements Strategy {
           this.recordBuyFill(ctx, w, side, result.size, fillPrice, "maker", false);
           await this.persistTradeToD1(ctx, w, side, "BUY", fillPrice, result.size, 0, "maker");
           if (side === "UP") w.upBidOrderId = null;
-          else w.dnBidOrderId = null;
+          else w.downBidOrderId = null;
         }
       }
     }
@@ -1033,13 +1098,13 @@ class BabyBoneRStrategy implements Strategy {
         w.upBidOrderId = null;
       }
     }
-    if (w.dnBidOrderId) {
-      const status = await ctx.api.getOrderStatus(w.dnBidOrderId);
+    if (w.downBidOrderId) {
+      const status = await ctx.api.getOrderStatus(w.downBidOrderId);
       if (status.status === "MATCHED" && status.size_matched > 0) {
-        const price = status.price || w.dnBidPrice;
+        const price = status.price || w.downBidPrice;
         this.recordBuyFill(ctx, w, "DOWN", status.size_matched, price, "maker", false);
         await this.persistTradeToD1(ctx, w, "DOWN", "BUY", price, status.size_matched, 0, "maker");
-        w.dnBidOrderId = null;
+        w.downBidOrderId = null;
       }
     }
   }
@@ -1058,7 +1123,7 @@ class BabyBoneRStrategy implements Strategy {
       if (now < w.windowEndTime + waitMs) continue;
 
       // No inventory and no trades — nothing to resolve
-      if (w.upInventory === 0 && w.dnInventory === 0 && w.fillCount === 0) {
+      if (w.upInventory === 0 && w.downInventory === 0 && w.fillCount === 0) {
         ctx.log(`EXPIRED (no fills): ${w.market.title.slice(0, 35)}`);
         toRemove.push(i);
         continue;
@@ -1100,15 +1165,20 @@ class BabyBoneRStrategy implements Strategy {
       // P&L: remaining inventory at resolution
       let resolutionPnl = 0;
       if (outcome !== "UNKNOWN") {
-        const winInv = outcome === "UP" ? w.upInventory : w.dnInventory;
-        const winCost = outcome === "UP" ? w.upAvgCost : w.dnAvgCost;
-        const loseInv = outcome === "UP" ? w.dnInventory : w.upInventory;
-        const loseCost = outcome === "UP" ? w.dnAvgCost : w.upAvgCost;
+        const winInv = outcome === "UP" ? w.upInventory : w.downInventory;
+        const winCost = outcome === "UP" ? w.upAvgCost : w.downAvgCost;
+        const loseInv = outcome === "UP" ? w.downInventory : w.upInventory;
+        const loseCost = outcome === "UP" ? w.downAvgCost : w.upAvgCost;
+
+        // Guard against NaN from 0-inventory or corrupt avg cost
+        const safeWinCost = Number.isFinite(winCost) ? winCost : 0;
+        const safeLoseCost = Number.isFinite(loseCost) ? loseCost : 0;
 
         const payoutFee = calcFeePerShare(1.0, params.fee_params) * winInv;
-        const winPayout = winInv * (1.0 - winCost) - payoutFee;
-        const loseLoss = -(loseInv * loseCost);
+        const winPayout = winInv * (1.0 - safeWinCost) - payoutFee;
+        const loseLoss = -(loseInv * safeLoseCost);
         resolutionPnl = winPayout + loseLoss;
+        if (!Number.isFinite(resolutionPnl)) resolutionPnl = 0;
       }
 
       const netPnl = resolutionPnl + w.realizedSellPnl;
@@ -1118,7 +1188,7 @@ class BabyBoneRStrategy implements Strategy {
         cryptoSymbol: w.cryptoSymbol,
         outcome,
         upInventory: w.upInventory,
-        dnInventory: w.dnInventory,
+        downInventory: w.downInventory,
         totalBuyCost: w.totalBuyCost,
         totalSellRevenue: w.totalSellRevenue,
         realizedSellPnl: w.realizedSellPnl,
@@ -1128,11 +1198,15 @@ class BabyBoneRStrategy implements Strategy {
         sellCount: w.sellCount,
         completedAt: new Date().toISOString(),
         upAvgCost: w.upAvgCost,
-        dnAvgCost: w.dnAvgCost,
+        downAvgCost: w.downAvgCost,
         gammaConfirmed,
         slug: w.market.slug,
         upTokenId: w.market.upTokenId,
         downTokenId: w.market.downTokenId,
+        peakUpInventory: w.peakUpInventory ?? 0,
+        peakDownInventory: w.peakDownInventory ?? 0,
+        totalMerged: w.totalMerged ?? 0,
+        totalMergePnl: w.totalMergePnl ?? 0,
       };
 
       this.custom.completedWindows.push(completed);
@@ -1140,6 +1214,7 @@ class BabyBoneRStrategy implements Strategy {
         this.custom.completedWindows = this.custom.completedWindows.slice(-50);
       }
 
+      if (!Number.isFinite(this.custom.totalPnl)) this.custom.totalPnl = 0;
       this.custom.totalPnl += netPnl;
       this.custom.windowsTraded++;
       if (outcome !== "UNKNOWN") {
@@ -1155,13 +1230,13 @@ class BabyBoneRStrategy implements Strategy {
       asset.pnl += netPnl;
       asset.fills += w.fillCount;
 
-      const pairCost = (w.upInventory > 0 && w.dnInventory > 0)
-        ? (w.upAvgCost + w.dnAvgCost).toFixed(2) : "n/a";
-      const paired = Math.min(w.upInventory, w.dnInventory);
-      const excess = Math.abs(w.upInventory - w.dnInventory);
+      const pairCost = (w.upInventory > 0 && w.downInventory > 0)
+        ? (w.upAvgCost + w.downAvgCost).toFixed(2) : "n/a";
+      const paired = Math.min(w.upInventory, w.downInventory);
+      const excess = Math.abs(w.upInventory - w.downInventory);
       const exitMode = params.merge_exit ? "merge" : "sell";
       ctx.log(
-        `RESOLVED [${exitMode}]: ${w.market.title.slice(0, 25)} ${outcome} | inv ${w.upInventory}↑/${w.dnInventory}↓ pc=${pairCost} paired=${paired} excess=${excess} | fills=${w.fillCount} sells=${w.sellCount} | res=$${resolutionPnl.toFixed(2)} sell=$${w.realizedSellPnl.toFixed(2)} net=$${netPnl.toFixed(2)} | W/L=${this.custom.windowsWon}/${this.custom.windowsLost}`,
+        `RESOLVED [${exitMode}]: ${w.market.title.slice(0, 25)} ${outcome} | inv ${w.upInventory}↑/${w.downInventory}↓ pc=${pairCost} paired=${paired} excess=${excess} | fills=${w.fillCount} sells=${w.sellCount} | res=$${resolutionPnl.toFixed(2)} sell=$${w.realizedSellPnl.toFixed(2)} net=$${netPnl.toFixed(2)} | W/L=${this.custom.windowsWon}/${this.custom.windowsLost}`,
         { level: "signal", symbol: w.cryptoSymbol, direction: outcome === "UNKNOWN" ? undefined : outcome, phase: "resolve" },
       );
 
@@ -1316,9 +1391,9 @@ class BabyBoneRStrategy implements Strategy {
         tapeBuckets, tapeMeta, bookBids, upBookAsks, downBookAsks,
         fills: w.pendingFills?.length ? [...w.pendingFills] : undefined,
         upBidOrderId: w.upBidOrderId, upBidPrice: w.upBidPrice, upBidSize: w.upBidSize,
-        downBidOrderId: w.dnBidOrderId, downBidPrice: w.dnBidPrice, downBidSize: w.dnBidSize,
-        upInventory: w.upInventory, downInventory: w.dnInventory,
-        upAvgCost: w.upAvgCost, downAvgCost: w.dnAvgCost,
+        downBidOrderId: w.downBidOrderId, downBidPrice: w.downBidPrice, downBidSize: w.downBidSize,
+        upInventory: w.upInventory, downInventory: w.downInventory,
+        upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
         oracleSpot: oracleTick?.price,
         pTrue,
       };

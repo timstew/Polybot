@@ -119,6 +119,7 @@ const STRATEGY_TYPES = [
   { value: "enhanced-maker", label: "Enhanced Maker" },
   { value: "orchestrator", label: "Orchestrator" },
   { value: "scaling-safe-maker", label: "Scaling Safe Maker" },
+  { value: "babyboner", label: "BabyBoneR" },
 ];
 
 // Tip, InventoryBar imported from strategy-windows
@@ -862,10 +863,10 @@ function StrategyDetail({
   const logs = state?.logs ?? [];
   const custom = state?.custom as Record<string, unknown> | undefined;
   const isConviction = config.strategy_type === "conviction-maker";
-  const isDirectional = config.strategy_type === "directional-taker" || config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "enhanced-maker" || config.strategy_type === "scaling-safe-maker";
+  const isDirectional = config.strategy_type === "directional-taker" || config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "enhanced-maker" || config.strategy_type === "scaling-safe-maker" || config.strategy_type === "babyboner";
   const isUnified = config.strategy_type === "unified-adaptive";
   const isOrchestrator = config.strategy_type === "orchestrator";
-  const isMaker = config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "conviction-maker" || config.strategy_type === "enhanced-maker" || config.strategy_type === "scaling-safe-maker";
+  const isMaker = config.strategy_type === "directional-maker" || config.strategy_type === "safe-maker" || config.strategy_type === "conviction-maker" || config.strategy_type === "enhanced-maker" || config.strategy_type === "scaling-safe-maker" || config.strategy_type === "babyboner";
   const isCertaintyTaker = config.strategy_type === "certainty-taker";
   const isAvellaneda = config.strategy_type === "avellaneda-maker";
 
@@ -909,6 +910,8 @@ function StrategyDetail({
     upInventory: number; downInventory: number;
     upAvgCost: number; downAvgCost: number; bidSize?: number;
     gammaConfirmed?: boolean;
+    peakUpInventory?: number; peakDownInventory?: number;
+    totalMerged?: number; totalMergePnl?: number;
   }>) ?? [];
   const windowsTraded = (custom?.windowsTraded as number) ?? 0;
   const windowsWon = (custom?.windowsWon as number) ?? 0;
@@ -950,10 +953,13 @@ function StrategyDetail({
               const matched = Math.min(w.upInventory ?? 0, w.downInventory ?? 0);
               return sum + matched * ((w.upAvgCost ?? 0) + (w.downAvgCost ?? 0));
             }, 0);
+            // For merge-heavy strategies (babyboner), show total volume when deployed is near 0
+            const totalVolume = allActiveWindows.reduce((sum, w) => sum + (w.totalBuyCost ?? 0), 0);
+            const showVolume = deployed < 1 && totalVolume > 1;
             return (
               <div className="rounded-lg border p-3 cursor-help">
-                <div className="text-xs text-muted-foreground">Capital Deployed</div>
-                <div className="text-lg font-bold tabular-nums">{fmt(deployed)}</div>
+                <div className="text-xs text-muted-foreground">{showVolume ? "Volume (recycling)" : "Capital Deployed"}</div>
+                <div className="text-lg font-bold tabular-nums">{fmt(showVolume ? totalVolume : deployed)}</div>
                 <div className="text-xs text-muted-foreground">
                   / {fmt(balanceProtection?.effective_max_capital ?? config.max_capital_usd)} max
                   {matchedCapital > 1 && <span className="text-green-600"> ({fmt(matchedCapital)} in pairs)</span>}
@@ -1743,9 +1749,20 @@ function StrategyDetail({
               );
             })}
             completed={completedWindows.slice(-20).reverse().map((w, i) => {
-              const up = w.upInventory ?? 0;
-              const dn = w.downInventory ?? 0;
-              const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
+              // For babyboner: auto-merge reduces final inventory to 0/0 — use peak inventory for display
+              const hasPeakData = (w.peakUpInventory ?? 0) > 0 || (w.peakDownInventory ?? 0) > 0;
+              const up = hasPeakData ? (w.peakUpInventory ?? 0) : (w.upInventory ?? 0);
+              const dn = hasPeakData ? (w.peakDownInventory ?? 0) : (w.downInventory ?? 0);
+              const rawUp = w.upInventory ?? 0;
+              const rawDn = w.downInventory ?? 0;
+              // Pair cost: use final inventory if present, else derive from totalBuyCost/totalMerged
+              let pairCost: number | null = null;
+              if (rawUp > 0 && rawDn > 0) {
+                pairCost = (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0);
+              } else if ((w.totalMerged ?? 0) > 0 && (w.totalBuyCost ?? 0) > 0) {
+                // Effective pair cost = total spend / pairs merged
+                pairCost = (w.totalBuyCost ?? 0) / (w.totalMerged ?? 1);
+              }
               return (
                 <CompletedWindowRow key={i}
                   title={w.title} compact={compactTitle(w.title) || w.title?.slice(0, 25)}
@@ -1761,6 +1778,7 @@ function StrategyDetail({
                   scale={w.bidSize ?? Math.max(up + dn, 1)} pairCost={pairCost}
                   netPnl={w.netPnl ?? 0} fillCount={w.fillCount ?? 0}
                   flipCount={w.flipCount} maxFlips={maxFlips}
+                  totalMerged={w.totalMerged}
                   completedAt={w.completedAt}
                   gammaConfirmed={w.gammaConfirmed}
                 />
