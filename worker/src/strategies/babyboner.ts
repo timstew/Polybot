@@ -130,8 +130,8 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
 
   max_inventory_per_side: 2000,  // Bonereaper accumulates 500-1600 per side
   max_total_cost: 500,           // Bonereaper deploys ~$830/window avg
-  max_skew_ratio: 0.75,          // pause heavy side at 75/25 split
-  skew_guard_min_tokens: 50,     // don't activate until 50+ total tokens
+  max_skew_ratio: 0.85,          // Bonereaper tolerates up to 83% skew
+  skew_guard_min_tokens: 200,    // don't activate until 200+ total tokens
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
