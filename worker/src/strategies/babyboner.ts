@@ -92,6 +92,11 @@ export interface BabyBoneRParams {
   // Market price guard — don't bid on sides the market values as near-worthless
   min_ask_to_bid: number;        // skip bidding when best ask < this (default 0.25)
 
+  // Early seeding — Bonereaper ALWAYS buys both sides. Seed both early before P drifts.
+  seed_seconds: number;          // seed phase duration after window open (e.g., 30s)
+  seed_bid_price: number;        // bid price during seeding (e.g., 0.50 for both sides)
+  seed_min_tokens: number;       // minimum tokens per side before seeding ends
+
   // Requote timing
   requote_interval_ms: number;   // min ms between requotes
   p_true_min_conviction: number; // don't trade when P_true near 0.50
@@ -138,6 +143,10 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   max_skew_ratio: 1.0,           // DISABLED — Bonereaper goes 97% one-sided when direction is clear
   skew_guard_min_tokens: 99999,  // disabled — market price guard handles safety
   min_ask_to_bid: 0.01,          // effectively disabled — Bonereaper buys losing side at $0.11
+
+  seed_seconds: 30,              // first 30s: bid $0.50 on both sides to seed inventory
+  seed_bid_price: 0.50,          // aggressive bid during seeding (crosses asks near open)
+  seed_min_tokens: 200,          // seed until at least 200 tokens per side
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
@@ -801,16 +810,29 @@ class BabyBoneRStrategy implements Strategy {
         continue;
       }
 
-      // ── Compressed P_true pricing (matches Bonereaper avg) ──────────
-      // Raw P_true always extreme (0.000 or 1.000) due to low BTC vol.
-      // Compress via p_floor/p_ceil → winning ~$0.70, losing ~$0.28, PC ~$0.98
-      const pCapped = clamp(pTrue, params.p_floor, params.p_ceil);
-      let upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
-      let dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
+      // ── Early seeding — Bonereaper ALWAYS buys both sides ──────────
+      // In the first N seconds, bid aggressively at $0.50 on both sides.
+      // This seeds inventory before direction becomes clear and asks drift.
+      // Without seeding, the losing side gets 0 fills in 50% of windows.
+      const windowAge = now - w.enteredAt;
+      const needsSeedUp = w.upInventory < params.seed_min_tokens;
+      const needsSeedDn = w.dnInventory < params.seed_min_tokens;
+      const inSeedPhase = windowAge < params.seed_seconds * 1000 && (needsSeedUp || needsSeedDn);
 
-      // NOTE: No bid shading. Bonereaper goes 97% one-sided when direction is clear
-      // (DN 5188@$0.985 vs UP 176@$0.148 in one window). Balance is an average across
-      // windows, not enforced within windows. The market price guard handles safety.
+      // ── Compute P_true pricing ──────────────────────────────────────
+      const pCapped = clamp(pTrue, params.p_floor, params.p_ceil);
+      let upBid: number;
+      let dnBid: number;
+
+      if (inSeedPhase) {
+        // Seed phase: bid at fixed price on both sides to ensure both-sided fills
+        upBid = needsSeedUp ? params.seed_bid_price : 0;
+        dnBid = needsSeedDn ? params.seed_bid_price : 0;
+      } else {
+        // Normal phase: P_true-driven pricing
+        upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
+        dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
+      }
 
       // Inventory suppression — hard caps
       if (w.upInventory >= params.max_inventory_per_side) upBid = 0;
@@ -843,16 +865,13 @@ class BabyBoneRStrategy implements Strategy {
       for (const side of ["UP", "DOWN"] as const) {
         const bid = side === "UP" ? upBid : dnBid;
         const inv = side === "UP" ? w.upInventory : w.dnInventory;
-        if (bid <= 0 || inv >= params.max_inventory_per_side || w.totalBuyCost >= params.max_total_cost) {
-          if (bid > 0) ctx.log(`TAKER ${side} blocked: inv=${inv}/${params.max_inventory_per_side} cost=$${w.totalBuyCost.toFixed(0)}/${params.max_total_cost}`);
-          continue;
-        }
+        if (bid <= 0 || inv >= params.max_inventory_per_side || w.totalBuyCost >= params.max_total_cost) continue;
 
         try {
           const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
           const book = await this.getBookCached(ctx, tokenId);
           const ask = this.getBestAsk(book);
-          if (ask === null) { ctx.log(`TAKER ${side} no asks in book`); continue; }
+          if (ask === null) continue;
 
           // Take asks up to taker_max_price on BOTH sides.
           // Bonereaper buys both sides aggressively — winning side at ~$0.89,
@@ -870,11 +889,7 @@ class BabyBoneRStrategy implements Strategy {
               const fillPrice = result.price || ask;
               this.recordBuyFill(ctx, w, side, result.size, fillPrice, "taker", true);
               await this.persistTradeToD1(ctx, w, side, "BUY", fillPrice, result.size, 0, "taker");
-            } else {
-              ctx.log(`TAKER ${side} miss: ask=$${ask.toFixed(2)} max=$${params.taker_max_price} result=${result.status}`);
             }
-          } else {
-            ctx.log(`TAKER ${side} skip: ask=$${ask.toFixed(2)} > max=$${params.taker_max_price}`);
           }
         } catch { /* best-effort */ }
       }
@@ -916,8 +931,9 @@ class BabyBoneRStrategy implements Strategy {
         const skewGuarded = skewActive &&
           (w.upInventory / totalInvTokens > params.max_skew_ratio || w.dnInventory / totalInvTokens > params.max_skew_ratio)
           ? " [SKEW-GUARD]" : "";
+        const seedTag = inSeedPhase ? " [SEED]" : "";
         ctx.log(
-          `TICK: ${w.market.title.slice(0, 25)} P=${pCapped.toFixed(2)} spot=$${currentPrice.toFixed(0)} strike=$${effectiveStrike.toFixed(0)} bid=↑$${upBid.toFixed(2)}/↓$${dnBid.toFixed(2)} inv=${w.upInventory}↑/${w.dnInventory}↓ skew=${skew}${skewGuarded} pc=${pc} fills=${w.fillCount}`,
+          `TICK: ${w.market.title.slice(0, 25)} P=${pCapped.toFixed(2)} spot=$${currentPrice.toFixed(0)} strike=$${effectiveStrike.toFixed(0)} bid=↑$${upBid.toFixed(2)}/↓$${dnBid.toFixed(2)} inv=${w.upInventory}↑/${w.dnInventory}↓ skew=${skew}${skewGuarded}${seedTag} pc=${pc} fills=${w.fillCount}`,
           { level: "signal", symbol: w.cryptoSymbol, signalStrength: pTrue, phase: "tick" },
         );
       }
