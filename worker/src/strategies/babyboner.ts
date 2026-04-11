@@ -797,11 +797,9 @@ class BabyBoneRStrategy implements Strategy {
       let upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
       let dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
 
-      // Pair cost guard: soft cap bid when opposite side already has expensive inventory
-      // Bonereaper pair cost ranges $0.93-$1.05 — so allow up to $1.05
-      const maxPairCost = 1.05;
-      if (w.dnInventory > 0 && w.dnAvgCost > 0) upBid = Math.min(upBid, maxPairCost - w.dnAvgCost);
-      if (w.upInventory > 0 && w.upAvgCost > 0) dnBid = Math.min(dnBid, maxPairCost - w.upAvgCost);
+      // No pair cost guard — Bonereaper bids based on current probability regardless
+      // of what it paid on the other side. Pair cost falls out naturally.
+      // Protection comes from max_total_cost and max_inventory_per_side caps.
 
       // Inventory suppression — hard caps
       if (w.upInventory >= params.max_inventory_per_side) upBid = 0;
