@@ -858,9 +858,13 @@ class BabyBoneRStrategy implements Strategy {
           // Bonereaper buys both sides aggressively — winning side at ~$0.89,
           // losing side at $0.11-$0.45. They profit from paired inventory.
           if (ask <= params.taker_max_price) {
+            // Use FAK sweeping above best ask — crypto books are thin (1-5 tokens per level)
+            // Price at ask+0.05 to hit multiple levels; FAK cancels unfilled remainder
+            const sweepPrice = Math.min(ask + 0.05, params.taker_max_price);
             const result = await ctx.api.placeOrder({
               token_id: tokenId, side: "BUY",
-              size: params.taker_bid_size, price: ask,
+              size: params.taker_bid_size, price: sweepPrice,
+              order_type: "FAK",
             });
             if (result.status === "filled") {
               const fillPrice = result.price || ask;
