@@ -39,6 +39,16 @@ export const BONESTAR_SEARCH_SPACE: ParamSpec[] = [
   { name: "losing_side_max_bid", type: "continuous", min: 0.10, max: 0.40 },
   { name: "losing_side_premium", type: "continuous", min: 0.01, max: 0.10 },
   { name: "max_inventory_per_side", type: "integer", min: 100, max: 500 },
+  // Sweep safety params
+  { name: "sweep_min_size", type: "integer", min: 10, max: 100 },
+  { name: "sweep_confidence_scale", type: "boolean" },
+  { name: "sweep_max_pair_cost", type: "continuous", min: 0.85, max: 0.99 },
+  { name: "sweep_require_paired_base", type: "integer", min: 0, max: 50 },
+  { name: "sweep_allow_flip", type: "boolean" },
+  { name: "sweep_flip_threshold", type: "continuous", min: 0.15, max: 0.45 },
+  { name: "sweep_threshold_late", type: "continuous", min: 0.85, max: 0.98 },
+  { name: "base_bid_size_phase2", type: "integer", min: 20, max: 100 },
+  { name: "max_inventory_ratio", type: "continuous", min: 1.5, max: 10.0 },
 ];
 
 export const BONESTAR_DEFAULT_PARAMS = DEFAULT_PARAMS;
@@ -233,6 +243,12 @@ export function replayBoneStarWindow(
     if (phase === 3 || sweepTriggered) {
       if (phase !== 3) {
         lockedSweepSide = pTrue > 0.5 ? "UP" : "DOWN";
+      } else if (p.sweep_allow_flip && lockedSweepSide) {
+        // Allow sweep side to flip if P_true reversed hard
+        const currentSweepPTrue = lockedSweepSide === "UP" ? pTrue : (1 - pTrue);
+        if (currentSweepPTrue < p.sweep_flip_threshold) {
+          lockedSweepSide = lockedSweepSide === "UP" ? "DOWN" : "UP";
+        }
       }
       phase = 3;
     } else if (phase >= 2 || windowProgress >= p.conviction_start_pct) {
@@ -266,6 +282,14 @@ export function replayBoneStarWindow(
       if (downInventory >= p.base_bid_size && upInventory === 0) dnSize = 0;
       if (upInventory >= p.max_inventory_per_side) upSize = 0;
       if (downInventory >= p.max_inventory_per_side) dnSize = 0;
+
+      // Inventory ratio guard: suppress heavy side when too imbalanced
+      const heavy1 = Math.max(upInventory, downInventory);
+      const light1 = Math.min(upInventory, downInventory);
+      if (light1 > 0 && heavy1 / light1 > p.max_inventory_ratio) {
+        if (upInventory > downInventory) upSize = 0;
+        else dnSize = 0;
+      }
 
       // Place bids
       if (upSize > 0) {
@@ -304,10 +328,10 @@ export function replayBoneStarWindow(
       let dnSize = p.base_bid_size;
 
       if (upWinning) {
-        upSize = Math.round(p.base_bid_size * sizeMultiplier);
+        upSize = Math.round(p.base_bid_size_phase2 * sizeMultiplier);
         dnBid = Math.max(p.min_bid_per_side, dnBid - p.losing_side_discount);
       } else {
-        dnSize = Math.round(p.base_bid_size * sizeMultiplier);
+        dnSize = Math.round(p.base_bid_size_phase2 * sizeMultiplier);
         upBid = Math.max(p.min_bid_per_side, upBid - p.losing_side_discount);
       }
 
@@ -320,6 +344,14 @@ export function replayBoneStarWindow(
       // Inventory guards
       if (upInventory >= p.max_inventory_per_side) upSize = 0;
       if (downInventory >= p.max_inventory_per_side) dnSize = 0;
+
+      // Inventory ratio guard: suppress heavy side when too imbalanced
+      const heavy2 = Math.max(upInventory, downInventory);
+      const light2 = Math.min(upInventory, downInventory);
+      if (light2 > 0 && heavy2 / light2 > p.max_inventory_ratio) {
+        if (upInventory > downInventory) upSize = 0;
+        else dnSize = 0;
+      }
 
       if (upSize > 0) {
         const newBid = Math.max(0.01, Math.floor(upBid * 100) / 100);
@@ -348,7 +380,10 @@ export function replayBoneStarWindow(
       // Phase 3: Sweep + maker bids
       const sweepSide = lockedSweepSide ?? (pTrue > 0.5 ? "UP" : "DOWN");
       const pTrueForSweepSide = sweepSide === "UP" ? pTrue : (1 - pTrue);
-      const sweepStillValid = pTrueForSweepSide > p.sweep_threshold;
+
+      // Late window uses stricter threshold
+      const effectiveThreshold = windowProgress > 0.75 ? p.sweep_threshold_late : p.sweep_threshold;
+      const sweepStillValid = pTrueForSweepSide > effectiveThreshold;
 
       // Sweep bid
       const sweepInv = sweepSide === "UP" ? upInventory : downInventory;
@@ -365,9 +400,37 @@ export function replayBoneStarWindow(
         );
       }
 
-      const newSweepSize = (sweepStillValid && cooldownOk && sweepCapOk && sweepCountOk)
-        ? Math.min(p.sweep_size, remainingCapacity)
-        : 0;
+      // Graduated sweep sizing: scale with confidence margin above threshold
+      let newSweepSize: number;
+      if (!(sweepStillValid && cooldownOk && sweepCapOk && sweepCountOk)) {
+        newSweepSize = 0;
+      } else if (p.sweep_confidence_scale) {
+        const margin = pTrueForSweepSide - effectiveThreshold;
+        const maxMargin = 1.0 - effectiveThreshold;
+        const scale = Math.min(1.0, margin / maxMargin);
+        newSweepSize = Math.round(p.sweep_min_size + scale * (p.sweep_size - p.sweep_min_size));
+        newSweepSize = Math.min(newSweepSize, remainingCapacity);
+      } else {
+        newSweepSize = Math.min(p.sweep_size, remainingCapacity);
+      }
+
+      // Pair cost gate: don't add sweep tokens if pair cost already too high
+      if (newSweepSize > 0 && p.sweep_max_pair_cost > 0) {
+        const pairedCount = Math.min(upInventory, downInventory);
+        const upAvg = upInventory > 0 ? upAvgCost : 0;
+        const dnAvg = downInventory > 0 ? downAvgCost : 0;
+        if (pairedCount > 0 && (upAvg + dnAvg) > p.sweep_max_pair_cost) {
+          newSweepSize = 0;
+        }
+      }
+
+      // Paired base check: limit sweep until enough paired inventory
+      if (newSweepSize > 0) {
+        const pairedCount = Math.min(upInventory, downInventory);
+        if (pairedCount < p.sweep_require_paired_base) {
+          newSweepSize = Math.min(newSweepSize, p.sweep_min_size);
+        }
+      }
 
       if (newSweepSize > 0) {
         const roundedSweep = Math.floor(effectiveSweepPrice * 100) / 100;
@@ -416,6 +479,14 @@ export function replayBoneStarWindow(
       if (actualUpWinning && unpaired === 0) dnSize = 0;
       if (upInventory >= p.max_inventory_per_side) upSize = 0;
       if (downInventory >= p.max_inventory_per_side) dnSize = 0;
+
+      // Inventory ratio guard: suppress heavy side when too imbalanced
+      const heavy3 = Math.max(upInventory, downInventory);
+      const light3 = Math.min(upInventory, downInventory);
+      if (light3 > 0 && heavy3 / light3 > p.max_inventory_ratio) {
+        if (upInventory > downInventory) upSize = 0;
+        else dnSize = 0;
+      }
 
       if (upSize > 0) {
         const newBid = Math.max(0.01, Math.floor(upBid * 100) / 100);

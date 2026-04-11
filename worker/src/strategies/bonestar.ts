@@ -75,8 +75,21 @@ export interface BoneStarParams {
   sweep_margin: number;          // bid P_true - margin on sweeps (when dynamic)
   max_sweep_price: number;       // absolute cap on dynamic sweep bids
 
+  // Sweep safety
+  sweep_min_size: number;            // floor for graduated sizing (default: 25)
+  sweep_confidence_scale: boolean;   // enable graduated sizing (default: true)
+  sweep_max_pair_cost: number;       // pair cost gate on sweeps (default: 0.95)
+  sweep_require_paired_base: number; // min paired inventory before full sweep (default: 20)
+  sweep_allow_flip: boolean;         // allow sweep side to flip on reversal (default: true)
+  sweep_flip_threshold: number;      // P_true reversal threshold to flip (default: 0.30)
+  sweep_threshold_late: number;      // stricter threshold for late window (default: 0.92)
+
+  // Phase 2 accumulation
+  base_bid_size_phase2: number;      // winning side bid size in Phase 2 (default: 40)
+
   // Inventory guards
   max_inventory_per_side: number; // absolute max tokens on one side per window
+  max_inventory_ratio: number;    // max heavy:light ratio before suppressing heavy side (default: 3.0)
 
   // General
   max_window_duration_ms: number; // only enter windows <= this duration (default 15min)
@@ -96,17 +109,17 @@ export const DEFAULT_PARAMS: BoneStarParams = {
   bid_offset: 0.02,
   max_bid_per_side: 0.85,           // Bonereaper buys winning side at $0.65-0.85 in Phase 2
   min_bid_per_side: 0.05,
-  max_pair_cost: 0.98,            // pair cost cap for Phase 1/2 (ignored in Phase 3 sweeps)
+  max_pair_cost: 0.95,            // pair cost cap for Phase 1/2 (was 0.98 — tighter target)
 
   conviction_start_pct: 0.25,   // Bonereaper shows conviction from ~25% onward
   conviction_size_mult: 2.0,
   conviction_p_true_min: 0.55,  // lower bar — Bonereaper follows market, not strict P_true
   losing_side_discount: 0.05,
 
-  sweep_threshold: 0.85,        // Only sweep when outcome near-certain (was 0.60 = too aggressive)
+  sweep_threshold: 0.90,        // Require strong conviction (was 0.85 — too many wrong-side sweeps)
   sweep_bid_price: 0.98,
   sweep_size: 200,
-  sweep_window_pct: 0.40,       // Don't sweep in first 40% of window
+  sweep_window_pct: 0.50,       // Don't sweep in first 50% of window (was 0.40)
   sweep_losing_side: true,
   sweep_cooldown_ms: 10_000,    // 10s between sweep fills (was 30s — too conservative)
   max_sweeps_per_window: 10,    // was 3 — leaves money on the table
@@ -117,7 +130,18 @@ export const DEFAULT_PARAMS: BoneStarParams = {
   sweep_margin: 0.02,
   max_sweep_price: 0.98,
 
+  sweep_min_size: 25,
+  sweep_confidence_scale: true,
+  sweep_max_pair_cost: 0.95,
+  sweep_require_paired_base: 20,
+  sweep_allow_flip: true,
+  sweep_flip_threshold: 0.30,
+  sweep_threshold_late: 0.92,
+
+  base_bid_size_phase2: 40,
+
   max_inventory_per_side: 200,  // Conservative cap per side per window
+  max_inventory_ratio: 3.0,    // Suppress heavy side when > 3:1
 
   max_window_duration_ms: 15 * 60_000, // 15 minutes — Bonereaper plays 5m and 15m only
   fee_params: CRYPTO_FEES,
@@ -176,7 +200,7 @@ interface BoneStarWindow {
 
   // Sweep state
   lastSweepFillAt: number;
-  lockedSweepSide: "UP" | "DOWN" | null; // locked when Phase 3 starts — never flips
+  lockedSweepSide: "UP" | "DOWN" | null; // locked when Phase 3 starts, can flip if sweep_allow_flip=true
 
   // Set when past end, awaiting resolution
   binancePrediction?: "UP" | "DOWN" | null;
@@ -713,8 +737,16 @@ class BoneStarStrategy implements Strategy {
       if (w.phase === 3 || sweepTriggered) {
         // Phase 3 is sticky — once in sweep mode, stay there
         if (w.phase !== 3) {
-          // Lock sweep side on first Phase 3 entry — never flips (like Bonereaper)
+          // Lock sweep side on first Phase 3 entry
           w.lockedSweepSide = pTrue > 0.5 ? "UP" : "DOWN";
+        } else if (params.sweep_allow_flip && w.lockedSweepSide) {
+          // Allow sweep side to flip if P_true reversed hard
+          const currentSweepPTrue = w.lockedSweepSide === "UP" ? pTrue : (1 - pTrue);
+          if (currentSweepPTrue < params.sweep_flip_threshold) {
+            const oldSide = w.lockedSweepSide;
+            w.lockedSweepSide = w.lockedSweepSide === "UP" ? "DOWN" : "UP";
+            ctx.log(`Sweep side FLIPPED ${oldSide}→${w.lockedSweepSide}, pTrue=${pTrue.toFixed(3)}`, { level: "warning", symbol: w.cryptoSymbol });
+          }
         }
         w.phase = 3;
         await this.updateSweepQuotes(ctx, w, params, pTrue, spotForPTrue);
@@ -963,6 +995,14 @@ class BoneStarStrategy implements Strategy {
     if (w.upInventory >= params.max_inventory_per_side) upSize = 0;
     if (w.downInventory >= params.max_inventory_per_side) dnSize = 0;
 
+    // Inventory ratio guard: suppress heavy side when too imbalanced
+    const heavy1 = Math.max(w.upInventory, w.downInventory);
+    const light1 = Math.min(w.upInventory, w.downInventory);
+    if (light1 > 0 && heavy1 / light1 > params.max_inventory_ratio) {
+      if (w.upInventory > w.downInventory) upSize = 0;
+      else dnSize = 0;
+    }
+
     await this.placeOrUpdateBid(ctx, w, "UP", upBid, upSize, params);
     await this.placeOrUpdateBid(ctx, w, "DOWN", dnBid, dnSize, params);
 
@@ -995,10 +1035,10 @@ class BoneStarStrategy implements Strategy {
     let dnSize = params.base_bid_size;
 
     if (upWinning) {
-      upSize = Math.round(params.base_bid_size * sizeMultiplier);
+      upSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
       dnBid = Math.max(params.min_bid_per_side, dnBid - params.losing_side_discount);
     } else {
-      dnSize = Math.round(params.base_bid_size * sizeMultiplier);
+      dnSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
       upBid = Math.max(params.min_bid_per_side, upBid - params.losing_side_discount);
     }
 
@@ -1011,6 +1051,14 @@ class BoneStarStrategy implements Strategy {
     // Inventory guards
     if (w.upInventory >= params.max_inventory_per_side) upSize = 0;
     if (w.downInventory >= params.max_inventory_per_side) dnSize = 0;
+
+    // Inventory ratio guard: suppress heavy side when too imbalanced
+    const heavy2 = Math.max(w.upInventory, w.downInventory);
+    const light2 = Math.min(w.upInventory, w.downInventory);
+    if (light2 > 0 && heavy2 / light2 > params.max_inventory_ratio) {
+      if (w.upInventory > w.downInventory) upSize = 0;
+      else dnSize = 0;
+    }
 
     await this.placeOrUpdateBid(ctx, w, "UP", upBid, upSize, params);
     await this.placeOrUpdateBid(ctx, w, "DOWN", dnBid, dnSize, params);
@@ -1033,8 +1081,6 @@ class BoneStarStrategy implements Strategy {
     // But we only CONTINUE sweeping if P_true still supports the locked side.
     const sweepSide: "UP" | "DOWN" = w.lockedSweepSide ?? (pTrue > 0.5 ? "UP" : "DOWN");
     const pTrueForSweepSide = sweepSide === "UP" ? pTrue : (1 - pTrue);
-    const sweepStillValid = pTrueForSweepSide > params.sweep_threshold;
-
     // Oracle edge check: only sweep when oracle P_true > market ask (real edge exists)
     let oracleEdgeOk = true;
     if (params.sweep_use_oracle_edge) {
@@ -1059,6 +1105,11 @@ class BoneStarStrategy implements Strategy {
       );
     }
 
+    // Late window uses stricter threshold
+    const windowProgress = (Date.now() - w.windowOpenTime) / (w.windowEndTime - w.windowOpenTime);
+    const effectiveThreshold = windowProgress > 0.75 ? params.sweep_threshold_late : params.sweep_threshold;
+    const sweepStillValidLate = pTrueForSweepSide > effectiveThreshold;
+
     // Sweep bid — only when P_true still supports locked side
     const sweepInv = sweepSide === "UP" ? w.upInventory : w.downInventory;
     const now = Date.now();
@@ -1066,9 +1117,39 @@ class BoneStarStrategy implements Strategy {
     const sweepCapOk = sweepInv < params.max_inventory_per_side;
     const sweepCountOk = w.sweepFillCount < params.max_sweeps_per_window;
     const remainingCapacity = Math.max(0, params.max_inventory_per_side - sweepInv);
-    const sweepSize = (sweepStillValid && oracleEdgeOk && cooldownOk && sweepCapOk && sweepCountOk)
-      ? Math.min(params.sweep_size, remainingCapacity)
-      : 0;
+
+    // Graduated sweep sizing: scale with confidence margin above threshold
+    let sweepSize: number;
+    if (!(sweepStillValidLate && oracleEdgeOk && cooldownOk && sweepCapOk && sweepCountOk)) {
+      sweepSize = 0;
+    } else if (params.sweep_confidence_scale) {
+      const margin = pTrueForSweepSide - effectiveThreshold;
+      const maxMargin = 1.0 - effectiveThreshold;
+      const scale = Math.min(1.0, margin / maxMargin);
+      sweepSize = Math.round(params.sweep_min_size + scale * (params.sweep_size - params.sweep_min_size));
+      sweepSize = Math.min(sweepSize, remainingCapacity);
+    } else {
+      sweepSize = Math.min(params.sweep_size, remainingCapacity);
+    }
+
+    // Pair cost gate: don't add sweep tokens if pair cost already too high
+    if (sweepSize > 0 && params.sweep_max_pair_cost > 0) {
+      const pairedCount = Math.min(w.upInventory, w.downInventory);
+      const upAvg = w.upInventory > 0 ? w.upAvgCost : 0;
+      const dnAvg = w.downInventory > 0 ? w.downAvgCost : 0;
+      if (pairedCount > 0 && (upAvg + dnAvg) > params.sweep_max_pair_cost) {
+        sweepSize = 0;
+      }
+    }
+
+    // Paired base check: limit sweep until enough paired inventory
+    if (sweepSize > 0) {
+      const pairedCount = Math.min(w.upInventory, w.downInventory);
+      if (pairedCount < params.sweep_require_paired_base) {
+        sweepSize = Math.min(sweepSize, params.sweep_min_size);
+      }
+    }
+
     if (sweepSize > 0) {
       await this.placeOrUpdateSweep(ctx, w, sweepSide, effectiveSweepPrice, sweepSize, params);
     } else if (w.sweepOrderId) {
@@ -1118,6 +1199,14 @@ class BoneStarStrategy implements Strategy {
     // Cap both sides at absolute max
     if (w.upInventory >= params.max_inventory_per_side) upSize = 0;
     if (w.downInventory >= params.max_inventory_per_side) dnSize = 0;
+
+    // Inventory ratio guard: suppress heavy side when too imbalanced
+    const heavy3 = Math.max(w.upInventory, w.downInventory);
+    const light3 = Math.min(w.upInventory, w.downInventory);
+    if (light3 > 0 && heavy3 / light3 > params.max_inventory_ratio) {
+      if (w.upInventory > w.downInventory) upSize = 0;
+      else dnSize = 0;
+    }
 
     await this.placeOrUpdateBid(ctx, w, "UP", upBid, upSize, params);
     await this.placeOrUpdateBid(ctx, w, "DOWN", dnBid, dnSize, params);
