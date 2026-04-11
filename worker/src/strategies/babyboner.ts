@@ -109,13 +109,12 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: near-fair-value market maker
-  // Bonereaper's ACTUAL current fills: UP ~$0.53, DN ~$0.45-$0.60
-  // NOT the $0.28/$0.70 from earlier analysis — they bid near 0.50 on both sides.
-  // p_floor/p_ceil compress P_true to keep bids close enough to cross both sides.
-  target_pair_cost: 0.98,      // Bonereaper PC: $1.00-$1.12 (varies)
-  p_floor: 0.40,              // losing bids at ~$0.39 (crosses $0.40 asks)
-  p_ceil: 0.60,               // winning bids at ~$0.59 (crosses $0.60 asks)
+  // Pricing: wide range matching Bonereaper's actual fill prices
+  // Bonereaper: winning side @$0.73 (crosses asks), losing side @$0.28 (cheap)
+  // p_floor/p_ceil maps P_true extremes to these levels via clamping.
+  target_pair_cost: 0.98,
+  p_floor: 0.25,              // losing bids at ~$0.245 (Bonereaper: $0.28 avg)
+  p_ceil: 0.75,               // winning bids at ~$0.735 (Bonereaper: $0.73 avg)
 
   maker_bid_size: 50,          // Bonereaper: 3-220 per fill, median 26, mean 45
   taker_bid_size: 25,          // aggressive taker for missing side
@@ -837,23 +836,11 @@ class BabyBoneRStrategy implements Strategy {
           const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
           const book = await this.getBookCached(ctx, tokenId);
           const bestAsk = this.getBestAsk(book);
-          if (bestAsk !== null) {
-            // Guard 1: skip sides the market values as near-worthless
-            if (bestAsk < params.min_ask_to_bid) {
-              if (side === "UP") upBid = 0;
-              else dnBid = 0;
-              continue;
-            }
-            // Guard 2: cap bid well below ask to be a true resting maker
-            // Using ask * 0.80 creates enough distance that the probability-based
-            // fill model (~0.30 * exp(-distance * 20)) gives low fill rates.
-            // With ask=$0.36, bid=max($0.29, our_bid) → distance=0.07 → prob=7.4%
-            if (bid > bestAsk * 0.80) {
-              bid = Math.round(bestAsk * 0.80 * 100) / 100;
-              if (bid <= 0) bid = 0;
-              if (side === "UP") upBid = bid;
-              else dnBid = bid;
-            }
+          if (bestAsk !== null && bestAsk < params.min_ask_to_bid) {
+            // Skip sides the market values as near-worthless.
+            // No bid cap — Bonereaper crosses the ask on winning side (taker).
+            if (side === "UP") upBid = 0;
+            else dnBid = 0;
           }
         } catch { /* best effort */ }
       }
