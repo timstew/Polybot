@@ -106,11 +106,12 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: P_true-proportional (Bonereaper avg pair cost ~$0.97)
+  // Pricing: P_true-proportional (Bonereaper avg pair cost ~$0.997)
   // Bonereaper winning-side bids: $0.54-$0.94, losing-side: $0.05-$0.49
-  target_pair_cost: 0.97,
+  // Must be aggressive enough to cross winning-side asks ($0.91-$0.95)
+  target_pair_cost: 0.99,
   p_floor: 0.05,              // never bid below 5% probability → $0.05 min
-  p_ceil: 0.92,               // never bid above 92% probability → $0.89 max
+  p_ceil: 0.95,               // never bid above 95% probability → $0.94 max
 
   maker_bid_size: 25,          // Bonereaper median fill: 26 tokens
   taker_bid_size: 10,          // FOK taker size
@@ -796,9 +797,11 @@ class BabyBoneRStrategy implements Strategy {
       let upBid = Math.round(pCapped * params.target_pair_cost * 100) / 100;
       let dnBid = Math.round((1 - pCapped) * params.target_pair_cost * 100) / 100;
 
-      // Pair cost guard: cap bid when opposite side already has inventory
-      if (w.dnInventory > 0 && w.dnAvgCost > 0) upBid = Math.min(upBid, params.target_pair_cost - w.dnAvgCost);
-      if (w.upInventory > 0 && w.upAvgCost > 0) dnBid = Math.min(dnBid, params.target_pair_cost - w.upAvgCost);
+      // Pair cost guard: soft cap bid when opposite side already has expensive inventory
+      // Bonereaper pair cost ranges $0.93-$1.05 — so allow up to $1.05
+      const maxPairCost = 1.05;
+      if (w.dnInventory > 0 && w.dnAvgCost > 0) upBid = Math.min(upBid, maxPairCost - w.dnAvgCost);
+      if (w.upInventory > 0 && w.upAvgCost > 0) dnBid = Math.min(dnBid, maxPairCost - w.upAvgCost);
 
       // Inventory suppression — hard caps
       if (w.upInventory >= params.max_inventory_per_side) upBid = 0;
@@ -822,42 +825,26 @@ class BabyBoneRStrategy implements Strategy {
       await this.updateBid(ctx, w, "UP", upBid, params.maker_bid_size, params);
       await this.updateBid(ctx, w, "DOWN", dnBid, params.maker_bid_size, params);
 
-      // ── Taker: hit cheap asks with FOK ────────────────────────────
-      if (upBid > 0) {
-        try {
-          const upBook = await this.getBookCached(ctx, w.market.upTokenId);
-          const upAsk = this.getBestAsk(upBook);
-          if (upAsk !== null && upAsk <= upBid - params.taker_ask_discount &&
-              w.upInventory < params.max_inventory_per_side &&
-              w.totalBuyCost < params.max_total_cost) {
-            const result = await ctx.api.placeOrder({
-              token_id: w.market.upTokenId, side: "BUY",
-              size: params.taker_bid_size, price: upAsk,
-            });
-            if (result.status === "filled") {
-              const fillPrice = result.price || upAsk;
-              this.recordBuyFill(ctx, w, "UP", result.size, fillPrice, "taker", true);
-              await this.persistTradeToD1(ctx, w, "UP", "BUY", fillPrice, result.size, 0, "taker");
-            }
-          }
-        } catch { /* best-effort */ }
-      }
+      // ── Taker: hit asks at or below our bid (Bonereaper does ~100 taker trades per 2hr) ──
+      for (const side of ["UP", "DOWN"] as const) {
+        const bid = side === "UP" ? upBid : dnBid;
+        const inv = side === "UP" ? w.upInventory : w.dnInventory;
+        if (bid <= 0 || inv >= params.max_inventory_per_side || w.totalBuyCost >= params.max_total_cost) continue;
 
-      if (dnBid > 0) {
         try {
-          const dnBook = await this.getBookCached(ctx, w.market.downTokenId);
-          const dnAsk = this.getBestAsk(dnBook);
-          if (dnAsk !== null && dnAsk <= dnBid - params.taker_ask_discount &&
-              w.dnInventory < params.max_inventory_per_side &&
-              w.totalBuyCost < params.max_total_cost) {
+          const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
+          const book = await this.getBookCached(ctx, tokenId);
+          const ask = this.getBestAsk(book);
+          // Take any ask at or below our bid price (no discount — be aggressive like Bonereaper)
+          if (ask !== null && ask <= bid) {
             const result = await ctx.api.placeOrder({
-              token_id: w.market.downTokenId, side: "BUY",
-              size: params.taker_bid_size, price: dnAsk,
+              token_id: tokenId, side: "BUY",
+              size: params.taker_bid_size, price: ask,
             });
             if (result.status === "filled") {
-              const fillPrice = result.price || dnAsk;
-              this.recordBuyFill(ctx, w, "DOWN", result.size, fillPrice, "taker", true);
-              await this.persistTradeToD1(ctx, w, "DOWN", "BUY", fillPrice, result.size, 0, "taker");
+              const fillPrice = result.price || ask;
+              this.recordBuyFill(ctx, w, side, result.size, fillPrice, "taker", true);
+              await this.persistTradeToD1(ctx, w, side, "BUY", fillPrice, result.size, 0, "taker");
             }
           }
         } catch { /* best-effort */ }
