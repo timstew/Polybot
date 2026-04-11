@@ -134,8 +134,8 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
 
   max_inventory_per_side: 800,   // Bonereaper: ~500-600 per side per window
   max_total_cost: 600,           // Bonereaper: ~$500-$600/window
-  max_skew_ratio: 0.75,          // pause heavy side at 75/25 skew
-  skew_guard_min_tokens: 100,    // activate after 100 tokens accumulated
+  max_skew_ratio: 0.65,          // pause heavy side at 65/35 skew (tighter to match Bonereaper 49/51)
+  skew_guard_min_tokens: 50,     // activate after 50 tokens accumulated
   min_ask_to_bid: 0.35,          // don't bid when market values side < $0.35
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
@@ -813,7 +813,7 @@ class BabyBoneRStrategy implements Strategy {
         // Skew factor: 0 when balanced, positive toward light side
         // Scale bid by (1 + skew_shade * imbalance) on light side
         // and (1 - skew_shade * imbalance) on heavy side
-        const skewShade = 0.50;  // 50% max bid adjustment for skew (stronger to match Bonereaper 49/51)
+        const skewShade = 0.15;  // 15% max bid adjustment (50% was too aggressive, pushed bids to $0.74)
         const imbalance = Math.abs(upShare - 0.5) * 2;  // 0 = balanced, 1 = fully skewed
         if (upShare < 0.5) {
           // UP is light → boost UP bid, reduce DN bid
