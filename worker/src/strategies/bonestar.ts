@@ -59,6 +59,7 @@ export interface BoneStarParams {
   conviction_size_mult: number;  // winning side gets N× base size
   conviction_p_true_min: number; // P_true > this to apply size skew
   losing_side_discount: number;  // bid this much below fair for losing side
+  losing_side_min_bid: number;   // floor for losing-side bid price (ensures fills above fair value)
 
   // Phase 3: Certainty sweep
   sweep_threshold: number;       // P_true > this triggers sweep
@@ -105,8 +106,8 @@ export interface BoneStarParams {
 
 export const DEFAULT_PARAMS: BoneStarParams = {
   target_cryptos: ["Bitcoin"],
-  base_bid_size: 25,
-  bid_offset: 0.02,
+  base_bid_size: 15,             // was 25 — Bonereaper does 5-24 tokens/fill
+  bid_offset: 0.10,             // was 0.02 — deeper offset for cheaper fills (Bonereaper fills $0.31-0.70)
   max_bid_per_side: 0.85,           // Bonereaper buys winning side at $0.65-0.85 in Phase 2
   min_bid_per_side: 0.05,
   max_pair_cost: 0.95,            // pair cost cap for Phase 1/2 (was 0.98 — tighter target)
@@ -114,7 +115,8 @@ export const DEFAULT_PARAMS: BoneStarParams = {
   conviction_start_pct: 0.25,   // Bonereaper shows conviction from ~25% onward
   conviction_size_mult: 1.5,    // was 2.0 — Bonereaper does 5-15 tokens, not 80
   conviction_p_true_min: 0.55,  // lower bar — Bonereaper follows market, not strict P_true
-  losing_side_discount: 0.05,
+  losing_side_discount: 0.00,   // was 0.05 — removing discount: it suppressed losing-side fills
+  losing_side_min_bid: 0.20,    // new — floor ensures losing-side bids above fair value → fills happen
 
   sweep_threshold: 0.90,        // Require strong conviction (was 0.85 — too many wrong-side sweeps)
   sweep_bid_price: 0.98,
@@ -1036,12 +1038,14 @@ class BoneStarStrategy implements Strategy {
 
     if (upWinning) {
       upSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
-      // Cap losing-side bid price — Bonereaper buys losing side at $0.08-$0.34
+      // Losing-side bid: floor at min_bid, cap at max_bid — ensures fills above fair value
+      dnBid = Math.max(dnBid, params.losing_side_min_bid);
       dnBid = Math.min(dnBid, params.losing_side_max_bid);
       dnBid = Math.max(params.min_bid_per_side, dnBid - params.losing_side_discount);
     } else {
       dnSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
-      // Cap losing-side bid price
+      // Losing-side bid: floor at min_bid, cap at max_bid
+      upBid = Math.max(upBid, params.losing_side_min_bid);
       upBid = Math.min(upBid, params.losing_side_max_bid);
       upBid = Math.max(params.min_bid_per_side, upBid - params.losing_side_discount);
     }
@@ -1187,13 +1191,13 @@ class BoneStarStrategy implements Strategy {
       upSize = Math.round(params.base_bid_size * params.conviction_size_mult);
       if (params.sweep_losing_side) {
         const losingBid = Math.min(1 - pTrue + params.losing_side_premium, params.losing_side_max_bid);
-        dnBid = Math.max(params.min_bid_per_side, losingBid);
+        dnBid = Math.max(params.losing_side_min_bid, losingBid);
       }
     } else {
       dnSize = Math.round(params.base_bid_size * params.conviction_size_mult);
       if (params.sweep_losing_side) {
         const losingBid = Math.min(pTrue + params.losing_side_premium, params.losing_side_max_bid);
-        upBid = Math.max(params.min_bid_per_side, losingBid);
+        upBid = Math.max(params.losing_side_min_bid, losingBid);
       }
     }
 

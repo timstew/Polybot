@@ -24,14 +24,15 @@ export interface ParamSpec {
 }
 
 export const BONESTAR_SEARCH_SPACE: ParamSpec[] = [
-  { name: "bid_offset", type: "continuous", min: 0.01, max: 0.08 },
+  { name: "bid_offset", type: "continuous", min: 0.02, max: 0.20 },
   { name: "max_bid_per_side", type: "continuous", min: 0.50, max: 0.95 },
   { name: "max_pair_cost", type: "continuous", min: 0.90, max: 0.99 },
-  { name: "base_bid_size", type: "integer", min: 10, max: 100 },
+  { name: "base_bid_size", type: "integer", min: 5, max: 50 },
   { name: "conviction_start_pct", type: "continuous", min: 0.15, max: 0.50 },
   { name: "conviction_size_mult", type: "continuous", min: 1.0, max: 4.0 },
   { name: "conviction_p_true_min", type: "continuous", min: 0.50, max: 0.70 },
-  { name: "losing_side_discount", type: "continuous", min: 0.01, max: 0.15 },
+  { name: "losing_side_discount", type: "continuous", min: 0.00, max: 0.15 },
+  { name: "losing_side_min_bid", type: "continuous", min: 0.10, max: 0.35 },
   { name: "sweep_threshold", type: "continuous", min: 0.70, max: 0.95 },
   { name: "sweep_size", type: "integer", min: 50, max: 500 },
   { name: "sweep_window_pct", type: "continuous", min: 0.20, max: 0.60 },
@@ -329,12 +330,14 @@ export function replayBoneStarWindow(
 
       if (upWinning) {
         upSize = Math.round(p.base_bid_size_phase2 * sizeMultiplier);
-        // Cap losing-side bid price
+        // Losing-side bid: floor at min_bid, cap at max_bid
+        dnBid = Math.max(dnBid, p.losing_side_min_bid);
         dnBid = Math.min(dnBid, p.losing_side_max_bid);
         dnBid = Math.max(p.min_bid_per_side, dnBid - p.losing_side_discount);
       } else {
         dnSize = Math.round(p.base_bid_size_phase2 * sizeMultiplier);
-        // Cap losing-side bid price
+        // Losing-side bid: floor at min_bid, cap at max_bid
+        upBid = Math.max(upBid, p.losing_side_min_bid);
         upBid = Math.min(upBid, p.losing_side_max_bid);
         upBid = Math.max(p.min_bid_per_side, upBid - p.losing_side_discount);
       }
@@ -469,13 +472,13 @@ export function replayBoneStarWindow(
         upSize = Math.round(p.base_bid_size * p.conviction_size_mult);
         if (p.sweep_losing_side) {
           const losingBid = Math.min(1 - pTrue + p.losing_side_premium, p.losing_side_max_bid);
-          dnBid = Math.max(p.min_bid_per_side, losingBid);
+          dnBid = Math.max(p.losing_side_min_bid, losingBid);
         }
       } else {
         dnSize = Math.round(p.base_bid_size * p.conviction_size_mult);
         if (p.sweep_losing_side) {
           const losingBid = Math.min(pTrue + p.losing_side_premium, p.losing_side_max_bid);
-          upBid = Math.max(p.min_bid_per_side, losingBid);
+          upBid = Math.max(p.losing_side_min_bid, losingBid);
         }
       }
 
