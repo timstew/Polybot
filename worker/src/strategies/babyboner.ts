@@ -106,13 +106,13 @@ export interface BabyBoneRParams {
 export const DEFAULT_PARAMS: BabyBoneRParams = {
   target_cryptos: ["Bitcoin"],
 
-  // Pricing: compressed P_true-proportional
-  // p_floor/p_ceil compress P_true toward 0.50 so losing-side bids are
-  // high enough to actually fill in the CLOB (real market has thin books).
-  // Bonereaper winning avg ~$0.70, losing avg ~$0.28, pair cost ~$0.98
-  target_pair_cost: 0.98,      // Bonereaper avg pair cost ~$0.98
-  p_floor: 0.28,              // losing-side bid floor (Bonereaper avg ~$0.28)
-  p_ceil: 0.70,               // winning-side bid ceiling (Bonereaper avg ~$0.70)
+  // Pricing: near-fair-value market maker
+  // Bonereaper's ACTUAL current fills: UP ~$0.53, DN ~$0.45-$0.60
+  // NOT the $0.28/$0.70 from earlier analysis — they bid near 0.50 on both sides.
+  // p_floor/p_ceil compress P_true to keep bids close enough to cross both sides.
+  target_pair_cost: 0.98,      // Bonereaper PC: $1.00-$1.12 (varies)
+  p_floor: 0.40,              // losing bids at ~$0.39 (crosses $0.40 asks)
+  p_ceil: 0.60,               // winning bids at ~$0.59 (crosses $0.60 asks)
 
   maker_bid_size: 50,          // Bonereaper: 3-220 per fill, median 26, mean 45
   taker_bid_size: 25,          // aggressive taker for missing side
