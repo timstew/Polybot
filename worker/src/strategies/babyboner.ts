@@ -136,7 +136,7 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   max_total_cost: 3000,          // Bonereaper deploys $5000+/window
   max_skew_ratio: 1.0,           // DISABLED — Bonereaper goes 97% one-sided when direction is clear
   skew_guard_min_tokens: 99999,  // disabled — market price guard handles safety
-  min_ask_to_bid: 0.35,          // don't bid when market values side < $0.35 (prevents losing-side flooding)
+  min_ask_to_bid: 0.40,          // don't bid when market values side < $0.40 (prevents losing-side flooding)
 
   requote_interval_ms: 2000,    // requote every 2s (match tick rate)
   p_true_min_conviction: 0.50,  // always trade — Bonereaper trades at all conviction levels
@@ -844,10 +844,12 @@ class BabyBoneRStrategy implements Strategy {
               else dnBid = 0;
               continue;
             }
-            // Guard 2: cap bid at best_ask - 0.01 to be a true resting maker
-            // Bonereaper fills at ~$0.50 on both sides = resting maker, never crosses spread
-            if (bid > bestAsk) {
-              bid = Math.round((bestAsk - 0.01) * 100) / 100;
+            // Guard 2: cap bid well below ask to be a true resting maker
+            // Using ask * 0.80 creates enough distance that the probability-based
+            // fill model (~0.30 * exp(-distance * 20)) gives low fill rates.
+            // With ask=$0.36, bid=max($0.29, our_bid) → distance=0.07 → prob=7.4%
+            if (bid > bestAsk * 0.80) {
+              bid = Math.round(bestAsk * 0.80 * 100) / 100;
               if (bid <= 0) bid = 0;
               if (side === "UP") upBid = bid;
               else dnBid = bid;
