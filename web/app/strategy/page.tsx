@@ -151,6 +151,7 @@ const STRATEGY_DEFAULTS: Record<string, { description: string; tickInterval: num
       { key: "min_window_duration_ms", label: "Min Window (ms)", type: "number", default: 240000, tip: "Skip windows shorter than this" },
       { key: "observation_seconds", label: "Observation (s)", type: "number", default: 0, tip: "Seconds to observe before entering" },
       { key: "profit_reinvest_pct", label: "Reinvest %", type: "number", default: 0.75, tip: "Fraction of profits to reinvest (0-1)" },
+      { key: "capital_cap_usd", label: "Capital Cap ($)", type: "number", default: undefined as unknown as number, tip: "Max working capital — profits above this are locked. Empty = no cap." },
       { key: "max_skew_ratio", label: "Max Skew Ratio", type: "number", default: 0.9, tip: "Stop buying heavy side above this ratio" },
       { key: "skew_guard_min_tokens", label: "Skew Guard Min", type: "number", default: 50, tip: "Min tokens before skew guard activates" },
       { key: "buy_cooldown_ms", label: "Buy Cooldown (ms)", type: "number", default: 0, tip: "Min ms between buys (paper mode)" },
@@ -1306,13 +1307,17 @@ function StrategyDetail({
               <div className="text-xs text-muted-foreground">of {fmt(config.balance_usd)} initial</div>
             </div>
           </Tip>
-          <Tip tip="Profits locked via ratchet. This capital is protected from further losses">
+          <Tip tip={balanceProtection.capital_cap
+            ? `Profits locked via ratchet + capital cap ($${balanceProtection.capital_cap}). Working capital cannot exceed the cap.`
+            : "Profits locked via ratchet. This capital is protected from further losses"}>
             <div className="rounded-lg border p-3 cursor-help">
               <div className="text-xs text-muted-foreground">Locked</div>
               <div className="text-lg font-bold tabular-nums text-blue-600">
                 {fmt(balanceProtection.locked_amount)}
               </div>
-              <div className="text-xs text-muted-foreground">protected</div>
+              <div className="text-xs text-muted-foreground">
+                {balanceProtection.capital_cap ? `cap: ${fmt(balanceProtection.capital_cap)}` : "protected"}
+              </div>
             </div>
           </Tip>
           <Tip tip="Capital above the lock that can still be lost. Strategy auto-stops when this hits $0">

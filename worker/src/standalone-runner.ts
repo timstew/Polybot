@@ -656,15 +656,22 @@ function startServer(port: number, pythonApiUrl: string) {
             const currentBalance = inst.config.balance_usd + inst.state.total_pnl;
             const hwm = inst.state.high_water_balance || 0;
             const reinvestPct = ((inst.config.params as Record<string, unknown>)?.profit_reinvest_pct as number) ?? 0;
+            const capitalCap = ((inst.config.params as Record<string, unknown>)?.capital_cap_usd as number) ?? null;
             const hwmProfit = Math.max(0, hwm - inst.config.balance_usd);
-            const lockedAmount = Math.min(hwmProfit * (1 - reinvestPct), Math.max(0, currentBalance));
-            const workingCapital = currentBalance - lockedAmount;
+            let lockedAmount = Math.min(hwmProfit * (1 - reinvestPct), Math.max(0, currentBalance));
+            let workingCapital = currentBalance - lockedAmount;
+            // Apply capital cap: lock everything above the cap
+            if (capitalCap != null && workingCapital > capitalCap) {
+              lockedAmount += workingCapital - capitalCap;
+              workingCapital = capitalCap;
+            }
             balanceProtection = {
               current_balance: Math.round(currentBalance * 100) / 100,
               locked_amount: Math.round(lockedAmount * 100) / 100,
               working_capital: Math.round(workingCapital * 100) / 100,
               high_water_balance: Math.round(hwm * 100) / 100,
               effective_max_capital: Math.round(workingCapital * 100) / 100,
+              capital_cap: capitalCap,
             };
           }
 
@@ -714,15 +721,18 @@ function startServer(port: number, pythonApiUrl: string) {
               const cb = inst.config.balance_usd + inst.state.total_pnl;
               const hwm = inst.state.high_water_balance || 0;
               const rp = ((inst.config.params as Record<string, unknown>)?.profit_reinvest_pct as number) ?? 0;
+              const cap = ((inst.config.params as Record<string, unknown>)?.capital_cap_usd as number) ?? null;
               const hwmP = Math.max(0, hwm - inst.config.balance_usd);
-              const locked = Math.min(hwmP * (1 - rp), Math.max(0, cb));
-              const wc = cb - locked;
+              let locked = Math.min(hwmP * (1 - rp), Math.max(0, cb));
+              let wc = cb - locked;
+              if (cap != null && wc > cap) { locked += wc - cap; wc = cap; }
               bp = {
                 current_balance: Math.round(cb * 100) / 100,
                 locked_amount: Math.round(locked * 100) / 100,
                 working_capital: Math.round(wc * 100) / 100,
                 high_water_balance: Math.round(hwm * 100) / 100,
                 effective_max_capital: Math.round(wc * 100) / 100,
+                capital_cap: cap,
               };
             }
             statuses[row.id] = {

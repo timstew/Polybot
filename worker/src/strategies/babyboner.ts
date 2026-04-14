@@ -636,7 +636,10 @@ class BabyBoneRStrategy implements Strategy {
     // ── Dynamic capital scaling ─────────────────────────────────────
     // Derive bid size, windows, and duration limits from available capital.
     // Allows a $20 account to trade conservatively and scale up as profits grow.
-    const effectiveCapital = ctx.config.max_capital_usd + (this.custom.totalPnl || 0);
+    // capital_cap_usd: hard cap on working capital — excess is locked as profit.
+    const capitalCap = (params as Record<string, unknown>).capital_cap_usd as number | undefined;
+    let effectiveCapital = ctx.config.max_capital_usd + (this.custom.totalPnl || 0);
+    if (capitalCap != null && effectiveCapital > capitalCap) effectiveCapital = capitalCap;
     if (effectiveCapital > 0) {
       // Bid size capped at 50 tokens — Bonereaper averages 53.6 (P50=26.4).
       // Large capital scales via fill count (more windows, faster cooldown), not larger orders.
