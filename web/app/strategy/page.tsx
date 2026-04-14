@@ -142,7 +142,7 @@ const STRATEGY_DEFAULTS: Record<string, { description: string; tickInterval: num
     fields: [
       { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin"], tip: "Crypto symbols to trade" },
       { key: "shadow_wallet", label: "Shadow Wallet", type: "string", default: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30", tip: "Bonereaper's wallet address for shadow fills" },
-      { key: "pricing_mode", label: "Pricing Mode", type: "select", default: "hybrid", options: ["book", "hybrid", "ladder"], tip: "hybrid=max($0.55,P_true) best for shadow fills, book=CLOB ask, ladder=P_true-edge" },
+      { key: "pricing_mode", label: "Pricing Mode", type: "select", default: "bonereaper", options: ["bonereaper", "hybrid", "book", "ladder"], tip: "bonereaper=3-phase adaptive (deep value→P_true→certainty load), hybrid=max($0.55,P_true), book=CLOB ask" },
       { key: "merge_exit", label: "Auto-Merge", type: "boolean", default: true, tip: "Merge paired UP+DOWN tokens to lock in profit" },
       { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 6, tip: "Max simultaneous windows" },
       { key: "max_total_cost", label: "Max Cost/Window ($)", type: "number", default: 3000, tip: "Max USDC deployed per window" },

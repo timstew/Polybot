@@ -82,7 +82,18 @@ export interface BabyBoneRParams {
   //   "book"   — bid at best ask from real CLOB book (what Bonereaper does)
   //   "hybrid" — max(winning_share, P_true) both sides (shadow fill mode)
   //   "ladder" — P_true - edge1/edge2 (P_true-following with edge)
-  pricing_mode: "book" | "hybrid" | "ladder";
+  //   "bonereaper" — three-phase adaptive: deep value early, P_true mid, aggressive certainty late
+  pricing_mode: "book" | "hybrid" | "ladder" | "bonereaper";
+
+  // Bonereaper mode params
+  br_certainty_threshold: number;    // P_true threshold for "strong signal" — suppress losing side (default 0.65)
+  br_suppress_after_pct: number;     // suppress losing side after this % of window elapsed (default 0.50)
+  br_late_size_mult: number;         // multiply winning bid size in late window (default 2.0)
+  br_deep_value_price: number;       // bid price when market is uncertain (default 0.15)
+  br_uncertain_range: number;        // P_true within 0.50 ± this is "uncertain" (default 0.10)
+
+  // Capital cap
+  capital_cap_usd?: number;          // max working capital — excess locked as profit
 
   // Legacy pricing params (used by hybrid and ladder modes)
   target_pair_cost: number;
@@ -161,6 +172,13 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
 
   // Pricing mode — "book" bids at real CLOB asks, "hybrid"/"ladder" use formulas
   pricing_mode: "book",        // DEFAULT: bid at best ask (what Bonereaper does)
+
+  // Bonereaper mode — three-phase adaptive pricing
+  br_certainty_threshold: 0.65,  // P_true above this = strong signal, suppress losing side
+  br_suppress_after_pct: 0.50,   // suppress losing side after 50% of window elapsed
+  br_late_size_mult: 2.0,        // double bid size on winning side in late window
+  br_deep_value_price: 0.15,     // bid $0.15 when market uncertain (P_true near 0.50)
+  br_uncertain_range: 0.10,      // P_true in [0.40, 0.60] = "uncertain"
 
   // Legacy pricing params (used by hybrid and ladder modes)
   target_pair_cost: 1.00,
@@ -479,7 +497,24 @@ class BabyBoneRStrategy implements Strategy {
     const pricingMode = params.pricing_mode || "hybrid";
 
     let bid = 0;
-    if (pricingMode === "hybrid") {
+    if (pricingMode === "bonereaper") {
+      const windowDuration = w.windowEndTime - w.windowOpenTime;
+      const elapsedPct = (now - w.windowOpenTime) / windowDuration;
+      const isLateWindow = elapsedPct > params.br_suppress_after_pct;
+      const isUncertain = pCapped > (0.50 - params.br_uncertain_range) && pCapped < (0.50 + params.br_uncertain_range);
+      const isStrongUp = pCapped > params.br_certainty_threshold;
+      const isStrongDn = pCapped < (1 - params.br_certainty_threshold);
+
+      if (isLateWindow && (isStrongUp || isStrongDn)) {
+        const sideIsWinning = (isUp && isStrongUp) || (!isUp && isStrongDn);
+        bid = sideIsWinning ? (isUp ? pCapped : 1 - pCapped) : 0;
+      } else if (!isLateWindow && isUncertain) {
+        bid = params.br_deep_value_price;
+      } else {
+        bid = isUp ? Math.max(params.br_deep_value_price, pCapped) : Math.max(params.br_deep_value_price, 1 - pCapped);
+      }
+      bid = Math.min(0.95, bid);
+    } else if (pricingMode === "hybrid") {
       bid = isUp ? Math.max(params.winning_share, pCapped) : Math.max(params.winning_share, 1 - pCapped);
     } else if (pricingMode === "book") {
       const bestAsk = this.getBestAsk(book);
@@ -639,7 +674,7 @@ class BabyBoneRStrategy implements Strategy {
     // Derive bid size, windows, and duration limits from available capital.
     // Allows a $20 account to trade conservatively and scale up as profits grow.
     // capital_cap_usd: hard cap on working capital — excess is locked as profit.
-    const capitalCap = (params as Record<string, unknown>).capital_cap_usd as number | undefined;
+    const capitalCap = params.capital_cap_usd;
     let effectiveCapital = ctx.config.max_capital_usd + (this.custom.totalPnl || 0);
     if (capitalCap != null && effectiveCapital > capitalCap) effectiveCapital = capitalCap;
     if (effectiveCapital > 0) {
@@ -1444,6 +1479,34 @@ class BabyBoneRStrategy implements Strategy {
         upBid2 = Math.max(0.01, upBid2);
         dnBid = Math.max(0.01, dnBid);
         dnBid2 = Math.max(0.01, dnBid2);
+      } else if (pricingMode === "bonereaper") {
+        // Bonereaper three-phase adaptive pricing:
+        // 1. Deep value: bid $0.15 both sides when market uncertain (P_true near 0.50)
+        // 2. Standard: follow P_true with deep-value floor
+        // 3. Late certainty: suppress losing side, aggressively load winning side
+        const windowDuration = w.windowEndTime - w.windowOpenTime;
+        const elapsedPct = (now - w.windowOpenTime) / windowDuration;
+        const isLateWindow = elapsedPct > params.br_suppress_after_pct;
+        const isUncertain = pCapped > (0.50 - params.br_uncertain_range)
+                         && pCapped < (0.50 + params.br_uncertain_range);
+        const isStrongUp = pCapped > params.br_certainty_threshold;
+        const isStrongDn = pCapped < (1 - params.br_certainty_threshold);
+
+        if (isLateWindow && (isStrongUp || isStrongDn)) {
+          // Phase 3: Late certainty — suppress losing side, bid aggressively on winning side
+          upBid = isStrongUp ? pCapped : 0;
+          dnBid = isStrongDn ? (1 - pCapped) : 0;
+        } else if (!isLateWindow && isUncertain) {
+          // Phase 1: Deep value — rest cheap bids on both sides, get filled by panicked sellers
+          upBid = params.br_deep_value_price;
+          dnBid = params.br_deep_value_price;
+        } else {
+          // Phase 2: Standard — follow P_true with deep-value floor
+          upBid = Math.max(params.br_deep_value_price, pCapped);
+          dnBid = Math.max(params.br_deep_value_price, 1 - pCapped);
+        }
+        upBid = Math.min(0.95, upBid);
+        dnBid = Math.min(0.95, dnBid);
       } else {
         // Hybrid: max(winning_share, P_true) both sides — for shadow fill matching
         upBid = Math.max(params.winning_share, pCapped);
@@ -1545,6 +1608,17 @@ class BabyBoneRStrategy implements Strategy {
             fillSize = Math.max(1, Math.floor(fillSize)); // at least 1 token, integer
           }
         } catch { /* book unavailable — use fallback size */ }
+
+        // Bonereaper late-window size boost: increase winning side fill size
+        if (pricingMode === "bonereaper") {
+          const windowDuration = w.windowEndTime - w.windowOpenTime;
+          const elapsedPct = (now - w.windowOpenTime) / windowDuration;
+          const isWinningSide = (side === "UP" && pCapped > 0.5) || (side === "DOWN" && pCapped < 0.5);
+          if (elapsedPct > params.br_suppress_after_pct && isWinningSide) {
+            fillSize = Math.max(1, Math.floor(fillSize * params.br_late_size_mult));
+          }
+        }
+
         const levelLabel = level === 2 ? "L2" : "L1";
 
         if (isReal) {
@@ -1693,7 +1767,17 @@ class BabyBoneRStrategy implements Strategy {
 
       const ladderStr = params.ladder_enabled ? `/${upBid2.toFixed(2)}` : "";
       const ladderStrDn = params.ladder_enabled ? `/${dnBid2.toFixed(2)}` : "";
-      w.tickAction = `Quoting: up=${upBid.toFixed(2)}${ladderStr} dn=${dnBid.toFixed(2)}${ladderStrDn}`;
+      // Phase label for bonereaper mode
+      let phaseLabel = "";
+      if (pricingMode === "bonereaper") {
+        const windowDuration = w.windowEndTime - w.windowOpenTime;
+        const elapsedPct = (now - w.windowOpenTime) / windowDuration;
+        const isLate = elapsedPct > params.br_suppress_after_pct;
+        const isUncertain = pCapped > (0.50 - params.br_uncertain_range) && pCapped < (0.50 + params.br_uncertain_range);
+        const isStrong = pCapped > params.br_certainty_threshold || pCapped < (1 - params.br_certainty_threshold);
+        phaseLabel = isLate && isStrong ? " [LOAD]" : !isLate && isUncertain ? " [DVB]" : " [STD]";
+      }
+      w.tickAction = `Quoting: up=${upBid.toFixed(2)}${ladderStr} dn=${dnBid.toFixed(2)}${ladderStrDn}${phaseLabel}`;
 
       this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
       acknowledgePriceChange(w.cryptoSymbol);
