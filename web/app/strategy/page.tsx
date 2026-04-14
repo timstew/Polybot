@@ -642,8 +642,10 @@ function extractOverviewStats(custom: Record<string, unknown> | undefined, strat
     ...((custom?.completedWindows as Array<{ totalBuyCost?: number }>) ?? []),
   ];
   const totalCapitalCycled = allWindows.reduce((s, w) => s + (w.totalBuyCost ?? 0), 0);
-  // Return on risk: P&L vs capital allocated to the strategy
-  const returnOnRisk = riskCapital > 0 ? pnl / riskCapital : 0;
+  // Return on risk: P&L vs peak unmatched capital actually at risk (not initial balance or total cycled)
+  const peakCapital = (custom?.peakCapitalDeployed as number) ?? 0;
+  const riskDenominator = peakCapital > 0 ? peakCapital : riskCapital; // fallback to config if no peak tracked yet
+  const returnOnRisk = riskDenominator > 0 ? pnl / riskDenominator : 0;
 
   if (isUnified) {
     const stats = custom?.stats as { windowsTraded?: number; sniperWins?: number; makerWins?: number; totalPnl?: number } | undefined;
@@ -2479,8 +2481,8 @@ export default function StrategyPage() {
                       </td>
                       <td className="py-2 px-1 text-right font-mono tabular-nums">
                         <Tip tip={bp
-                          ? `${fmt(pnl)} on ${fmt(riskCapital)} risked (${fmt(totalCapitalCycled)} cycled) | Bal ${fmt(bp.current_balance)} | Working ${fmt(bp.working_capital)}`
-                          : `${fmt(pnl)} on ${fmt(riskCapital)} risked (${fmt(totalCapitalCycled)} cycled)`
+                          ? `${fmt(pnl)} P&L / ${fmt(riskDenominator)} peak at risk (${fmt(totalCapitalCycled)} cycled) | Bal ${fmt(bp.current_balance)} | Working ${fmt(bp.working_capital)}`
+                          : `${fmt(pnl)} P&L / ${fmt(riskDenominator)} peak at risk (${fmt(totalCapitalCycled)} cycled)`
                         }>
                           <span className={`cursor-help ${returnOnRisk >= 0 ? "text-green-600" : "text-red-600"}`}>
                             {traded > 0 ? `${(returnOnRisk * 100).toFixed(1)}%` : "—"}

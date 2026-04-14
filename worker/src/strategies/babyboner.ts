@@ -344,6 +344,7 @@ interface CustomState {
   windowsLost: number;
   perAsset: Record<string, { won: number; lost: number; pnl: number; fills: number }>;
   scanStatus: string;
+  peakCapitalDeployed: number;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -363,6 +364,7 @@ function emptyCustom(): CustomState {
     windowsLost: 0,
     perAsset: {},
     scanStatus: "Starting up…",
+    peakCapitalDeployed: 0,
   };
 }
 
@@ -865,12 +867,17 @@ class BabyBoneRStrategy implements Strategy {
 
     // 8. Persist
     ctx.state.custom = this.custom as unknown as Record<string, unknown>;
-    // Capital deployed: current inventory cost (what's still at risk right now)
-    // Auto-merge keeps this low, but it's the accurate "money in play" number.
-    // We also report totalBuyCost via custom state for the UI to show total volume.
-    ctx.state.capital_deployed = this.custom.activeWindows.reduce(
-      (sum, w) => sum + w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost, 0,
-    );
+    // Capital deployed: current unmatched inventory cost (what's actually at risk).
+    // Matched pairs are structurally profitable and don't count as risk.
+    ctx.state.capital_deployed = this.custom.activeWindows.reduce((sum, w) => {
+      const matched = Math.min(w.upInventory, w.downInventory);
+      const unmatchedUp = (w.upInventory - matched) * w.upAvgCost;
+      const unmatchedDn = (w.downInventory - matched) * w.downAvgCost;
+      return sum + unmatchedUp + unmatchedDn;
+    }, 0);
+    // Track peak capital at risk (for accurate RoR% calculation)
+    if (this.custom.peakCapitalDeployed == null) this.custom.peakCapitalDeployed = 0;
+    this.custom.peakCapitalDeployed = Math.max(this.custom.peakCapitalDeployed, ctx.state.capital_deployed);
     ctx.state.total_pnl = this.custom.totalPnl;
   }
 
