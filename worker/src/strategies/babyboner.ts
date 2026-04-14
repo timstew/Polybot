@@ -48,6 +48,7 @@ import {
   disableReactiveFeed,
 } from "./reactive-feed";
 import { classifyRegime, computeRegimeFeatures } from "./regime";
+import { getClobBalance, adjustClobBalance } from "../standalone-runner";
 import {
   enableClobFeed,
   subscribeClobTokens,
@@ -301,6 +302,10 @@ interface BabyBoneRWindow {
   // Multi-level order tracking (for bonereaper ladder — keyed by "UP_3" or "DOWN_1")
   ladderOrders?: Record<string, { orderId: string | null; price: number }>;
 
+  // Certainty phase tracking — once [LOAD] activates, stays locked (only flips on full reversal past 0.50)
+  loadActivated?: boolean;       // has [LOAD] ever activated in this window?
+  loadSide?: "UP" | "DOWN";     // which side was being loaded?
+
   // Prediction at end
   binancePrediction?: "UP" | "DOWN" | null;
 
@@ -516,12 +521,12 @@ class BabyBoneRStrategy implements Strategy {
       const elapsedPct = (now - w.windowOpenTime) / windowDuration;
       const isLateWindow = elapsedPct > params.br_suppress_after_pct;
       const isUncertain = pCapped > (0.50 - params.br_uncertain_range) && pCapped < (0.50 + params.br_uncertain_range);
-      const isStrongUp = pCapped > params.br_certainty_threshold;
-      const isStrongDn = pCapped < (1 - params.br_certainty_threshold);
 
-      if (isLateWindow && (isStrongUp || isStrongDn)) {
-        const sideIsWinning = (isUp && isStrongUp) || (!isUp && isStrongDn);
-        bid = sideIsWinning ? (isUp ? pCapped : 1 - pCapped) : 0;
+      // Respect [LOAD] hysteresis — if locked, check if this side is suppressed
+      if (w.loadActivated && isLateWindow) {
+        const suppressed = (isUp && w.loadSide === "DOWN") || (!isUp && w.loadSide === "UP");
+        if (suppressed) { bid = 0; }
+        else { bid = isUp ? pCapped : 1 - pCapped; }
       } else if (!isLateWindow && isUncertain) {
         bid = params.br_deep_value_price;
       } else {
@@ -1566,10 +1571,29 @@ class BabyBoneRStrategy implements Strategy {
           dnLadder.push(Math.min(0.95, deepPrice + t * Math.max(0, dnFair - deepPrice)));
         }
 
-        // Late certainty: suppress losing side ladder entirely
+        // Late certainty with hysteresis:
+        // Once [LOAD] activates, it stays locked. Only changes if P_true crosses 0.50 (full reversal).
+        // Brief wobbles (0.70→0.58→0.72) don't cause a flip back to [STD].
+        // Real reversals (0.70→0.35) flip to [LOAD] the other side. Matches BR's actual behavior
+        // (42% of windows flip heavy side, 39% flip late — they follow real reversals, not wobbles).
+        const upIsWinning = pCapped > 0.50;
         if (isLateWindow && (isStrongUp || isStrongDn)) {
-          if (isStrongDn) upLadder.fill(0);
-          if (isStrongUp) dnLadder.fill(0);
+          // Fresh activation or same-side continuation
+          w.loadActivated = true;
+          w.loadSide = upIsWinning ? "UP" : "DOWN";
+        } else if (w.loadActivated && isLateWindow) {
+          // [LOAD] was active — check for full reversal
+          if ((w.loadSide === "UP" && !upIsWinning) || (w.loadSide === "DOWN" && upIsWinning)) {
+            // P_true crossed 0.50 — flip to the other side
+            w.loadSide = upIsWinning ? "UP" : "DOWN";
+          }
+          // Otherwise stay in [LOAD] on the same side (hysteresis — ignore wobbles)
+        }
+
+        // Apply [LOAD] suppression if active
+        if (w.loadActivated && isLateWindow) {
+          if (w.loadSide === "UP") dnLadder.fill(0);
+          if (w.loadSide === "DOWN") upLadder.fill(0);
         }
 
         // L1 bid = highest level (fair price), used for display + legacy suppression
@@ -1675,6 +1699,8 @@ class BabyBoneRStrategy implements Strategy {
       }
 
       // Track capital committed this tick across all orders (prevents over-deploying small balances)
+      // For real mode: use the shared CLOB balance as ground truth
+      const clobFreeBalance = isReal ? getClobBalance() : this.effectiveCapital;
       let tickCapitalCommitted = 0;
       let orderFailed = false;
 
@@ -1762,11 +1788,12 @@ class BabyBoneRStrategy implements Strategy {
           if (!this.getRealOrderId(w, side, level)) {
             // Capital budget: don't commit more than effective capital across all orders this tick
             const orderCost = roundedBid * fillSize;
-            if (tickCapitalCommitted + orderCost > this.effectiveCapital) {
+            const budgetRemaining = clobFreeBalance - tickCapitalCommitted;
+            if (orderCost > budgetRemaining) {
               continue; // skip this level — not enough budget
             }
             try {
-              ctx.log(`ORDER: ${side} ${levelLabel} $${roundedBid} sz=${fillSize} cost=$${orderCost.toFixed(1)} budget=$${(this.effectiveCapital - tickCapitalCommitted).toFixed(1)}`, { level: "signal" });
+              ctx.log(`ORDER: ${side} ${levelLabel} $${roundedBid} sz=${fillSize} cost=$${orderCost.toFixed(1)} budget=$${budgetRemaining.toFixed(1)}${isReal ? " clob=$" + clobFreeBalance.toFixed(1) : ""}`, { level: "signal" });
               const result = await ctx.api.placeOrder({
                 token_id: tokenId,
                 side: "BUY",
@@ -1779,11 +1806,14 @@ class BabyBoneRStrategy implements Strategy {
                 ctx.log(`FILL: ${side} ${levelLabel} ${result.size}@$${result.price?.toFixed(3)}`, { level: "signal" });
                 this.recordBuyFill(ctx, w, side, result.size, result.price, `real_${levelLabel}_imm`, true);
                 await this.persistTradeToD1(ctx, w, side, "BUY", result.price, result.size, 0, `real_${levelLabel}_imm`);
-                tickCapitalCommitted += result.price * result.size;
+                const fillCost = result.price * result.size;
+                tickCapitalCommitted += fillCost;
+                if (isReal) adjustClobBalance(-fillCost); // tokens bought, USDC spent
               } else if (result.status === "placed") {
                 this.setRealOrderId(w, side, level, result.order_id);
                 this.setRealOrderPrice(w, side, level, roundedBid);
                 tickCapitalCommitted += orderCost; // reserved by resting order
+                if (isReal) adjustClobBalance(-orderCost); // CLOB locks this capital
               } else {
                 // Order failed — likely insufficient balance. Stop placing more.
                 ctx.log(`ORDER FAILED: ${side} ${levelLabel} $${roundedBid} — ${result.error?.slice(0, 80) ?? "unknown"}`, { level: "warning" });
@@ -1895,7 +1925,7 @@ class BabyBoneRStrategy implements Strategy {
         const isLate = elapsedPct > params.br_suppress_after_pct;
         const isUncertain = pCapped > (0.50 - params.br_uncertain_range) && pCapped < (0.50 + params.br_uncertain_range);
         const isStrong = pCapped > params.br_certainty_threshold || pCapped < (1 - params.br_certainty_threshold);
-        const phase = isLate && isStrong ? "LOAD" : !isLate && isUncertain ? "DVB" : "STD";
+        const phase = w.loadActivated && isLate ? `LOAD${w.loadSide === "UP" ? "↑" : "↓"}` : !isLate && isUncertain ? "DVB" : "STD";
         const upLadder = (w._upLadder as number[]) || [];
         const dnLadder = (w._dnLadder as number[]) || [];
         const c2 = (n: number) => Math.round(n * 100); // $0.15 → 15

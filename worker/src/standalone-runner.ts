@@ -196,6 +196,25 @@ const instances = new Map<string, RunnerInstance>();
 let sqliteDb: InstanceType<typeof Database>;
 let d1Db: D1Database;
 
+// ── Shared CLOB balance cache ───────────────────────────────────────
+// Polled from Python API every 30s. Strategies read this instead of making
+// their own API calls. Decremented on order placement, adjusted on fills/cancels.
+let sharedClobBalance = 0;
+let sharedClobBalanceAt = 0;
+const BALANCE_POLL_INTERVAL_MS = 30_000;
+
+export function getClobBalance(): number { return sharedClobBalance; }
+export function adjustClobBalance(delta: number): void { sharedClobBalance = Math.max(0, sharedClobBalance + delta); }
+
+async function pollClobBalance(pythonApiUrl: string): Promise<void> {
+  try {
+    const resp = await fetch(`${pythonApiUrl}/api/strategy/balance`);
+    const data = (await resp.json()) as { balance: number };
+    sharedClobBalance = data.balance || 0;
+    sharedClobBalanceAt = Date.now();
+  } catch { /* keep stale value */ }
+}
+
 function loadConfig(configId: string): StrategyConfig | null {
   const row = sqliteDb.prepare(
     "SELECT * FROM strategy_configs WHERE id = ?"
@@ -1097,6 +1116,11 @@ async function main() {
   } catch (e) {
     console.log(`Oracle feed: unavailable (${e instanceof Error ? e.message : String(e)})`);
   }
+
+  // Start shared CLOB balance poller
+  await pollClobBalance(pythonApiUrl);
+  setInterval(() => pollClobBalance(pythonApiUrl), BALANCE_POLL_INTERVAL_MS);
+  console.log(`CLOB balance: $${sharedClobBalance.toFixed(2)} (polling every ${BALANCE_POLL_INTERVAL_MS / 1000}s)`);
 
   // Start HTTP server
   startServer(port, pythonApiUrl);
