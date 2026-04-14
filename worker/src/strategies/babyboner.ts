@@ -1846,19 +1846,20 @@ class BabyBoneRStrategy implements Strategy {
         const phase = isLate && isStrong ? "LOAD" : !isLate && isUncertain ? "DVB" : "STD";
         const upLadder = (w._upLadder as number[]) || [];
         const dnLadder = (w._dnLadder as number[]) || [];
-        const fmtL = (arr: number[]) => arr.filter(p => p > 0).map(p => p.toFixed(2)).join("/");
-        phaseLabel = ` [${phase}] bids:${fmtL(upLadder)}|${fmtL(dnLadder)}`;
+        const c2 = (n: number) => Math.round(n * 100); // $0.15 → 15
+        const fmtL = (arr: number[]) => arr.filter(p => p > 0).map(c2).join("/");
+        phaseLabel = ` [${phase}] ${fmtL(upLadder)}|${fmtL(dnLadder)}`;
       }
       // Expose book state for UI visibility
       w.upAsk = upAsk;
       w.dnAsk = dnAsk;
       w.upAskVol = upAskVol;
       w.dnAskVol = dnAskVol;
-      const fmtAsk = (p: number | null, v: number) => p != null ? `${p.toFixed(2)}(${Math.round(v)})` : "—";
+      const fmtAsk = (p: number | null, v: number) => p != null ? `${Math.round(p*100)}(${Math.round(v)})` : "—";
       const bookStr = upAsk != null || dnAsk != null
-        ? ` book:${fmtAsk(upAsk, upAskVol)}/${fmtAsk(dnAsk, dnAskVol)}`
+        ? ` ask:${fmtAsk(upAsk, upAskVol)}/${fmtAsk(dnAsk, dnAskVol)}`
         : "";
-      w.tickAction = `Quoting: up=${upBid.toFixed(2)}${ladderStr} dn=${dnBid.toFixed(2)}${ladderStrDn}${phaseLabel}${bookStr}`;
+      w.tickAction = `up=${Math.round(upBid*100)} dn=${Math.round(dnBid*100)}${phaseLabel}${bookStr}`;
 
       this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
       acknowledgePriceChange(w.cryptoSymbol);
