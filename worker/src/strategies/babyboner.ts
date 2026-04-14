@@ -1461,7 +1461,7 @@ class BabyBoneRStrategy implements Strategy {
       const priceChanged = hasPriceChanged(w.cryptoSymbol);
       const forceRequote = w.lastRequoteAt === 0; // first tick for this window
       if (!priceChanged && !forceRequote && now - w.lastRequoteAt < params.requote_interval_ms) {
-        // Nothing changed — skip quoting
+        // Nothing changed — skip quoting, tickAction retains last value
         this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
         acknowledgePriceChange(w.cryptoSymbol);
         continue;
