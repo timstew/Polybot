@@ -1847,20 +1847,37 @@ def strategy_wallet_overview():
 
     result: dict = {"wallet_address": cfg.funder_address}
 
-    # USDC balance via on-chain balanceOf
+    # USDC balance: use CLOB balance (what's available for trading) for totals,
+    # and on-chain balance for reference. During redemptions, CLOB balance lags
+    # behind on-chain, which prevents double-counting (position still shows in
+    # Data API while USDC already arrived on-chain).
+    clob_balance = 0
+    try:
+        client = _get_clob_client()
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        bal_result = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        raw = bal_result.get("balance", 0) if isinstance(bal_result, dict) else 0
+        clob_balance = round(int(raw) / 1e6, 2)
+    except Exception as e:
+        logger.warning("CLOB balance fetch failed: %s", e)
+
+    onchain_balance = 0
     try:
         from web3 import Web3
 
         w3 = Web3(Web3.HTTPProvider("https://polygon-bor.publicnode.com"))
         usdc_addr = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
         wallet_cs = Web3.to_checksum_address(cfg.funder_address)
-        # ERC-20 balanceOf(address) → uint256
         data = "0x70a08231" + bytes.fromhex(wallet_cs[2:].lower().zfill(64)).hex()
         raw = w3.eth.call({"to": usdc_addr, "data": data})
-        result["usdc_balance"] = round(int(raw.hex(), 16) / 1e6, 2)
+        onchain_balance = round(int(raw.hex(), 16) / 1e6, 2)
     except Exception as e:
-        logger.warning("USDC balance fetch failed: %s", e)
-        result["usdc_balance"] = 0
+        logger.warning("On-chain USDC balance fetch failed: %s", e)
+
+    # Use CLOB balance for totals (conservative — doesn't include pending redeems)
+    # Fall back to on-chain if CLOB unavailable
+    result["usdc_balance"] = clob_balance if clob_balance > 0 else onchain_balance
+    result["onchain_balance"] = onchain_balance
 
     # POL (native token) balance
     try:

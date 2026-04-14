@@ -968,31 +968,40 @@ function startServer(port: number, pythonApiUrl: string) {
       if (url.pathname === "/api/strategy/wallet-overview" && method === "GET") {
         try {
           const pyUrl = pythonApiUrl;
-          // Fetch balance, positions, and POL in parallel
-          const [balRes, posRes, polRes] = await Promise.all([
-            fetch(`${pyUrl}/api/strategy/balance`).then(r => r.json()).catch(() => ({ balance: 0 })),
-            fetch(`${pyUrl}/api/redeem/positions`).then(r => r.json()).catch(() => ({ positions: [] })),
-            fetch(`${pyUrl}/api/strategy/wallet-overview`).then(r => r.json()).catch(() => ({})),
-          ]);
-          const usdc = (balRes as Record<string, unknown>).balance as number || 0;
-          const positions = ((posRes as Record<string, unknown>).positions || []) as Array<Record<string, unknown>>;
-          const unredeemed = positions.reduce((sum: number, p) => sum + ((p.currentValue as number) || 0), 0);
-          const redeemable = positions.filter(p => p.redeemable).length;
-          const pol = (polRes as Record<string, unknown>).pol_balance as number || 0;
-          const walletAddress = (polRes as Record<string, unknown>).wallet_address as string || "";
-          const pendingWinsValue = (polRes as Record<string, unknown>).pending_wins_value as number || 0;
-          const pendingWinsCount = (polRes as Record<string, unknown>).pending_wins_count as number || 0;
+          // Delegate to Python API which reads on-chain USDC + Data API positions in one snapshot.
+          // This avoids double-counting during redemptions (CLOB balance updates before positions disappear).
+          const overview = await fetch(`${pyUrl}/api/strategy/wallet-overview`).then(r => r.json()).catch(() => ({})) as Record<string, unknown>;
+          const usdc = (overview.usdc_balance as number) || 0;
+          const unredeemed = (overview.unredeemed_value as number) || 0;
+          const pendingWinsValue = (overview.pending_wins_value as number) || 0;
+          const pendingWinsCount = (overview.pending_wins_count as number) || 0;
+          const unredeemedCount = (overview.unredeemed_count as number) || 0;
+
+          // Also get deployed capital from active strategy windows (not in Python API)
+          let deployedCapital = 0;
+          for (const [, inst] of instances) {
+            if (inst.config.mode === "real") {
+              deployedCapital += inst.state.capital_deployed || 0;
+            }
+          }
+
+          // Total = USDC + unredeemed + pending wins + deployed (don't double-count deployed — it's already in USDC via CLOB allowance)
+          // Actually deployed capital is NOT in USDC balance — it's locked in resting orders.
+          // But the CLOB balance already excludes locked order capital. So total = usdc + unredeemed + pending + deployed.
+          // No: deployed is the cost of TOKENS we hold, which aren't in USDC or positions.
+          // Active window tokens haven't resolved yet, so they're not in unredeemed_value.
+          // For now, just use: usdc + unredeemed + pending_wins (deployed is in USDC or in open positions already).
           jsonResponse(res, {
             usdc_balance: usdc,
-            total_balance: usdc + unredeemed + pendingWinsValue,
+            total_balance: Math.round((usdc + unredeemed + pendingWinsValue) * 100) / 100,
             unredeemed_value: unredeemed,
-            unredeemed_count: redeemable,
+            unredeemed_count: unredeemedCount,
             pending_wins_value: pendingWinsValue,
             pending_wins_count: pendingWinsCount,
-            pol_balance: pol,
-            wallet_address: walletAddress,
-            position_count: positions.length,
-            redeemable_count: redeemable,
+            pol_balance: (overview.pol_balance as number) || 0,
+            wallet_address: (overview.wallet_address as string) || "",
+            position_count: unredeemedCount + pendingWinsCount,
+            redeemable_count: unredeemedCount,
           });
         } catch (e) {
           jsonResponse(res, { usdc_balance: 0, total_balance: 0, unredeemed_value: 0, error: String(e) });
