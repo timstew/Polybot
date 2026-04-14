@@ -664,6 +664,7 @@ function startServer(port: number, pythonApiUrl: string) {
               locked_amount: Math.round(lockedAmount * 100) / 100,
               working_capital: Math.round(workingCapital * 100) / 100,
               high_water_balance: Math.round(hwm * 100) / 100,
+              effective_max_capital: Math.round(workingCapital * 100) / 100,
             };
           }
 
@@ -715,11 +716,13 @@ function startServer(port: number, pythonApiUrl: string) {
               const rp = ((inst.config.params as Record<string, unknown>)?.profit_reinvest_pct as number) ?? 0;
               const hwmP = Math.max(0, hwm - inst.config.balance_usd);
               const locked = Math.min(hwmP * (1 - rp), Math.max(0, cb));
+              const wc = cb - locked;
               bp = {
                 current_balance: Math.round(cb * 100) / 100,
                 locked_amount: Math.round(locked * 100) / 100,
-                working_capital: Math.round((cb - locked) * 100) / 100,
+                working_capital: Math.round(wc * 100) / 100,
                 high_water_balance: Math.round(hwm * 100) / 100,
+                effective_max_capital: Math.round(wc * 100) / 100,
               };
             }
             statuses[row.id] = {
