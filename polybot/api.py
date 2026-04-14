@@ -1675,10 +1675,18 @@ def strategy_place_order(body: dict):
             if order_id:
                 try:
                     order_info = client.get_order(order_id)
-                    if order_info.get("status") == "MATCHED":
+                    if order_info and order_info.get("status") == "MATCHED":
                         matched_size = float(order_info.get("size_matched", 0))
-                        matched_price = float(order_info.get("price", price))
-                        logger.info("[STRATEGY] IMMEDIATE FILL: %s %.2f @ $%.4f", side, matched_size, matched_price)
+                        # Use associate_trades for actual execution price (not the limit price)
+                        trades_list = order_info.get("associate_trades", [])
+                        if trades_list:
+                            # Volume-weighted average price across all partial fills
+                            total_cost = sum(float(t.get("price", 0)) * float(t.get("size", 0)) for t in trades_list)
+                            total_size = sum(float(t.get("size", 0)) for t in trades_list)
+                            matched_price = total_cost / total_size if total_size > 0 else float(order_info.get("price", price))
+                        else:
+                            matched_price = float(order_info.get("price", price))
+                        logger.info("[STRATEGY] IMMEDIATE FILL: %s %.2f @ $%.4f (limit=$%.4f)", side, matched_size, matched_price, price)
                         return {
                             "status": "filled",
                             "order_id": order_id,
@@ -1759,12 +1767,22 @@ def strategy_order_status(order_id: str):
     client = _get_clob_client()
     try:
         order = client.get_order(order_id)
+        if order is None:
+            return {"order_id": order_id, "status": "UNKNOWN", "size_matched": 0, "original_size": 0, "price": 0}
+        # For filled orders, compute actual execution price from associate_trades
+        exec_price = float(order.get("price", 0))
+        trades_list = order.get("associate_trades", [])
+        if trades_list and order.get("status") == "MATCHED":
+            total_cost = sum(float(t.get("price", 0)) * float(t.get("size", 0)) for t in trades_list)
+            total_size = sum(float(t.get("size", 0)) for t in trades_list)
+            if total_size > 0:
+                exec_price = total_cost / total_size
         return {
             "order_id": order.get("id", order_id),
             "status": order.get("status", "UNKNOWN"),
             "size_matched": float(order.get("size_matched", 0)),
             "original_size": float(order.get("original_size", 0)),
-            "price": float(order.get("price", 0)),
+            "price": exec_price,
             "side": order.get("side", ""),
             "outcome": order.get("outcome", ""),
         }
@@ -2040,7 +2058,9 @@ def merge_positions_endpoint(body: dict):
     Returns: {status, tx_hash, gas_used, duration_ms}
     """
     from polybot.redeem import merge_positions
+    from polybot.config import Config
 
+    cfg = Config.from_env()
     condition_id = body.get("condition_id", "")
     amount = body.get("amount", 0)
     if not condition_id or amount <= 0:

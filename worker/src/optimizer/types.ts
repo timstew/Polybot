@@ -64,9 +64,15 @@ export interface TickSnapshot {
   upBidOrderId: string | null;
   upBidPrice: number;
   upBidSize: number;
+  upBid2OrderId?: string | null;
+  upBid2Price?: number;
+  upBid2Size?: number;
   downBidOrderId: string | null;
   downBidPrice: number;
   downBidSize: number;
+  downBid2OrderId?: string | null;
+  downBid2Price?: number;
+  downBid2Size?: number;
   upInventory: number;
   downInventory: number;
   upAvgCost: number;

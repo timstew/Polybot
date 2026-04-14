@@ -45,8 +45,8 @@ export async function tryMerge(
   w: MergeableWindow,
   minPairs: number = 1,
 ): Promise<MergeResult | null> {
-  // 1. Check matched pairs
-  const matched = Math.min(w.upInventory, w.downInventory);
+  // 1. Check matched pairs (floor to integer — CTF contract operates on whole tokens)
+  const matched = Math.floor(Math.min(w.upInventory, w.downInventory));
   if (matched < minPairs) return null;
 
   // 2. Profitability check

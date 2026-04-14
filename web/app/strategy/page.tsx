@@ -106,21 +106,328 @@ function fmtRunTime(cumulativeMs: number): string {
 }
 
 const STRATEGY_TYPES = [
+  { value: "babyboner", label: "BabyBoneR" },
+  { value: "bonestar", label: "BoneStar" },
   { value: "spread-sniper", label: "Spread Sniper" },
-  { value: "split-arb", label: "Split Arbitrage" },
-  { value: "passive-mm", label: "Passive Market Making" },
-  { value: "directional-taker", label: "Directional Taker" },
   { value: "directional-maker", label: "Directional Maker" },
   { value: "safe-maker", label: "Safe Maker" },
+  { value: "enhanced-maker", label: "Enhanced Maker" },
   { value: "conviction-maker", label: "Conviction Maker" },
   { value: "unified-adaptive", label: "Unified Adaptive" },
-  { value: "certainty-taker", label: "Certainty Taker" },
   { value: "avellaneda-maker", label: "Avellaneda Maker" },
-  { value: "enhanced-maker", label: "Enhanced Maker" },
+  { value: "certainty-taker", label: "Certainty Taker" },
+  { value: "directional-taker", label: "Directional Taker" },
   { value: "orchestrator", label: "Orchestrator" },
+  { value: "split-arb", label: "Split Arbitrage" },
+  { value: "passive-mm", label: "Passive Market Making" },
   { value: "scaling-safe-maker", label: "Scaling Safe Maker" },
-  { value: "babyboner", label: "BabyBoneR" },
 ];
+
+// Parameter field definition for the create form
+interface ParamField {
+  key: string;
+  label: string;
+  type: "number" | "boolean" | "string" | "select" | "string[]";
+  default: unknown;
+  tip?: string;
+  options?: string[]; // for select type
+  advanced?: boolean; // hidden by default
+}
+
+// Default parameters per strategy type — used to populate the create form
+const STRATEGY_DEFAULTS: Record<string, { description: string; tickInterval: number; fields: ParamField[] }> = {
+  "babyboner": {
+    description: "Shadow-fills Bonereaper's actual trades. Best for Bitcoin up/down markets.",
+    tickInterval: 2000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin"], tip: "Crypto symbols to trade" },
+      { key: "shadow_wallet", label: "Shadow Wallet", type: "string", default: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30", tip: "Bonereaper's wallet address for shadow fills" },
+      { key: "pricing_mode", label: "Pricing Mode", type: "select", default: "hybrid", options: ["book", "hybrid", "ladder"], tip: "hybrid=max($0.55,P_true) best for shadow fills, book=CLOB ask, ladder=P_true-edge" },
+      { key: "merge_exit", label: "Auto-Merge", type: "boolean", default: true, tip: "Merge paired UP+DOWN tokens to lock in profit" },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 6, tip: "Max simultaneous windows" },
+      { key: "max_total_cost", label: "Max Cost/Window ($)", type: "number", default: 3000, tip: "Max USDC deployed per window" },
+      { key: "max_inventory_per_side", label: "Max Inventory/Side", type: "number", default: 3000, tip: "Max tokens per side (UP or DOWN)" },
+      { key: "max_window_duration_ms", label: "Max Window (ms)", type: "number", default: 900000, tip: "900000=15min, 300000=5min" },
+      { key: "min_window_duration_ms", label: "Min Window (ms)", type: "number", default: 240000, tip: "Skip windows shorter than this" },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 0, tip: "Seconds to observe before entering" },
+      { key: "profit_reinvest_pct", label: "Reinvest %", type: "number", default: 0.75, tip: "Fraction of profits to reinvest (0-1)" },
+      { key: "max_skew_ratio", label: "Max Skew Ratio", type: "number", default: 0.9, tip: "Stop buying heavy side above this ratio" },
+      { key: "skew_guard_min_tokens", label: "Skew Guard Min", type: "number", default: 50, tip: "Min tokens before skew guard activates" },
+      { key: "buy_cooldown_ms", label: "Buy Cooldown (ms)", type: "number", default: 0, tip: "Min ms between buys (paper mode)" },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000, tip: "How often to scan for new markets" },
+      { key: "record_snapshots", label: "Record Snapshots", type: "boolean", default: false, tip: "Record tick data for offline replay" },
+      // Advanced
+      { key: "maker_bid_size", label: "Maker Bid Size", type: "number", default: 25, advanced: true, tip: "Tokens per bid (auto-scaled by capital)" },
+      { key: "taker_bid_size", label: "Taker Bid Size", type: "number", default: 15, advanced: true },
+      { key: "ladder_enabled", label: "Ladder Enabled", type: "boolean", default: false, advanced: true },
+      { key: "edge1", label: "Edge L1", type: "number", default: 0.03, advanced: true, tip: "Ladder level 1 edge" },
+      { key: "edge2", label: "Edge L2", type: "number", default: 0.07, advanced: true, tip: "Ladder level 2 edge" },
+      { key: "winning_share", label: "Winning Share", type: "number", default: 0.55, advanced: true },
+      { key: "seed_seconds", label: "Seed Seconds", type: "number", default: 45, advanced: true },
+      { key: "seed_bid_price", label: "Seed Bid Price", type: "number", default: 0.55, advanced: true },
+      { key: "seed_min_tokens", label: "Seed Min Tokens", type: "number", default: 300, advanced: true },
+      { key: "wind_down_seconds", label: "Wind Down (s)", type: "number", default: 180, advanced: true },
+      { key: "sell_enabled", label: "Sell Enabled", type: "boolean", default: true, advanced: true },
+      { key: "sell_profit_threshold", label: "Sell Profit Threshold", type: "number", default: 0.05, advanced: true },
+    ],
+  },
+  "bonestar": {
+    description: "Three-phase accumulation + certainty sweep. Oracle-driven, never sells.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin"] },
+      { key: "base_bid_size", label: "Base Bid Size", type: "number", default: 15, tip: "Tokens per bid in phase 1" },
+      { key: "bid_offset", label: "Bid Offset", type: "number", default: 0.10, tip: "How far below fair value to bid" },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.95 },
+      { key: "max_inventory_per_side", label: "Max Inventory/Side", type: "number", default: 500 },
+      { key: "max_window_duration_ms", label: "Max Window (ms)", type: "number", default: 900000 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 5 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "record_snapshots", label: "Record Snapshots", type: "boolean", default: true },
+      // Advanced
+      { key: "sweep_threshold", label: "Sweep Threshold", type: "number", default: 0.90, advanced: true, tip: "P_true above this triggers sweep" },
+      { key: "sweep_bid_price", label: "Sweep Bid Price", type: "number", default: 0.98, advanced: true },
+      { key: "sweep_size", label: "Sweep Size", type: "number", default: 200, advanced: true },
+      { key: "conviction_start_pct", label: "Conviction Start %", type: "number", default: 0.25, advanced: true },
+      { key: "conviction_size_mult", label: "Conviction Size Mult", type: "number", default: 1.5, advanced: true },
+      { key: "base_bid_size_phase2", label: "Phase 2 Bid Size", type: "number", default: 15, advanced: true },
+      { key: "edge1", label: "Edge L1", type: "number", default: 0.03, advanced: true },
+      { key: "edge2", label: "Edge L2", type: "number", default: 0.07, advanced: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: false, advanced: true },
+    ],
+  },
+  "spread-sniper": {
+    description: "Direction-agnostic spread strategy. Neutral fair value, adaptive bid sizing.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "bid_size", label: "Bid Size", type: "number", default: 30 },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.92 },
+      { key: "bid_offset", label: "Bid Offset", type: "number", default: 0.04 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 50 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 10 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true, tip: "Paper fills based on real CLOB volume" },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: false, advanced: true },
+      { key: "stop_quoting_before_end_ms", label: "Stop Quoting (ms before end)", type: "number", default: 45000, advanced: true },
+      { key: "exit_inventory_before_end_ms", label: "Exit Inventory (ms before end)", type: "number", default: 15000, advanced: true },
+    ],
+  },
+  "directional-maker": {
+    description: "Aggressive signal-biased maker. Sells ALL losing-side inventory on flip.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "base_bid_size", label: "Base Bid Size", type: "number", default: 30 },
+      { key: "conviction_bias", label: "Conviction Bias", type: "number", default: 2.0, tip: "Multiplier for signal-side bids" },
+      { key: "bid_offset", label: "Bid Offset", type: "number", default: 0.02 },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.93 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 50 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "min_signal_strength", label: "Min Signal", type: "number", default: 0.45 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 20 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true },
+      { key: "max_flips_per_window", label: "Max Flips/Window", type: "number", default: 3, advanced: true },
+      { key: "max_inventory_ratio", label: "Max Inventory Ratio", type: "number", default: 2, advanced: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: false, advanced: true },
+      { key: "stop_quoting_before_end_ms", label: "Stop Quoting (ms)", type: "number", default: 45000, advanced: true },
+      { key: "exit_inventory_before_end_ms", label: "Exit Inventory (ms)", type: "number", default: 15000, advanced: true },
+    ],
+  },
+  "safe-maker": {
+    description: "Conservative signal-biased maker. Protects paired inventory from being sold.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "base_bid_size", label: "Base Bid Size", type: "number", default: 30 },
+      { key: "conviction_bias", label: "Conviction Bias", type: "number", default: 2.0 },
+      { key: "bid_offset", label: "Bid Offset", type: "number", default: 0.02 },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.93 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 50 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "min_signal_strength", label: "Min Signal", type: "number", default: 0.45 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 20 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true },
+      { key: "record_snapshots", label: "Record Snapshots", type: "boolean", default: false },
+      { key: "max_flips_per_window", label: "Max Flips/Window", type: "number", default: 3, advanced: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: false, advanced: true },
+    ],
+  },
+  "enhanced-maker": {
+    description: "Safe maker with volatility-adjusted spreads and delta-based pausing.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "base_bid_size", label: "Base Bid Size", type: "number", default: 30 },
+      { key: "conviction_bias", label: "Conviction Bias", type: "number", default: 2.0 },
+      { key: "bid_offset", label: "Bid Offset", type: "number", default: 0.02 },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.93 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 50 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "min_signal_strength", label: "Min Signal", type: "number", default: 0.45 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 20 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true },
+      { key: "max_bid_per_side", label: "Max Bid/Side", type: "number", default: 0.45, advanced: true },
+      { key: "delta_pause_threshold", label: "Delta Pause Threshold", type: "number", default: 5.0, advanced: true },
+      { key: "delta_widen_threshold", label: "Delta Widen Threshold", type: "number", default: 3.0, advanced: true },
+      { key: "vol_spread_weight", label: "Vol Spread Weight", type: "number", default: 0.5, advanced: true },
+    ],
+  },
+  "conviction-maker": {
+    description: "One-sided conviction bets. Only bids when signal > threshold, no hedging.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "base_bid_size", label: "Base Bid Size", type: "number", default: 30 },
+      { key: "min_signal_strength", label: "Min Signal", type: "number", default: 0.55, tip: "Only bid when signal exceeds this" },
+      { key: "conviction_discount", label: "Conviction Discount", type: "number", default: 0.15 },
+      { key: "pair_discount", label: "Pair Discount", type: "number", default: 0.08 },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.93 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 50 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 20 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true },
+      { key: "max_flips_before_sit_out", label: "Max Flips Before Sit Out", type: "number", default: 2, advanced: true },
+      { key: "enable_lead_lag", label: "Lead-Lag", type: "boolean", default: true, advanced: true },
+      { key: "late_phase_penalty", label: "Late Phase Penalty", type: "number", default: 0.5, advanced: true },
+    ],
+  },
+  "unified-adaptive": {
+    description: "Picks sniper or maker per window. Adaptive bid sizing, wallet management.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "max_pair_cost", label: "Max Pair Cost (Sniper)", type: "number", default: 0.92 },
+      { key: "maker_max_pair_cost", label: "Max Pair Cost (Maker)", type: "number", default: 0.93 },
+      { key: "default_bid_size", label: "Default Bid Size", type: "number", default: 30 },
+      { key: "conviction_bias", label: "Conviction Bias", type: "number", default: 2.0 },
+      { key: "min_signal_strength", label: "Min Signal", type: "number", default: 0.25 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 10 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true },
+      { key: "max_drawdown_pct", label: "Max Drawdown %", type: "number", default: 0.25, advanced: true },
+      { key: "max_flips_per_window", label: "Max Flips/Window", type: "number", default: 3, advanced: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: false, advanced: true },
+    ],
+  },
+  "avellaneda-maker": {
+    description: "Avellaneda-Stoikov market maker. P_true + Delta based pricing.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "gamma", label: "Gamma (risk aversion)", type: "number", default: 0.005, tip: "Higher = stronger inventory shading" },
+      { key: "base_spread", label: "Base Spread", type: "number", default: 0.04 },
+      { key: "bid_size", label: "Bid Size", type: "number", default: 20 },
+      { key: "max_inventory_per_side", label: "Max Inventory/Side", type: "number", default: 200 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 500 },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.96 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 8 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "delta_kill_threshold", label: "Delta Kill Threshold", type: "number", default: 5.0, advanced: true },
+      { key: "exit_buffer_ms", label: "Exit Buffer (ms)", type: "number", default: 60000, advanced: true },
+      { key: "use_clob_websocket", label: "CLOB WebSocket", type: "boolean", default: true, advanced: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: true, advanced: true },
+    ],
+  },
+  "certainty-taker": {
+    description: "Sweeps when P_true > threshold. Bonereaper-inspired, oracle-driven.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "min_p_true", label: "Min P_true", type: "number", default: 0.85, tip: "Only sweep above this confidence" },
+      { key: "max_price", label: "Max Price", type: "number", default: 0.95 },
+      { key: "max_shares_per_sweep", label: "Max Shares/Sweep", type: "number", default: 50 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 500 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 8 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "use_clob_websocket", label: "CLOB WebSocket", type: "boolean", default: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: true },
+      { key: "min_edge_pct", label: "Min Edge %", type: "number", default: 0.01, advanced: true },
+      { key: "min_time_remaining_ms", label: "Min Time Remaining (ms)", type: "number", default: 10000, advanced: true },
+    ],
+  },
+  "directional-taker": {
+    description: "Taker strategy (not viable for wide-spread crypto markets).",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "initial_order_size", label: "Initial Order Size", type: "number", default: 40 },
+      { key: "conviction_multiplier", label: "Conviction Multiplier", type: "number", default: 1.7 },
+      { key: "min_signal_strength", label: "Min Signal", type: "number", default: 0.45 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 60 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 4 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 20 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "max_flips_per_window", label: "Max Flips/Window", type: "number", default: 3, advanced: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: false, advanced: true },
+    ],
+  },
+  "orchestrator": {
+    description: "Meta-strategy: regime-based tactic selection with Thompson Sampling bandit.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "default_bid_size", label: "Default Bid Size", type: "number", default: 30 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 10 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "bandit_enabled", label: "Bandit Enabled", type: "boolean", default: true, tip: "Thompson Sampling for tactic selection" },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true },
+      { key: "min_explore_pct", label: "Min Explore %", type: "number", default: 0.10, advanced: true },
+      { key: "enable_order_flow", label: "Order Flow", type: "boolean", default: false, advanced: true },
+    ],
+  },
+  "split-arb": {
+    description: "Split arbitrage strategy. Profits from YES+NO < 1.00.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "min_profit_per_share", label: "Min Profit/Share", type: "number", default: 0.005 },
+      { key: "order_size", label: "Order Size", type: "number", default: 50 },
+      { key: "max_open_markets", label: "Max Open Markets", type: "number", default: 10 },
+      { key: "max_capital_per_market", label: "Max Capital/Market ($)", type: "number", default: 100 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 30000 },
+    ],
+  },
+  "passive-mm": {
+    description: "Passive market making (scalp). Resting bids, quick profit targets.",
+    tickInterval: 5000,
+    fields: [
+      { key: "bid_offset", label: "Bid Offset", type: "number", default: 0.03 },
+      { key: "sell_profit_target", label: "Sell Profit Target", type: "number", default: 0.02 },
+      { key: "order_size", label: "Order Size", type: "number", default: 20 },
+      { key: "max_inventory_per_side", label: "Max Inventory/Side", type: "number", default: 100 },
+      { key: "max_open_markets", label: "Max Open Markets", type: "number", default: 3 },
+      { key: "max_capital_usd", label: "Max Capital ($)", type: "number", default: 200 },
+      { key: "min_spread", label: "Min Spread", type: "number", default: 0.04 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 30000 },
+    ],
+  },
+  "scaling-safe-maker": {
+    description: "Safe maker with position scaling. Larger bids as confidence grows.",
+    tickInterval: 5000,
+    fields: [
+      { key: "target_cryptos", label: "Target Cryptos", type: "string[]", default: ["Bitcoin", "Ethereum", "Solana", "XRP"] },
+      { key: "base_bid_size", label: "Base Bid Size", type: "number", default: 30 },
+      { key: "conviction_bias", label: "Conviction Bias", type: "number", default: 2.0 },
+      { key: "bid_offset", label: "Bid Offset", type: "number", default: 0.02 },
+      { key: "max_pair_cost", label: "Max Pair Cost", type: "number", default: 0.93 },
+      { key: "max_capital_per_window", label: "Max Capital/Window ($)", type: "number", default: 50 },
+      { key: "max_concurrent_windows", label: "Max Windows", type: "number", default: 12 },
+      { key: "min_signal_strength", label: "Min Signal", type: "number", default: 0.45 },
+      { key: "observation_seconds", label: "Observation (s)", type: "number", default: 20 },
+      { key: "discovery_interval_ms", label: "Discovery Interval (ms)", type: "number", default: 15000 },
+      { key: "grounded_fills", label: "Grounded Fills", type: "boolean", default: true },
+    ],
+  },
+};
 
 // Tip, InventoryBar imported from strategy-windows
 
@@ -566,7 +873,16 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
           const up = w.upInventory ?? 0;
           const dn = w.downInventory ?? 0;
           const pairCost = (up > 0 && dn > 0) ? (w.upAvgCost ?? 0) + (w.downAvgCost ?? 0) : null;
-          const prediction = (w.binancePrediction ?? w.confirmedDirection) as "UP" | "DOWN" | null;
+          // Predict outcome: oracle/Binance price vs strike (client-side, instant)
+          let prediction = (w.binancePrediction ?? w.confirmedDirection) as "UP" | "DOWN" | null;
+          if (!prediction && w.oracleStrike != null) {
+            // Use latest price from price history or snapshot to determine outcome
+            const strike = w.oracleStrike ?? w.priceAtWindowOpen;
+            const lastPrice = w.lastSpotPrice ?? w.priceAtWindowOpen;
+            if (strike && lastPrice) {
+              prediction = lastPrice >= strike ? "UP" : "DOWN";
+            }
+          }
           const betSide = w.convictionSide || (up > dn ? "UP" : dn > up ? "DOWN" : null);
           const willWin = prediction && betSide ? prediction === betSide : null;
           const estPnl = prediction ? (() => {
@@ -582,7 +898,7 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
               up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
               scale={w.bidSize ?? 1} pairCost={pairCost}
               prediction={prediction} estPnl={estPnl}
-              predictionText={prediction ? (willWin === true ? `Binance predicts win (${prediction})` : willWin === false ? `Binance predicts loss (${prediction})` : undefined) : undefined}
+              predictionText={prediction ? (willWin === true ? `Oracle predicts win (${prediction})` : willWin === false ? `Oracle predicts loss (${prediction})` : `Oracle: ${prediction}`) : undefined}
             />
           );
         })}
@@ -598,6 +914,7 @@ function UnifiedDetail({ custom, isActive, isWindingDown, config }: {
               up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
               scale={w.bidSize ?? 1} pairCost={pairCost}
               netPnl={w.netPnl} fillCount={w.fillCount}
+              estimatedRebates={w.estimatedRebates}
               durationMs={w.windowDurationMs} completedAt={w.completedAt}
               gammaConfirmed={w.gammaConfirmed}
             />
@@ -946,6 +1263,11 @@ function StrategyDetail({
             <div className={`text-lg font-bold tabular-nums ${(state?.total_pnl ?? 0) >= 0 ? "text-green-600" : "text-red-600"}`}>
               {fmt(state?.total_pnl ?? 0)}
             </div>
+            {(custom?.totalEstimatedRebates ?? 0) > 0.01 && (
+              <div className="text-[10px] text-purple-600 tabular-nums">
+                + {fmt(custom.totalEstimatedRebates)} est. rebates
+              </div>
+            )}
           </div>
         </Tip>
         <Tip tip="Capital currently locked in active window positions, vs the configured maximum. Matched pairs (structurally profitable) don't count against the capital limit">
@@ -1508,7 +1830,8 @@ function StrategyDetail({
                   up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
                   scale={Math.max(up + dn, 1)} pairCost={pairCost}
                   netPnl={w.netPnl ?? 0} fillCount={w.fillCount} takerFills={w.takerFills}
-                  totalMerged={w.totalMerged} completedAt={w.completedAt}
+                  totalMerged={w.totalMerged} estimatedRebates={w.estimatedRebates}
+                  completedAt={w.completedAt}
                 />
               );
             })}
@@ -1566,6 +1889,7 @@ function StrategyDetail({
                   up={up} dn={dn} upAvgCost={w.upAvgCost ?? 0} dnAvgCost={w.downAvgCost ?? 0}
                   scale={Math.max(up + dn, 1)} pairCost={pairCost}
                   netPnl={w.netPnl ?? 0} fillCount={w.fillCount}
+                  estimatedRebates={w.estimatedRebates}
                   completedAt={w.completedAt}
                 />
               );
@@ -1789,6 +2113,7 @@ function StrategyDetail({
                   netPnl={w.netPnl ?? 0} fillCount={w.fillCount ?? 0}
                   flipCount={w.flipCount} maxFlips={maxFlips}
                   totalMerged={w.totalMerged}
+                  estimatedRebates={w.estimatedRebates}
                   completedAt={w.completedAt}
                   gammaConfirmed={w.gammaConfirmed}
                 />
@@ -1869,11 +2194,12 @@ export default function StrategyPage() {
 
   // New config form
   const [newName, setNewName] = useState("");
-  const [newType, setNewType] = useState("split-arb");
+  const [newType, setNewType] = useState("babyboner");
   const [newMode, setNewMode] = useState<"paper" | "real">("paper");
   const [newMaxCapital, setNewMaxCapital] = useState("200");
   const [newBalance, setNewBalance] = useState("");
-  const [newGroundedFills, setNewGroundedFills] = useState(true);
+  const [newParams, setNewParams] = useState<Record<string, unknown>>({});
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -1904,18 +2230,27 @@ export default function StrategyPage() {
   const createConfig = async () => {
     if (!newName.trim()) return;
     try {
+      // Build params from defaults + overrides
+      const defaults = STRATEGY_DEFAULTS[newType];
+      const params: Record<string, unknown> = {};
+      if (defaults) {
+        for (const f of defaults.fields) {
+          params[f.key] = newParams[f.key] !== undefined ? newParams[f.key] : f.default;
+        }
+      }
+      const tickInterval = defaults?.tickInterval || 5000;
       await api.strategyCreateConfig({
         name: newName.trim(),
         strategy_type: newType,
         mode: newMode,
         max_capital_usd: parseFloat(newMaxCapital) || 200,
+        tick_interval_ms: tickInterval,
         ...(newBalance ? { balance_usd: parseFloat(newBalance) } : {}),
-        ...((newType === "spread-sniper" || newType === "directional-maker" || newType === "unified-adaptive" || newType === "orchestrator" || newType === "scaling-safe-maker") && newMode === "paper"
-          ? { params: { grounded_fills: newGroundedFills } as unknown as string }
-          : {}),
+        params: params as unknown as string,
       });
       setNewName("");
       setNewBalance("");
+      setNewParams({});
       refresh();
     } catch (e) {
       setError(String(e));
@@ -2065,7 +2400,7 @@ export default function StrategyPage() {
               <Tip tip="POL (native token) for gas fees on Polygon">
                 <div className="cursor-help">
                   <p className="text-xs text-muted-foreground">POL (Gas)</p>
-                  <p className="text-xl font-bold">{walletOverview.pol_balance.toFixed(2)}</p>
+                  <p className="text-xl font-bold">{(walletOverview.pol_balance ?? 0).toFixed(2)}</p>
                 </div>
               </Tip>
             </CardContent>
@@ -2291,75 +2626,145 @@ export default function StrategyPage() {
           </div>
 
           {/* Create new config */}
-          <div className="mt-4 flex flex-wrap items-end gap-3 border-t pt-4">
-            <div className="flex-1 min-w-[120px]">
-              <label className="text-xs font-medium text-muted-foreground">Name</label>
-              <Input
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                placeholder="e.g. BTC Split Test"
-                className="mt-1"
-              />
-            </div>
-            <div className="min-w-[130px]">
-              <label className="text-xs font-medium text-muted-foreground">Type</label>
-              <select
-                className="mt-1 block h-9 w-full rounded-md border bg-background px-3 text-sm"
-                value={newType}
-                onChange={(e) => setNewType(e.target.value)}
-              >
-                {STRATEGY_TYPES.map((t) => (
-                  <option key={t.value} value={t.value}>{t.label}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">Mode</label>
-              <select
-                className="mt-1 block h-9 w-full rounded-md border bg-background px-3 text-sm"
-                value={newMode}
-                onChange={(e) => setNewMode(e.target.value as "paper" | "real")}
-              >
-                <option value="paper">Paper</option>
-                <option value="real">Real</option>
-              </select>
-            </div>
-            {(newType === "spread-sniper" || newType === "directional-maker" || newType === "unified-adaptive" || newType === "orchestrator" || newType === "scaling-safe-maker") && newMode === "paper" && (
-              <div className="flex items-end pb-0.5">
-                <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={newGroundedFills}
-                    onChange={(e) => setNewGroundedFills(e.target.checked)}
-                    className="rounded border"
-                  />
-                  Grounded fills
-                </label>
+          <div className="mt-4 border-t pt-4 space-y-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="flex-1 min-w-[120px]">
+                <label className="text-xs font-medium text-muted-foreground">Name</label>
+                <Input
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  placeholder="e.g. BTC Shadow Test"
+                  className="mt-1"
+                />
               </div>
+              <div className="min-w-[160px]">
+                <label className="text-xs font-medium text-muted-foreground">Type</label>
+                <select
+                  className="mt-1 block h-9 w-full rounded-md border bg-background px-3 text-sm"
+                  value={newType}
+                  onChange={(e) => { setNewType(e.target.value); setNewParams({}); setShowAdvanced(false); }}
+                >
+                  {STRATEGY_TYPES.map((t) => (
+                    <option key={t.value} value={t.value}>{t.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">Mode</label>
+                <select
+                  className="mt-1 block h-9 w-full rounded-md border bg-background px-3 text-sm"
+                  value={newMode}
+                  onChange={(e) => setNewMode(e.target.value as "paper" | "real")}
+                >
+                  <option value="paper">Paper</option>
+                  <option value="real">Real</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">Max Capital ($)</label>
+                <Input
+                  type="number"
+                  value={newMaxCapital}
+                  onChange={(e) => setNewMaxCapital(e.target.value)}
+                  className="mt-1 w-24"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">Balance ($)</label>
+                <Input
+                  type="number"
+                  value={newBalance}
+                  onChange={(e) => setNewBalance(e.target.value)}
+                  placeholder="off"
+                  className="mt-1 w-20"
+                  title="Starting bankroll for ratchet protection. Empty = disabled."
+                />
+              </div>
+              <Button onClick={createConfig} disabled={!newName.trim()}>
+                Create
+              </Button>
+            </div>
+            {/* Strategy description */}
+            {STRATEGY_DEFAULTS[newType] && (
+              <p className="text-xs text-muted-foreground italic">{STRATEGY_DEFAULTS[newType].description}</p>
             )}
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">Max Capital ($)</label>
-              <Input
-                type="number"
-                value={newMaxCapital}
-                onChange={(e) => setNewMaxCapital(e.target.value)}
-                className="mt-1 w-24"
-              />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">Balance ($)</label>
-              <Input
-                type="number"
-                value={newBalance}
-                onChange={(e) => setNewBalance(e.target.value)}
-                placeholder="off"
-                className="mt-1 w-20"
-                title="Starting bankroll for ratchet protection. Empty = disabled."
-              />
-            </div>
-            <Button onClick={createConfig} disabled={!newName.trim()}>
-              Create
-            </Button>
+            {/* Strategy-specific parameters */}
+            {STRATEGY_DEFAULTS[newType] && (() => {
+              const def = STRATEGY_DEFAULTS[newType];
+              const mainFields = def.fields.filter(f => !f.advanced);
+              const advFields = def.fields.filter(f => f.advanced);
+              const renderField = (f: ParamField) => {
+                const val = newParams[f.key] !== undefined ? newParams[f.key] : f.default;
+                const onChange = (v: unknown) => setNewParams(p => ({ ...p, [f.key]: v }));
+                return (
+                  <div key={f.key} className="flex flex-col gap-0.5">
+                    <label className="text-[10px] font-medium text-muted-foreground" title={f.tip}>
+                      {f.label}{f.tip ? " *" : ""}
+                    </label>
+                    {f.type === "boolean" ? (
+                      <label className="flex items-center gap-1.5 cursor-pointer h-9">
+                        <input type="checkbox" checked={val as boolean}
+                          onChange={(e) => onChange(e.target.checked)}
+                          className="rounded border" />
+                        <span className="text-xs">{val ? "On" : "Off"}</span>
+                      </label>
+                    ) : f.type === "select" ? (
+                      <select
+                        className="h-9 rounded-md border bg-background px-2 text-xs"
+                        value={val as string}
+                        onChange={(e) => onChange(e.target.value)}
+                      >
+                        {f.options?.map(o => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                    ) : f.type === "string[]" ? (
+                      <Input
+                        className="h-9 text-xs"
+                        value={Array.isArray(val) ? (val as string[]).join(", ") : String(val)}
+                        onChange={(e) => onChange(e.target.value.split(",").map(s => s.trim()).filter(Boolean))}
+                        title={f.tip}
+                      />
+                    ) : f.type === "string" ? (
+                      <Input
+                        className="h-9 text-xs font-mono"
+                        value={val as string ?? ""}
+                        onChange={(e) => onChange(e.target.value || undefined)}
+                        title={f.tip}
+                      />
+                    ) : (
+                      <Input
+                        type="number" step="any"
+                        className="h-9 text-xs w-28"
+                        value={val as number}
+                        onChange={(e) => onChange(e.target.value === "" ? undefined : parseFloat(e.target.value))}
+                        title={f.tip}
+                      />
+                    )}
+                  </div>
+                );
+              };
+              return (
+                <div className="space-y-2">
+                  <div className="flex flex-wrap gap-x-3 gap-y-2">
+                    {mainFields.map(renderField)}
+                  </div>
+                  {advFields.length > 0 && (
+                    <>
+                      <button
+                        className="text-[10px] text-muted-foreground hover:text-foreground underline"
+                        onClick={() => setShowAdvanced(!showAdvanced)}
+                      >
+                        {showAdvanced ? "Hide" : "Show"} {advFields.length} advanced params
+                      </button>
+                      {showAdvanced && (
+                        <div className="flex flex-wrap gap-x-3 gap-y-2 border-t pt-2">
+                          {advFields.map(renderField)}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </CardContent>
       </Card>

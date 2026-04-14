@@ -3,10 +3,12 @@
 ## Current State (April 2026)
 
 **Paper trading on two machines** — laptop (local dev) and always-on Mac mini (24/7 recording):
-- Worker (`wrangler dev`) — strategy execution, copy trading, D1 storage
-- Standalone runner (`standalone-runner.ts`) — no DO eviction, primary execution on Mac mini
+- Standalone runner (`npx tsx src/standalone-runner.ts`) — primary strategy execution, pure Node.js with real WebSockets (Oracle, CLOB, Binance), direct D1 SQLite via better-sqlite3
+- Worker (`wrangler dev` / `./dev.sh`) — API routes, copy trading, D1 storage, dashboard backend
 - Python API (`uvicorn`) — bot detection, CLOB order execution
 - Frontend (`next dev`) — dashboard with strategy monitoring, orchestrator page
+
+The standalone runner replaced the in-worker tick simulator (`tick-simulator.ts` / `USE_SIMULATOR` env var) which had CF I/O context issues with WebSocket connections and module imports.
 
 Real trading infrastructure complete (CLOB orders, position redemption, balance protection).
 **Chainlink Data Streams integrated** — authenticated access to the same oracle Polymarket uses for settlement. All 13 strategies benefit via oracle-aware `computeSignal()`. Safe-maker uses oracle P_true as primary fair value (zero basis risk).
@@ -34,7 +36,7 @@ Deploy existing paper trading to the cloud. No wallet or on-chain interaction ne
 - [ ] Add strategy dashboard page to frontend
 - [ ] Monitor paper PnL for 1+ week to validate cloud execution matches local results
 
-**Limitation:** No Binance WebSocket order flow or Chainlink Data Streams in deployed Workers (CF can't hold outbound WS connections or run Node.js crypto). Signal runs on 5 REST layers only — order flow bonus is 0, oracle falls back to Polymarket RTDS → Binance REST. This is acceptable for cloud; the Mac mini standalone runner has full Chainlink + Binance WS access.
+**Limitation (cloud only):** No Binance WebSocket order flow or Chainlink Data Streams in deployed Workers (CF can't hold outbound WS connections or run Node.js crypto). Signal runs on 5 REST layers only — order flow bonus is 0, oracle falls back to Polymarket RTDS → Binance REST. This is acceptable for cloud; the standalone runner (`npx tsx src/standalone-runner.ts`) has full Chainlink + CLOB + Binance WS access and is the primary execution model for local dev and the Mac mini.
 
 ---
 
@@ -131,15 +133,20 @@ Switch from paper to real order execution. Requires EOA wallet from Phase 2.
 - [x] Real P&L tracking in D1 strategy_trades
 - [x] DO config reload on update (no restart needed)
 
-**Remaining work — adverse selection fixes (critical for profitability):**
-- [ ] Graduated pair-first scaling: start 5 tokens, scale to 15→30 only after pairing confirmed
-- [ ] Ask-aware bid pricing: never bid above best ask minus buffer
-- [ ] Fill-velocity feedback: cancel wrong-side bids after 3 same-side fills in 60s
-- [ ] Regime-conditional tactic behavior: conviction-only in trending, paired in oscillating
-- [ ] Per-tactic real-mode defaults: smaller bid sizes, faster fill-side cancellation
-- [ ] Paper vs real fill model comparison: log paper-predicted fills alongside real fills to calibrate
-- [ ] **Oracle spread-gated entry**: skip window entry when oracle bid/ask spread is wide (high uncertainty = adverse selection risk). See Phase 3a Layer 3.
-- [ ] **Binance-oracle divergence gate**: reduce bid sizes when Binance and oracle prices diverge (one source leading = directional move incoming). See Phase 3a Layer 4.
+**Remaining work — BabyBoneR replication (Bonereaper-matching strategy):**
+- [x] Shadow fill model: paper trade using Bonereaper's actual fills as proof of fillability
+- [x] Standalone runner: pure Node.js execution, real WebSockets, no DO eviction (replaces tick simulator / USE_SIMULATOR)
+- [x] Slug-based market discovery: predictable `btc-updown-5m-{ts}` lookup via Gamma API
+- [x] Hybrid pricing: `max($0.55, P_true)` both sides, follows market like Bonereaper
+- [x] Skew guard: cap either side at 90% of total tokens (Bonereaper shows up to 86%)
+- [x] Dynamic capital scaling: bid size, windows, duration adapt to effective capital
+- [x] Shadow wallet activity recording to D1 for post-analysis
+- [ ] **Batch merge at resolution** (Bonereaper holds inventory, merges at end — not continuous auto-merge)
+- [ ] **Late-window fill optimization**: keep filling throughout window (late fills have best pair cost: pc=$0.96 vs early pc=$1.05)
+- [ ] **Three-stream profit model**: early fills for rebates, late fills for cheap pairs, excess for directional wins
+- [ ] Paper vs real fill model comparison: log shadow-predicted fills alongside real fills to calibrate
+- [ ] **Oracle spread-gated entry**: skip window entry when oracle bid/ask spread is wide. See Phase 3a Layer 3.
+- [ ] **Binance-oracle divergence gate**: reduce bid sizes when divergence detected. See Phase 3a Layer 4.
 
 **Remaining work — infrastructure:**
 - [ ] On-chain balance verification (compare wallet USDC to tracked balance)

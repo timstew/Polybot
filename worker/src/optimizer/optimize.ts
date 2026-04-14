@@ -29,9 +29,10 @@ import { replayBoneStarWindow, BONESTAR_SEARCH_SPACE, BONESTAR_DEFAULT_PARAMS } 
 
 interface ParamSpec {
   name: string;
-  type: "continuous" | "integer" | "boolean";
+  type: "continuous" | "integer" | "boolean" | "categorical";
   min?: number;
   max?: number;
+  choices?: string[];  // for categorical params (e.g., pricing_mode: ["book","hybrid","ladder"])
 }
 
 interface StrategyConfig {
@@ -225,10 +226,12 @@ function loadSnapshotMeta(dbPath: string): WindowMeta[] {
 // Active strategy config — set in main() before any sampling
 let activeConfig: StrategyConfig;
 
-function sampleRandom(): Record<string, number | boolean> {
-  const params: Record<string, number | boolean> = {};
+function sampleRandom(): Record<string, number | boolean | string> {
+  const params: Record<string, number | boolean | string> = {};
   for (const spec of activeConfig.searchSpace) {
-    if (spec.type === "boolean") {
+    if (spec.type === "categorical" && spec.choices) {
+      params[spec.name] = spec.choices[Math.floor(Math.random() * spec.choices.length)];
+    } else if (spec.type === "boolean") {
       params[spec.name] = Math.random() < 0.5;
     } else if (spec.type === "integer") {
       params[spec.name] = Math.round(spec.min! + Math.random() * (spec.max! - spec.min!));
@@ -240,14 +243,19 @@ function sampleRandom(): Record<string, number | boolean> {
 }
 
 /** Sample from kernel density estimate of good samples (simple TPE) */
-function sampleFromGood(goodSamples: Record<string, number | boolean>[]): Record<string, number | boolean> {
-  const params: Record<string, number | boolean> = {};
+function sampleFromGood(goodSamples: Record<string, number | boolean | string>[]): Record<string, number | boolean | string> {
+  const params: Record<string, number | boolean | string> = {};
   // Pick a random good sample, then perturb it
   const base = goodSamples[Math.floor(Math.random() * goodSamples.length)];
 
   for (const spec of activeConfig.searchSpace) {
     const baseVal = base[spec.name];
-    if (spec.type === "boolean") {
+    if (spec.type === "categorical" && spec.choices) {
+      // Switch with 20% probability
+      params[spec.name] = Math.random() < 0.20
+        ? spec.choices[Math.floor(Math.random() * spec.choices.length)]
+        : baseVal;
+    } else if (spec.type === "boolean") {
       // Flip with 20% probability
       params[spec.name] = Math.random() < 0.20 ? !(baseVal as boolean) : baseVal;
     } else if (spec.type === "integer") {

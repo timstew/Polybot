@@ -49,10 +49,15 @@ export interface BoneStarParams {
 
   // Phase 1: Balanced accumulation
   base_bid_size: number;
-  bid_offset: number;            // bid below fair value
+  bid_offset: number;            // bid below fair value (unused when edge1/edge2 active)
   max_bid_per_side: number;      // hard cap on any single-side bid price
   min_bid_per_side: number;      // floor on bid price
   max_pair_cost: number;         // UP_bid + DN_bid must be <= this
+
+  // Moving ladder: 2 levels per side, anchored to P_true
+  edge1: number;                 // tight level: bid at P - edge1
+  edge2: number;                 // deep level: bid at P - edge2
+  quote_ttl_ms: number;          // cancel quotes older than this (0 = disabled)
 
   // Phase 2: Directional conviction
   conviction_start_pct: number;  // window progress to enter Phase 2
@@ -107,10 +112,14 @@ export interface BoneStarParams {
 export const DEFAULT_PARAMS: BoneStarParams = {
   target_cryptos: ["Bitcoin"],
   base_bid_size: 15,             // was 25 — Bonereaper does 5-24 tokens/fill
-  bid_offset: 0.10,             // was 0.02 — deeper offset for cheaper fills (Bonereaper fills $0.31-0.70)
+  bid_offset: 0.10,             // legacy: used as fallback when edge1/edge2 = 0
   max_bid_per_side: 0.85,           // Bonereaper buys winning side at $0.65-0.85 in Phase 2
   min_bid_per_side: 0.05,
   max_pair_cost: 0.95,            // pair cost cap for Phase 1/2 (was 0.98 — tighter target)
+
+  edge1: 0.03,                  // tight level: P_true - 0.03
+  edge2: 0.07,                  // deep level: P_true - 0.07
+  quote_ttl_ms: 30_000,         // cancel quotes older than 30s (matches Bonereaper's ~2-3 prices per 30s bucket)
 
   conviction_start_pct: 0.25,   // Bonereaper shows conviction from ~25% onward
   conviction_size_mult: 1.5,    // was 2.0 — Bonereaper does 5-15 tokens, not 80
@@ -142,8 +151,8 @@ export const DEFAULT_PARAMS: BoneStarParams = {
 
   base_bid_size_phase2: 15,     // was 40 — Bonereaper accumulates gradually (5-15 tokens/fill)
 
-  max_inventory_per_side: 200,  // Conservative cap per side per window
-  max_inventory_ratio: 3.0,    // Suppress heavy side when > 3:1
+  max_inventory_per_side: 500,  // Raised from 200 — Bonereaper accumulates 30k-90k tokens/window
+  max_inventory_ratio: 6.0,    // Raised from 3.0 — Bonereaper shows 14/86 (6:1) skew
 
   max_window_duration_ms: 15 * 60_000, // 15 minutes — Bonereaper plays 5m and 15m only
   fee_params: CRYPTO_FEES,
@@ -166,13 +175,24 @@ interface BoneStarWindow {
   priceAtWindowOpen: number;
   oracleStrike: number | null;
 
-  // Maker bids (both sides)
+  // Maker bids — level 1 (tight) and level 2 (deep)
   upBidOrderId: string | null;
   upBidPrice: number;
   upBidSize: number;
+  upBid2OrderId: string | null;
+  upBid2Price: number;
+  upBid2Size: number;
+  upBid2PlacedAt: number;
   downBidOrderId: string | null;
   downBidPrice: number;
   downBidSize: number;
+  downBid2OrderId: string | null;
+  downBid2Price: number;
+  downBid2Size: number;
+  downBid2PlacedAt: number;
+  // TTL tracking for level 1
+  upBidPlacedAt: number;
+  downBidPlacedAt: number;
 
   // Sweep bid (one side, Phase 3 only)
   sweepOrderId: string | null;
@@ -437,21 +457,7 @@ class BoneStarStrategy implements Strategy {
   async stop(ctx: StrategyContext): Promise<void> {
     const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as BoneStarParams;
     for (const w of this.custom.activeWindows) {
-      if (w.upBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
-        if (r.cleared) { if (r.fill) this.recordFill(ctx, w, "UP", r.fill.size, r.fill.price, params, "cancel"); w.upBidOrderId = null; }
-      }
-      if (w.downBidOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
-        if (r.cleared) { if (r.fill) this.recordFill(ctx, w, "DOWN", r.fill.size, r.fill.price, params, "cancel"); w.downBidOrderId = null; }
-      }
-      if (w.sweepOrderId) {
-        const r = await safeCancelOrder(ctx.api, w.sweepOrderId);
-        if (r.cleared) {
-          if (r.fill && w.sweepSide) this.recordFill(ctx, w, w.sweepSide, r.fill.size, r.fill.price, params, "sweep_cancel");
-          w.sweepOrderId = null;
-        }
-      }
+      await this.cancelAllBids(ctx, w, params);
     }
     if (params.enable_order_flow) disableOrderFlow();
     ctx.log(`BoneStar stopped: ${this.custom.totalFills} fills, ${this.custom.totalSweepFills} sweeps, P&L=$${ctx.state.total_pnl.toFixed(2)}`);
@@ -601,9 +607,19 @@ class BoneStarStrategy implements Strategy {
         upBidOrderId: null,
         upBidPrice: 0,
         upBidSize: 0,
+        upBid2OrderId: null,
+        upBid2Price: 0,
+        upBid2Size: 0,
+        upBid2PlacedAt: 0,
         downBidOrderId: null,
         downBidPrice: 0,
         downBidSize: 0,
+        downBid2OrderId: null,
+        downBid2Price: 0,
+        downBid2Size: 0,
+        downBid2PlacedAt: 0,
+        upBidPlacedAt: 0,
+        downBidPlacedAt: 0,
 
         sweepOrderId: null,
         sweepSide: null,
@@ -727,8 +743,9 @@ class BoneStarStrategy implements Strategy {
       const spotForPTrue = (oracleTick && isOracleConnected()) ? oracleTick.price : currentSnap.price;
       const pTrue = calculatePTrue(spotForPTrue, effectiveStrike, "above", timeRemaining, vol);
 
-      // Check fills on all bids
+      // Check fills on all bids, then cancel stale quotes
       await this.checkFills(ctx, w, params);
+      await this.cancelStaleBids(ctx, w, params);
 
       // Determine phase — monotonic: once promoted, never demoted (1→2→3)
       const prevPhase = w.phase;
@@ -879,7 +896,9 @@ class BoneStarStrategy implements Strategy {
           downBookAsks,
           fills: w.pendingFills && w.pendingFills.length > 0 ? [...w.pendingFills] : undefined,
           upBidOrderId: w.upBidOrderId, upBidPrice: w.upBidPrice, upBidSize: w.upBidSize,
+          upBid2OrderId: w.upBid2OrderId, upBid2Price: w.upBid2Price, upBid2Size: w.upBid2Size,
           downBidOrderId: w.downBidOrderId, downBidPrice: w.downBidPrice, downBidSize: w.downBidSize,
+          downBid2OrderId: w.downBid2OrderId, downBid2Price: w.downBid2Price, downBid2Size: w.downBid2Size,
           upInventory: w.upInventory, downInventory: w.downInventory,
           upAvgCost: w.upAvgCost, downAvgCost: w.downAvgCost,
           oracleSpot: oracleTick?.price,
@@ -920,27 +939,49 @@ class BoneStarStrategy implements Strategy {
   // ── Check fills ────────────────────────────────────────────────────
 
   private async checkFills(ctx: StrategyContext, w: BoneStarWindow, params: BoneStarParams): Promise<void> {
-    // Check UP bid
+    // Check UP bid (level 1)
     if (w.upBidOrderId) {
       const status = await ctx.api.getOrderStatus(w.upBidOrderId);
       if (status.status === "MATCHED" && status.size_matched > 0) {
         const price = status.price || w.upBidPrice;
         const size = status.size_matched;
-        this.recordFill(ctx, w, "UP", size, price, params, "maker");
-        await this.persistFillToD1(ctx, w, "UP", price, size, params, "maker");
+        this.recordFill(ctx, w, "UP", size, price, params, "maker_L1");
+        await this.persistFillToD1(ctx, w, "UP", price, size, params, "maker_L1");
         w.upBidOrderId = null;
       }
     }
+    // Check UP bid (level 2)
+    if (w.upBid2OrderId) {
+      const status = await ctx.api.getOrderStatus(w.upBid2OrderId);
+      if (status.status === "MATCHED" && status.size_matched > 0) {
+        const price = status.price || w.upBid2Price;
+        const size = status.size_matched;
+        this.recordFill(ctx, w, "UP", size, price, params, "maker_L2");
+        await this.persistFillToD1(ctx, w, "UP", price, size, params, "maker_L2");
+        w.upBid2OrderId = null;
+      }
+    }
 
-    // Check DOWN bid
+    // Check DOWN bid (level 1)
     if (w.downBidOrderId) {
       const status = await ctx.api.getOrderStatus(w.downBidOrderId);
       if (status.status === "MATCHED" && status.size_matched > 0) {
         const price = status.price || w.downBidPrice;
         const size = status.size_matched;
-        this.recordFill(ctx, w, "DOWN", size, price, params, "maker");
-        await this.persistFillToD1(ctx, w, "DOWN", price, size, params, "maker");
+        this.recordFill(ctx, w, "DOWN", size, price, params, "maker_L1");
+        await this.persistFillToD1(ctx, w, "DOWN", price, size, params, "maker_L1");
         w.downBidOrderId = null;
+      }
+    }
+    // Check DOWN bid (level 2)
+    if (w.downBid2OrderId) {
+      const status = await ctx.api.getOrderStatus(w.downBid2OrderId);
+      if (status.status === "MATCHED" && status.size_matched > 0) {
+        const price = status.price || w.downBid2Price;
+        const size = status.size_matched;
+        this.recordFill(ctx, w, "DOWN", size, price, params, "maker_L2");
+        await this.persistFillToD1(ctx, w, "DOWN", price, size, params, "maker_L2");
+        w.downBid2OrderId = null;
       }
     }
 
@@ -960,6 +1001,43 @@ class BoneStarStrategy implements Strategy {
     }
   }
 
+  // ── Ladder price computation (shared across phases) ────────────────
+
+  private computeLadderPrices(
+    pTrue: number,
+    w: BoneStarWindow,
+    params: BoneStarParams,
+  ): { upL1: number; upL2: number; dnL1: number; dnL2: number } {
+    const fairUp = pTrue;
+    const fairDown = 1 - pTrue;
+
+    // Two levels per side: tight (edge1) and deep (edge2)
+    let upL1 = clamp(fairUp - params.edge1, params.min_bid_per_side, params.max_bid_per_side);
+    let upL2 = clamp(fairUp - params.edge2, params.min_bid_per_side, params.max_bid_per_side);
+    let dnL1 = clamp(fairDown - params.edge1, params.min_bid_per_side, params.max_bid_per_side);
+    let dnL2 = clamp(fairDown - params.edge2, params.min_bid_per_side, params.max_bid_per_side);
+
+    // Pair cost cap: each level's bid + opposite avg cost must stay under max_pair_cost
+    if (w.downInventory > 0) {
+      const cap = params.max_pair_cost - w.downAvgCost;
+      upL1 = Math.min(upL1, cap);
+      upL2 = Math.min(upL2, cap);
+    }
+    if (w.upInventory > 0) {
+      const cap = params.max_pair_cost - w.upAvgCost;
+      dnL1 = Math.min(dnL1, cap);
+      dnL2 = Math.min(dnL2, cap);
+    }
+
+    // Floor at $0.01
+    upL1 = Math.max(0.01, upL1);
+    upL2 = Math.max(0.01, upL2);
+    dnL1 = Math.max(0.01, dnL1);
+    dnL2 = Math.max(0.01, dnL2);
+
+    return { upL1, upL2, dnL1, dnL2 };
+  }
+
   // ── Phase 1: Balanced quotes ───────────────────────────────────────
 
   private async updateBalancedQuotes(
@@ -969,22 +1047,8 @@ class BoneStarStrategy implements Strategy {
     pTrue: number,
     _spot: number,
   ): Promise<void> {
-    const fairUp = pTrue;
-    const fairDown = 1 - pTrue;
-
-    let upBid = clamp(fairUp - params.bid_offset, params.min_bid_per_side, params.max_bid_per_side);
-    let dnBid = clamp(fairDown - params.bid_offset, params.min_bid_per_side, params.max_bid_per_side);
-
-    // Pair cost cap
-    if (w.downInventory > 0) upBid = Math.min(upBid, params.max_pair_cost - w.downAvgCost);
-    if (w.upInventory > 0) dnBid = Math.min(dnBid, params.max_pair_cost - w.upAvgCost);
-    if (upBid + dnBid > params.max_pair_cost) {
-      const scale = params.max_pair_cost / (upBid + dnBid);
-      upBid *= scale;
-      dnBid *= scale;
-    }
-    upBid = Math.max(0.01, upBid);
-    dnBid = Math.max(0.01, dnBid);
+    // Moving 2-level ladder anchored to P_true
+    const { upL1, upL2, dnL1, dnL2 } = this.computeLadderPrices(pTrue, w, params);
 
     // Equal sizing with inventory guards
     let upSize = params.base_bid_size;
@@ -1005,11 +1069,13 @@ class BoneStarStrategy implements Strategy {
       else dnSize = 0;
     }
 
-    await this.placeOrUpdateBid(ctx, w, "UP", upBid, upSize, params);
-    await this.placeOrUpdateBid(ctx, w, "DOWN", dnBid, dnSize, params);
+    await this.placeOrUpdateBid(ctx, w, "UP", upL1, upSize, params, 1);
+    await this.placeOrUpdateBid(ctx, w, "UP", upL2, upSize, params, 2);
+    await this.placeOrUpdateBid(ctx, w, "DOWN", dnL1, dnSize, params, 1);
+    await this.placeOrUpdateBid(ctx, w, "DOWN", dnL2, dnSize, params, 2);
 
     const pc = (w.upInventory > 0 && w.downInventory > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
-    w.tickAction = `P1 balanced: ▲${upBid.toFixed(2)}×${upSize} ▼${dnBid.toFixed(2)}×${dnSize}${pc}`;
+    w.tickAction = `P1 ladder: ▲${upL1.toFixed(2)}/${upL2.toFixed(2)}×${upSize} ▼${dnL1.toFixed(2)}/${dnL2.toFixed(2)}×${dnSize}${pc}`;
   }
 
   // ── Phase 2: Conviction quotes ─────────────────────────────────────
@@ -1021,12 +1087,8 @@ class BoneStarStrategy implements Strategy {
     pTrue: number,
     _spot: number,
   ): Promise<void> {
-    const fairUp = pTrue;
-    const fairDown = 1 - pTrue;
     const upWinning = pTrue > 0.5;
-
-    let upBid = clamp(fairUp - params.bid_offset, params.min_bid_per_side, params.max_bid_per_side);
-    let dnBid = clamp(fairDown - params.bid_offset, params.min_bid_per_side, params.max_bid_per_side);
+    const { upL1, upL2, dnL1, dnL2 } = this.computeLadderPrices(pTrue, w, params);
 
     // Size skew based on conviction
     const sizeMultiplier = pTrue > params.conviction_p_true_min || (1 - pTrue) > params.conviction_p_true_min
@@ -1038,23 +1100,9 @@ class BoneStarStrategy implements Strategy {
 
     if (upWinning) {
       upSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
-      // Losing-side bid: floor at min_bid, cap at max_bid — ensures fills above fair value
-      dnBid = Math.max(dnBid, params.losing_side_min_bid);
-      dnBid = Math.min(dnBid, params.losing_side_max_bid);
-      dnBid = Math.max(params.min_bid_per_side, dnBid - params.losing_side_discount);
     } else {
       dnSize = Math.round(params.base_bid_size_phase2 * sizeMultiplier);
-      // Losing-side bid: floor at min_bid, cap at max_bid
-      upBid = Math.max(upBid, params.losing_side_min_bid);
-      upBid = Math.min(upBid, params.losing_side_max_bid);
-      upBid = Math.max(params.min_bid_per_side, upBid - params.losing_side_discount);
     }
-
-    // Pair cost cap
-    if (w.downInventory > 0) upBid = Math.min(upBid, params.max_pair_cost - w.downAvgCost);
-    if (w.upInventory > 0) dnBid = Math.min(dnBid, params.max_pair_cost - w.upAvgCost);
-    upBid = Math.max(0.01, upBid);
-    dnBid = Math.max(0.01, dnBid);
 
     // Inventory guards
     if (w.upInventory >= params.max_inventory_per_side) upSize = 0;
@@ -1072,12 +1120,14 @@ class BoneStarStrategy implements Strategy {
       else dnSize = 0;
     }
 
-    await this.placeOrUpdateBid(ctx, w, "UP", upBid, upSize, params);
-    await this.placeOrUpdateBid(ctx, w, "DOWN", dnBid, dnSize, params);
+    await this.placeOrUpdateBid(ctx, w, "UP", upL1, upSize, params, 1);
+    await this.placeOrUpdateBid(ctx, w, "UP", upL2, upSize, params, 2);
+    await this.placeOrUpdateBid(ctx, w, "DOWN", dnL1, dnSize, params, 1);
+    await this.placeOrUpdateBid(ctx, w, "DOWN", dnL2, dnSize, params, 2);
 
     const winningSide = upWinning ? "UP" : "DOWN";
     const pc = (w.upInventory > 0 && w.downInventory > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
-    w.tickAction = `P2 ${winningSide}×${sizeMultiplier.toFixed(1)}: ▲${upBid.toFixed(2)}×${upSize} ▼${dnBid.toFixed(2)}×${dnSize}${pc}`;
+    w.tickAction = `P2 ${winningSide}×${sizeMultiplier.toFixed(1)}: ▲${upL1.toFixed(2)}/${upL2.toFixed(2)}×${upSize} ▼${dnL1.toFixed(2)}/${dnL2.toFixed(2)}×${dnSize}${pc}`;
   }
 
   // ── Phase 3: Sweep + bargain hunt ──────────────────────────────────
@@ -1177,32 +1227,17 @@ class BoneStarStrategy implements Strategy {
     }
 
     // Maker bids follow ACTUAL P_true direction (not locked side).
-    // If the locked side reversed, we stop sweeping but price things correctly.
-    const fairUp = pTrue;
-    const fairDown = 1 - pTrue;
+    const { upL1, upL2, dnL1, dnL2 } = this.computeLadderPrices(pTrue, w, params);
     const actualUpWinning = pTrue > 0.5;
-    let upBid = clamp(fairUp - params.bid_offset, params.min_bid_per_side, params.max_bid_per_side);
-    let dnBid = clamp(fairDown - params.bid_offset, params.min_bid_per_side, params.max_bid_per_side);
 
     let upSize = params.base_bid_size;
     let dnSize = params.base_bid_size;
 
     if (actualUpWinning) {
       upSize = Math.round(params.base_bid_size * params.conviction_size_mult);
-      if (params.sweep_losing_side) {
-        const losingBid = Math.min(1 - pTrue + params.losing_side_premium, params.losing_side_max_bid);
-        dnBid = Math.max(params.losing_side_min_bid, losingBid);
-      }
     } else {
       dnSize = Math.round(params.base_bid_size * params.conviction_size_mult);
-      if (params.sweep_losing_side) {
-        const losingBid = Math.min(pTrue + params.losing_side_premium, params.losing_side_max_bid);
-        upBid = Math.max(params.losing_side_min_bid, losingBid);
-      }
     }
-
-    upBid = Math.max(0.01, upBid);
-    dnBid = Math.max(0.01, dnBid);
 
     // Inventory guards — use actual P_true direction for "winning" side
     const actualWinningInv = actualUpWinning ? w.upInventory : w.downInventory;
@@ -1226,11 +1261,13 @@ class BoneStarStrategy implements Strategy {
       else dnSize = 0;
     }
 
-    await this.placeOrUpdateBid(ctx, w, "UP", upBid, upSize, params);
-    await this.placeOrUpdateBid(ctx, w, "DOWN", dnBid, dnSize, params);
+    await this.placeOrUpdateBid(ctx, w, "UP", upL1, upSize, params, 1);
+    await this.placeOrUpdateBid(ctx, w, "UP", upL2, upSize, params, 2);
+    await this.placeOrUpdateBid(ctx, w, "DOWN", dnL1, dnSize, params, 1);
+    await this.placeOrUpdateBid(ctx, w, "DOWN", dnL2, dnSize, params, 2);
 
     const pc = (w.upInventory > 0 && w.downInventory > 0) ? ` pc=${(w.upAvgCost + w.downAvgCost).toFixed(2)}` : "";
-    w.tickAction = `P3 SWEEP ${sweepSide}@${effectiveSweepPrice.toFixed(2)}×${sweepSize}: ▲${upBid.toFixed(2)}×${upSize} ▼${dnBid.toFixed(2)}×${dnSize}${pc}`;
+    w.tickAction = `P3 SWEEP ${sweepSide}@${effectiveSweepPrice.toFixed(2)}×${sweepSize}: ▲${upL1.toFixed(2)}/${upL2.toFixed(2)}×${upSize} ▼${dnL1.toFixed(2)}/${dnL2.toFixed(2)}×${dnSize}${pc}`;
   }
 
   // ── Bid placement helpers ──────────────────────────────────────────
@@ -1242,10 +1279,18 @@ class BoneStarStrategy implements Strategy {
     bidPrice: number,
     bidSize: number,
     params: BoneStarParams,
+    level: 1 | 2 = 1,
   ): Promise<void> {
-    const existingOrderId = side === "UP" ? w.upBidOrderId : w.downBidOrderId;
-    const existingPrice = side === "UP" ? w.upBidPrice : w.downBidPrice;
+    // Select order slot based on level
+    const isL2 = level === 2;
+    const existingOrderId = side === "UP"
+      ? (isL2 ? w.upBid2OrderId : w.upBidOrderId)
+      : (isL2 ? w.downBid2OrderId : w.downBidOrderId);
+    const existingPrice = side === "UP"
+      ? (isL2 ? w.upBid2Price : w.upBidPrice)
+      : (isL2 ? w.downBid2Price : w.downBidPrice);
     const roundedBid = Math.floor(bidPrice * 100) / 100;
+    const labelSuffix = isL2 ? "_L2" : "_L1";
 
     // Size=0 means inventory guard is active — cancel any existing bid
     if (roundedBid < 0.01 || bidSize <= 0) {
@@ -1253,11 +1298,10 @@ class BoneStarStrategy implements Strategy {
         const r = await safeCancelOrder(ctx.api, existingOrderId);
         if (r.cleared) {
           if (r.fill) {
-            this.recordFill(ctx, w, side, r.fill.size, r.fill.price, params, "cancel");
-            await this.persistFillToD1(ctx, w, side, r.fill.price, r.fill.size, params, "cancel");
+            this.recordFill(ctx, w, side, r.fill.size, r.fill.price, params, `cancel${labelSuffix}`);
+            await this.persistFillToD1(ctx, w, side, r.fill.price, r.fill.size, params, `cancel${labelSuffix}`);
           }
-          if (side === "UP") w.upBidOrderId = null;
-          else w.downBidOrderId = null;
+          this.clearOrderSlot(w, side, level);
         }
       }
       return;
@@ -1271,11 +1315,10 @@ class BoneStarStrategy implements Strategy {
       const r = await safeCancelOrder(ctx.api, existingOrderId);
       if (r.cleared) {
         if (r.fill) {
-          this.recordFill(ctx, w, side, r.fill.size, r.fill.price, params, "cancel");
-          await this.persistFillToD1(ctx, w, side, r.fill.price, r.fill.size, params, "cancel");
+          this.recordFill(ctx, w, side, r.fill.size, r.fill.price, params, `cancel${labelSuffix}`);
+          await this.persistFillToD1(ctx, w, side, r.fill.price, r.fill.size, params, `cancel${labelSuffix}`);
         }
-        if (side === "UP") w.upBidOrderId = null;
-        else w.downBidOrderId = null;
+        this.clearOrderSlot(w, side, level);
       } else {
         return; // Cancel failed — don't place new bid while old one exists
       }
@@ -1296,23 +1339,64 @@ class BoneStarStrategy implements Strategy {
       size: bidSize,
       price: finalBid,
       market: w.market.slug,
-      title: `${w.market.title} [BS P${w.phase} ${side}]`,
+      title: `${w.market.title} [BS P${w.phase} ${side} L${level}]`,
     });
 
     if (result.status === "filled") {
       const fillPrice = result.price;
       const fillSize = result.size;
-      this.recordFill(ctx, w, side, fillSize, fillPrice, params, `P${w.phase}_imm`);
-      await this.persistFillToD1(ctx, w, side, fillPrice, fillSize, params, `P${w.phase}_imm`);
+      this.recordFill(ctx, w, side, fillSize, fillPrice, params, `P${w.phase}_imm${labelSuffix}`);
+      await this.persistFillToD1(ctx, w, side, fillPrice, fillSize, params, `P${w.phase}_imm${labelSuffix}`);
     } else if (result.status === "placed") {
-      if (side === "UP") {
-        w.upBidOrderId = result.order_id;
-        w.upBidPrice = finalBid;
-        w.upBidSize = bidSize;
-      } else {
-        w.downBidOrderId = result.order_id;
-        w.downBidPrice = finalBid;
-        w.downBidSize = bidSize;
+      this.setOrderSlot(w, side, level, result.order_id, finalBid, bidSize);
+    }
+  }
+
+  private clearOrderSlot(w: BoneStarWindow, side: "UP" | "DOWN", level: 1 | 2): void {
+    if (side === "UP") {
+      if (level === 2) { w.upBid2OrderId = null; w.upBid2Price = 0; w.upBid2Size = 0; }
+      else { w.upBidOrderId = null; w.upBidPrice = 0; w.upBidSize = 0; }
+    } else {
+      if (level === 2) { w.downBid2OrderId = null; w.downBid2Price = 0; w.downBid2Size = 0; }
+      else { w.downBidOrderId = null; w.downBidPrice = 0; w.downBidSize = 0; }
+    }
+  }
+
+  private setOrderSlot(w: BoneStarWindow, side: "UP" | "DOWN", level: 1 | 2, orderId: string, price: number, size: number): void {
+    const now = Date.now();
+    if (side === "UP") {
+      if (level === 2) { w.upBid2OrderId = orderId; w.upBid2Price = price; w.upBid2Size = size; w.upBid2PlacedAt = now; }
+      else { w.upBidOrderId = orderId; w.upBidPrice = price; w.upBidSize = size; w.upBidPlacedAt = now; }
+    } else {
+      if (level === 2) { w.downBid2OrderId = orderId; w.downBid2Price = price; w.downBid2Size = size; w.downBid2PlacedAt = now; }
+      else { w.downBidOrderId = orderId; w.downBidPrice = price; w.downBidSize = size; w.downBidPlacedAt = now; }
+    }
+  }
+
+  /** Cancel quotes older than quote_ttl_ms */
+  private async cancelStaleBids(ctx: StrategyContext, w: BoneStarWindow, params: BoneStarParams): Promise<void> {
+    if (params.quote_ttl_ms <= 0) return;
+    const now = Date.now();
+    const ttl = params.quote_ttl_ms;
+
+    for (const [side, level] of [["UP", 1], ["UP", 2], ["DOWN", 1], ["DOWN", 2]] as Array<["UP" | "DOWN", 1 | 2]>) {
+      const isL2 = level === 2;
+      const orderId = side === "UP"
+        ? (isL2 ? w.upBid2OrderId : w.upBidOrderId)
+        : (isL2 ? w.downBid2OrderId : w.downBidOrderId);
+      const placedAt = side === "UP"
+        ? (isL2 ? w.upBid2PlacedAt : w.upBidPlacedAt)
+        : (isL2 ? w.downBid2PlacedAt : w.downBidPlacedAt);
+
+      if (orderId && placedAt > 0 && (now - placedAt) > ttl) {
+        const r = await safeCancelOrder(ctx.api, orderId);
+        if (r.cleared) {
+          if (r.fill) {
+            this.recordFill(ctx, w, side, r.fill.size, r.fill.price, params, `stale_L${level}`);
+            await this.persistFillToD1(ctx, w, side, r.fill.price, r.fill.size, params, `stale_L${level}`);
+          }
+          this.clearOrderSlot(w, side, level);
+        }
       }
     }
   }
@@ -1378,26 +1462,24 @@ class BoneStarStrategy implements Strategy {
   // ── Cancel all bids on a window ────────────────────────────────────
 
   private async cancelAllBids(ctx: StrategyContext, w: BoneStarWindow, params: BoneStarParams): Promise<void> {
-    if (w.upBidOrderId) {
-      const r = await safeCancelOrder(ctx.api, w.upBidOrderId);
-      if (r.cleared) {
-        if (r.fill) {
-          this.recordFill(ctx, w, "UP", r.fill.size, r.fill.price, params, "cancel");
-          await this.persistFillToD1(ctx, w, "UP", r.fill.price, r.fill.size, params, "cancel");
+    // Cancel all 4 maker bids (L1 + L2 for UP + DOWN)
+    for (const [side, level] of [["UP", 1], ["UP", 2], ["DOWN", 1], ["DOWN", 2]] as Array<["UP" | "DOWN", 1 | 2]>) {
+      const isL2 = level === 2;
+      const orderId = side === "UP"
+        ? (isL2 ? w.upBid2OrderId : w.upBidOrderId)
+        : (isL2 ? w.downBid2OrderId : w.downBidOrderId);
+      if (orderId) {
+        const r = await safeCancelOrder(ctx.api, orderId);
+        if (r.cleared) {
+          if (r.fill) {
+            this.recordFill(ctx, w, side, r.fill.size, r.fill.price, params, `cancel_L${level}`);
+            await this.persistFillToD1(ctx, w, side, r.fill.price, r.fill.size, params, `cancel_L${level}`);
+          }
+          this.clearOrderSlot(w, side, level);
         }
-        w.upBidOrderId = null;
       }
     }
-    if (w.downBidOrderId) {
-      const r = await safeCancelOrder(ctx.api, w.downBidOrderId);
-      if (r.cleared) {
-        if (r.fill) {
-          this.recordFill(ctx, w, "DOWN", r.fill.size, r.fill.price, params, "cancel");
-          await this.persistFillToD1(ctx, w, "DOWN", r.fill.price, r.fill.size, params, "cancel");
-        }
-        w.downBidOrderId = null;
-      }
-    }
+    // Cancel sweep
     if (w.sweepOrderId && w.sweepSide) {
       const r = await safeCancelOrder(ctx.api, w.sweepOrderId);
       if (r.cleared) {

@@ -53,6 +53,7 @@ import {
   buildProtectedConfig,
 } from "./strategy-core";
 import { tryMerge, type MergeableWindow } from "./strategies/merge";
+// Strategy execution: standalone-runner.ts for local dev, DO/alarm for CF deployment
 
 // ── Strategy Registration (DO-specific dynamic imports) ─────────────
 
@@ -96,6 +97,7 @@ export class StrategyDO implements DurableObject {
   private currentConfig: StrategyConfig | null = null;
   private state: StrategyState = emptyState();
   private logBuffer: Array<{ msg: string; data?: StructuredLogData; ts: string }> = [];
+  private tickRunning = false;
 
   constructor(state: DurableObjectState, env: StrategyEnv) {
     this.doState = state;
@@ -481,6 +483,7 @@ export class StrategyDO implements DurableObject {
     await this.doState.storage.put("userStopped", false);
 
     this.addLog(`Started: ${this.currentConfig!.name} (${this.currentConfig!.strategy_type}, ${this.currentConfig!.mode} mode)`);
+
     const ctx = this.buildContext();
     try {
       await this.strategy!.init(ctx);
@@ -543,6 +546,25 @@ export class StrategyDO implements DurableObject {
   }
 
   async alarm(): Promise<void> {
+    // Prevent concurrent tick execution — if a tick is still running when the
+    // next alarm fires (common in real mode where CLOB API calls take seconds),
+    // skip this alarm and reschedule. Without this, concurrent ticks read the
+    // same state and overwrite each other's fills.
+    if (this.tickRunning) {
+      console.log(`[ALARM] tick still running for ${this.currentConfig?.name || "unknown"}, skipping`);
+      const interval = this.currentConfig?.tick_interval_ms || 5000;
+      await this.doState.storage.setAlarm(Date.now() + interval);
+      return;
+    }
+    this.tickRunning = true;
+    try {
+      await this._alarm();
+    } finally {
+      this.tickRunning = false;
+    }
+  }
+
+  private async _alarm(): Promise<void> {
     console.log(`[ALARM] fired for ${this.currentConfig?.name || "unknown"} (has strategy=${!!this.strategy})`);
     const userStopped = await this.doState.storage.get<boolean>("userStopped");
     // Check if we're winding down — if so, keep ticking even if userStopped
@@ -662,8 +684,10 @@ export class StrategyDO implements DurableObject {
         const reinvestPct = (alarmParams?.profit_reinvest_pct as number) ?? 0;
         const hwmProfit = Math.max(0, this.state.high_water_balance - this.currentConfig.balance_usd);
 
-        // Lock (1 - reinvestPct) of peak profits above initial balance
-        const lockedAmount = Math.min(hwmProfit * (1 - reinvestPct), Math.max(0, currentBalance));
+        // Lock (1 - reinvestPct) of peak profits above initial balance.
+        // Never lock more than the profit portion — initial balance_usd always stays available.
+        const maxLockable = Math.max(0, currentBalance - this.currentConfig.balance_usd);
+        const lockedAmount = Math.min(hwmProfit * (1 - reinvestPct), maxLockable);
         const workingCapital = currentBalance - lockedAmount;
 
         if (workingCapital <= 0) {
@@ -997,17 +1021,32 @@ export class StrategyDO implements DurableObject {
     if (!windows) return;
 
     for (const w of windows) {
+      // ── Estimate maker rebates (all strategies) ─────────────────
+      const upInv = (w.upInventory as number) || 0;
+      const dnInv = (w.downInventory as number) || 0;
+      const upCost = (w.upAvgCost as number) || 0;
+      const dnCost = (w.downAvgCost as number) || 0;
+      const totalTokens = upInv + dnInv + ((w.totalMerged as number) || 0) * 2;
+      const prevTokens = (w._lastRebateTokens as number) || 0;
+      if (totalTokens > prevTokens) {
+        const totalCostVal = upInv * upCost + dnInv * dnCost;
+        const avgPrice = (upInv + dnInv) > 0 ? totalCostVal / (upInv + dnInv) : 0.5;
+        const newTokens = totalTokens - prevTokens;
+        const feePerToken = avgPrice * (1 - avgPrice) * 0.0625;
+        const rebate = feePerToken * newTokens * 0.20;
+        w.estimatedRebates = ((w.estimatedRebates as number) || 0) + rebate;
+        w._lastRebateTokens = totalTokens;
+      }
+
+      // ── Auto-merge profitable pairs ─────────────────────────────
       if (!w.upInventory || !w.downInventory) continue;
       if (w.upAvgCost + w.downAvgCost >= 1.0) continue;
 
       try {
         const result = await tryMerge(ctx, w);
         if (result) {
-          // Credit per-window P&L so resolution accounting stays accurate.
-          // Strategies use different field names for realized P&L:
           if (typeof w.realizedSellPnl === "number") w.realizedSellPnl += result.pnl;
           if (typeof w.realizedPnl === "number") w.realizedPnl += result.pnl;
-          // Track merge stats for UI display (babyboner etc.)
           if (typeof w.totalMerged === "number") w.totalMerged += result.merged;
           if (typeof w.totalMergePnl === "number") w.totalMergePnl += result.pnl;
           this.addLog(

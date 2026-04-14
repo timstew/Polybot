@@ -23,6 +23,12 @@ import "./strategies/certainty-taker";
 import "./strategies/avellaneda-maker";
 import "./strategies/enhanced-maker";
 import "./strategies/orchestrator";
+import "./strategies/bonestar";
+import "./strategies/babyboner";
+import "./strategies/safe-maker";
+import "./strategies/unified-adaptive";
+import "./strategies/conviction-maker";
+import "./strategies/scaling-safe-maker";
 
 // ── Auto-start DOs on first request ────────────────────────────────
 

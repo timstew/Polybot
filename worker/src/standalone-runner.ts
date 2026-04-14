@@ -63,7 +63,19 @@ function parseArgs() {
     for (const dir of candidates) {
       if (fs.existsSync(dir)) {
         const files = fs.readdirSync(dir).filter(f => f.endsWith(".sqlite"));
-        if (files.length > 0) { dbPath = path.join(dir, files[0]); break; }
+        // Find the ops database (has strategy_configs table), not firehose or empty
+        for (const file of files) {
+          const filePath = path.join(dir, file);
+          try {
+            const testDb = new Database(filePath, { readonly: true });
+            const hasTable = testDb.prepare(
+              "SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_configs'"
+            ).get();
+            testDb.close();
+            if (hasTable) { dbPath = filePath; break; }
+          } catch { /* skip unreadable files */ }
+        }
+        if (dbPath) break;
       }
     }
   }
@@ -314,15 +326,9 @@ async function startStrategy(configId: string, pythonApiUrl: string): Promise<st
   if (!state.logs) state.logs = [];
   if (!state.started_at) state.started_at = new Date().toISOString();
 
-  // Recover total_pnl from D1 if state was empty
-  if (state.ticks === 0 && state.total_pnl === 0) {
-    const row = sqliteDb.prepare(
-      "SELECT COALESCE(SUM(pnl), 0) as total_pnl, COUNT(*) as trade_count FROM strategy_trades WHERE strategy_id = ?"
-    ).get(configId) as { total_pnl: number; trade_count: number } | undefined;
-    if (row && row.trade_count > 0) {
-      state.total_pnl = row.total_pnl;
-    }
-  }
+  // State file is the source of truth for P&L. No D1 recovery — it causes
+  // double-counting when state files are cleared without clearing D1 trades.
+  // Use "Reset Stats" button to clear both D1 and state together.
 
   // HWM
   if (config.balance_usd != null) {
@@ -381,6 +387,28 @@ async function autoMergeProfitablePairs(inst: RunnerInstance, ctx: StrategyConte
   if (!windows) return;
 
   for (const w of windows) {
+    // ── Estimate maker rebates for ALL strategies ──────────────────
+    // Track cumulative inventory to compute incremental rebates each tick.
+    // Polymarket crypto fee: price × (1-price) × 0.0625 × size. Maker gets 20%.
+    const upInv = (w.upInventory as number) || 0;
+    const dnInv = (w.downInventory as number) || 0;
+    const upCost = (w.upAvgCost as number) || 0;
+    const dnCost = (w.downAvgCost as number) || 0;
+    const totalTokens = upInv + dnInv + ((w.totalMerged as number) || 0) * 2; // include merged (they were inventory)
+    const prevTokens = (w._lastRebateTokens as number) || 0;
+    if (totalTokens > prevTokens) {
+      // New tokens accumulated since last check — estimate rebate on the delta
+      // Use weighted avg price across both sides for fee calc
+      const totalCost = upInv * upCost + dnInv * dnCost;
+      const avgPrice = (upInv + dnInv) > 0 ? totalCost / (upInv + dnInv) : 0.5;
+      const newTokens = totalTokens - prevTokens;
+      const feePerToken = avgPrice * (1 - avgPrice) * 0.0625;
+      const rebate = feePerToken * newTokens * 0.20;
+      w.estimatedRebates = ((w.estimatedRebates as number) || 0) + rebate;
+      w._lastRebateTokens = totalTokens;
+    }
+
+    // ── Auto-merge profitable pairs ───────────────────────────────
     if (!w.upInventory || !w.downInventory) continue;
     if (w.upAvgCost + w.downAvgCost >= 1.0) continue;
     try {
@@ -514,10 +542,19 @@ async function stopStrategy(configId: string): Promise<string> {
 }
 
 async function resetStrategy(configId: string): Promise<string> {
-  // Stop if running
-  if (instances.has(configId)) {
-    await stopStrategy(configId);
+  // Stop if running — clear interval first to prevent state persist race
+  const inst = instances.get(configId);
+  if (inst) {
+    if (inst.interval) { clearInterval(inst.interval); inst.interval = null; }
+    instances.delete(configId);
+    sqliteDb.prepare("UPDATE strategy_configs SET active = 0, updated_at = datetime('now') WHERE id = ?").run(configId);
   }
+
+  // Delete persisted state JSON file FIRST (before stopStrategy could re-create it)
+  const statePath = path.join(path.dirname(sqliteDb.name), `standalone-state-${configId}.json`);
+  try {
+    if (fs.existsSync(statePath)) fs.unlinkSync(statePath);
+  } catch { /* ignore */ }
 
   // Clear D1/SQLite data for this strategy
   try {
@@ -532,17 +569,21 @@ async function resetStrategy(configId: string): Promise<string> {
     console.error("Reset DB cleanup error:", e);
   }
 
-  // Delete persisted state JSON file
-  const statePath = path.join(path.dirname(sqliteDb.name), `standalone-state-${configId}.json`);
-  try {
-    if (fs.existsSync(statePath)) fs.unlinkSync(statePath);
-  } catch { /* ignore */ }
-
   console.log(`[standalone-runner] Reset strategy ${configId}: cleared state, trades, logs, orders, snapshots`);
   return "reset";
 }
 
 // ── HTTP server ──
+
+function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try { resolve(JSON.parse(body)); } catch { resolve({}); }
+    });
+  });
+}
 
 function jsonResponse(res: http.ServerResponse, data: unknown, status = 200) {
   res.writeHead(status, {
@@ -677,6 +718,71 @@ function startServer(port: number, pythonApiUrl: string) {
           jsonResponse(res, rows);
           return;
         }
+        if (method === "POST") {
+          const body = await readBody(req);
+          const id = body.id || `strat-${Date.now()}`;
+          const params = typeof body.params === "string" ? body.params : JSON.stringify(body.params || {});
+          sqliteDb.prepare(
+            `INSERT INTO strategy_configs (id, name, strategy_type, mode, active, params, tick_interval_ms, max_capital_usd, balance_usd, lock_increment_usd, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`
+          ).run(id, body.name || id, body.strategy_type || "babyboner", body.mode || "paper", params,
+            body.tick_interval_ms || 2000, body.max_capital_usd || 100, body.balance_usd ?? null, body.lock_increment_usd ?? null);
+          jsonResponse(res, { status: "created", id });
+          return;
+        }
+      }
+
+      // PUT /api/strategy/configs/:id — update config
+      const configPutMatch = url.pathname.match(/^\/api\/strategy\/configs\/(.+)$/);
+      if (configPutMatch && method === "PUT") {
+        const configId = configPutMatch[1];
+        const body = await readBody(req);
+        const existing = sqliteDb.prepare("SELECT * FROM strategy_configs WHERE id = ?").get(configId) as Record<string, unknown> | undefined;
+        if (!existing) { jsonResponse(res, { error: "Config not found" }, 404); return; }
+
+        // Merge params
+        const oldParams = typeof existing.params === "string" ? JSON.parse(existing.params as string) : (existing.params || {});
+        const newParams = body.params ? { ...oldParams, ...body.params } : oldParams;
+
+        sqliteDb.prepare(
+          `UPDATE strategy_configs SET
+            name = COALESCE(?, name),
+            mode = COALESCE(?, mode),
+            params = ?,
+            tick_interval_ms = COALESCE(?, tick_interval_ms),
+            max_capital_usd = COALESCE(?, max_capital_usd),
+            balance_usd = ?,
+            lock_increment_usd = ?,
+            updated_at = datetime('now')
+          WHERE id = ?`
+        ).run(
+          body.name ?? null, body.mode ?? null, JSON.stringify(newParams),
+          body.tick_interval_ms ?? null, body.max_capital_usd ?? null,
+          body.balance_usd !== undefined ? body.balance_usd : existing.balance_usd,
+          body.lock_increment_usd !== undefined ? body.lock_increment_usd : existing.lock_increment_usd,
+          configId
+        );
+
+        // Update running instance if any
+        const inst = instances.get(configId);
+        if (inst) {
+          const updated = loadConfig(configId);
+          if (updated) inst.config = updated;
+        }
+
+        const row = sqliteDb.prepare("SELECT * FROM strategy_configs WHERE id = ?").get(configId);
+        jsonResponse(res, { status: "updated", config: row });
+        return;
+      }
+
+      // DELETE /api/strategy/configs/:id
+      const configDelMatch = url.pathname.match(/^\/api\/strategy\/configs\/(.+)$/);
+      if (configDelMatch && method === "DELETE") {
+        const configId = configDelMatch[1];
+        if (instances.has(configId)) await stopStrategy(configId);
+        sqliteDb.prepare("DELETE FROM strategy_configs WHERE id = ?").run(configId);
+        jsonResponse(res, { status: "deleted", id: configId });
+        return;
       }
 
       // Trades endpoints
@@ -716,6 +822,61 @@ function startServer(port: number, pythonApiUrl: string) {
         return;
       }
 
+      // ── Chart data (PnL series from strategy_trades) ────────────────
+      const chartMatch = url.pathname.match(/^\/api\/strategy\/chart-data\/(.+)$/);
+      if (chartMatch && method === "GET") {
+        const configId = chartMatch[1];
+        const since = parseInt(url.searchParams.get("since") || "0", 10);
+        const until = parseInt(url.searchParams.get("until") || `${Date.now()}`, 10);
+        const maxPoints = Math.min(parseInt(url.searchParams.get("max_points") || "300", 10), 1000);
+
+        const SYMBOL_NORM: Record<string, string> = { bitcoin: "BTC", btc: "BTC", ethereum: "ETH", eth: "ETH", solana: "SOL", sol: "SOL" };
+        const parseMarket = (market: string) => {
+          const parts = (market || "").split("-");
+          const raw = (parts[0] || "").toLowerCase();
+          const symbol = SYMBOL_NORM[raw] || raw.toUpperCase();
+          const durPart = parts.find(p => /^\d+[mh]$/.test(p)) || "";
+          const durMs = durPart.endsWith("m") ? parseInt(durPart) * 60_000 : durPart.endsWith("h") ? parseInt(durPart) * 3_600_000 : 0;
+          return { symbol, durMs };
+        };
+
+        const tradeRows = sqliteDb.prepare(
+          "SELECT timestamp, pnl, market FROM strategy_trades WHERE strategy_id = ? ORDER BY timestamp ASC"
+        ).all(configId) as Array<{ timestamp: string; pnl: number; market: string }>;
+
+        let cumPnl = 0;
+        const pnlSeries: Array<{ t: number; cumulative_pnl: number; trade_pnl: number; symbol: string; window_duration_ms: number }> = [];
+        for (const row of tradeRows) {
+          // D1 timestamps are UTC but stored without 'Z' — force UTC parsing
+          const tsStr = row.timestamp.endsWith("Z") ? row.timestamp : row.timestamp + "Z";
+          const t = new Date(tsStr).getTime();
+          cumPnl += row.pnl || 0;
+          if (t >= since && t <= until) {
+            const { symbol, durMs } = parseMarket(row.market || "");
+            pnlSeries.push({ t, cumulative_pnl: cumPnl, trade_pnl: row.pnl || 0, symbol, window_duration_ms: durMs });
+          }
+        }
+
+        // Downsample: aggregate trade_pnl between sampled points so the chart's
+        // cumulative sum matches. The chart recomputes cumulative from trade_pnl.
+        let sampled = pnlSeries;
+        if (pnlSeries.length > maxPoints) {
+          const step = Math.ceil(pnlSeries.length / maxPoints);
+          sampled = [];
+          let aggPnl = 0;
+          for (let i = 0; i < pnlSeries.length; i++) {
+            aggPnl += pnlSeries[i].trade_pnl;
+            if (i % step === 0 || i === pnlSeries.length - 1) {
+              sampled.push({ ...pnlSeries[i], trade_pnl: aggPnl });
+              aggPnl = 0;
+            }
+          }
+        }
+
+        jsonResponse(res, { pnl_series: sampled, tick_series: [], wallet_balances: [] });
+        return;
+      }
+
       // ── Orchestrator routes ──────────────────────────────────────────
       if (url.pathname === "/api/strategy/tactics" && method === "GET") {
         // Import orchestrator to trigger tactic registrations (side-effect imports)
@@ -752,6 +913,42 @@ function startServer(port: number, pythonApiUrl: string) {
           jsonResponse(res, rows);
         } catch {
           jsonResponse(res, []);
+        }
+        return;
+      }
+
+      // ── Wallet overview (proxied to Python API) ────────────────────
+      if (url.pathname === "/api/strategy/wallet-overview" && method === "GET") {
+        try {
+          const pyUrl = pythonApiUrl;
+          // Fetch balance, positions, and POL in parallel
+          const [balRes, posRes, polRes] = await Promise.all([
+            fetch(`${pyUrl}/api/strategy/balance`).then(r => r.json()).catch(() => ({ balance: 0 })),
+            fetch(`${pyUrl}/api/redeem/positions`).then(r => r.json()).catch(() => ({ positions: [] })),
+            fetch(`${pyUrl}/api/strategy/wallet-overview`).then(r => r.json()).catch(() => ({})),
+          ]);
+          const usdc = (balRes as Record<string, unknown>).balance as number || 0;
+          const positions = ((posRes as Record<string, unknown>).positions || []) as Array<Record<string, unknown>>;
+          const unredeemed = positions.reduce((sum: number, p) => sum + ((p.currentValue as number) || 0), 0);
+          const redeemable = positions.filter(p => p.redeemable).length;
+          const pol = (polRes as Record<string, unknown>).pol_balance as number || 0;
+          const walletAddress = (polRes as Record<string, unknown>).wallet_address as string || "";
+          const pendingWinsValue = (polRes as Record<string, unknown>).pending_wins_value as number || 0;
+          const pendingWinsCount = (polRes as Record<string, unknown>).pending_wins_count as number || 0;
+          jsonResponse(res, {
+            usdc_balance: usdc,
+            total_balance: usdc + unredeemed + pendingWinsValue,
+            unredeemed_value: unredeemed,
+            unredeemed_count: redeemable,
+            pending_wins_value: pendingWinsValue,
+            pending_wins_count: pendingWinsCount,
+            pol_balance: pol,
+            wallet_address: walletAddress,
+            position_count: positions.length,
+            redeemable_count: redeemable,
+          });
+        } catch (e) {
+          jsonResponse(res, { usdc_balance: 0, total_balance: 0, unredeemed_value: 0, error: String(e) });
         }
         return;
       }
@@ -871,11 +1068,14 @@ async function main() {
   }
   console.log("Press Ctrl+C to stop.\n");
 
-  // Graceful shutdown
+  // Graceful shutdown — flush state but keep active=1 so strategies auto-restart.
+  // Only explicit POST /stop sets active=0.
   const shutdown = async () => {
-    console.log("\n[standalone-runner] Shutting down...");
-    for (const [id] of instances) {
-      await stopStrategy(id);
+    console.log("\n[standalone-runner] Shutting down (preserving active flags)...");
+    for (const [id, inst] of instances) {
+      try { flushLogs(inst); } catch { /* ignore */ }
+      persistState(inst);
+      console.log(`  Saved state for ${id}`);
     }
     sqliteDb.close();
     process.exit(0);

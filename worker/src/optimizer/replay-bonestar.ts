@@ -18,9 +18,10 @@ import { volumeAtOrBelow, checkBucketFill, computeQueueAhead } from "./replay";
 
 export interface ParamSpec {
   name: string;
-  type: "continuous" | "integer" | "boolean";
+  type: "continuous" | "integer" | "boolean" | "categorical";
   min?: number;
   max?: number;
+  choices?: string[];
 }
 
 export const BONESTAR_SEARCH_SPACE: ParamSpec[] = [

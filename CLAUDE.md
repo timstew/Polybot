@@ -19,7 +19,12 @@ npx wrangler d1 execute polybot --file=schema-ops.sql     # apply ops schema
 npx wrangler d1 execute polybot --remote --command "SELECT ..."  # query D1
 npx tsc --noEmit                                # type-check strategies
 
-# Worker local dev (from worker/)
+# Standalone runner (from worker/ — primary local strategy execution)
+cd worker && npx tsx src/standalone-runner.ts    # pure Node.js, real WebSockets, direct D1 SQLite access
+# Uses better-sqlite3 to read/write the same .wrangler/state D1 database as wrangler dev.
+# Real setInterval tick loops, real WebSocket connections (Oracle, CLOB, Binance), no DO eviction.
+
+# Worker local dev (from worker/ — needed for API routes, copy trading, dashboard)
 cd worker && ./dev.sh                           # local dev with persistent DO state, debug logging, port 8787
 # IMPORTANT: never use `npm exec wrangler dev` — it swallows --persist-to and --port flags.
 # Always use ./dev.sh (or npx wrangler dev). Crash logs: worker/wrangler-dev.log
@@ -71,24 +76,40 @@ Polymarket APIs (Data API, Leaderboard API, Gamma API, CLOB API)
 
 **Key principle**: The dashboard talks to the Worker. The Worker handles all D1 reads/writes and FIFO P&L computation. The Worker calls Cloud Run only for bot detection (`/api/detect/cloud`) and proxies unmatched routes to Cloud Run.
 
-### Strategy Execution (StrategyDO)
+### Strategy Execution
+
+**Local development** uses the **standalone runner** (`worker/src/standalone-runner.ts`) — pure Node.js, no CF Worker limitations:
 ```
-StrategyDO alarm (every 5s) → strategy.tick(ctx)
-  → fetchSpotPrice(symbol)         # Binance/Coinbase REST (1s cache)
-  → computeSignal(...)             # 5-layer signal from price history
-  → checkFills(ctx, window, ...)   # simulate fills against fair value
-  → updateQuotes(ctx, window, ...) # place/cancel resting bids
-  → resolveWindows(...)            # settle expired windows via Gamma API
-State lives in DO memory (lost on eviction), configs + trades persisted to D1.
+standalone-runner.ts reads configs from D1 SQLite (better-sqlite3)
+  → starts real setInterval tick loops per strategy
+  → strategy.tick(ctx) every 5s
+    → fetchSpotPrice(symbol)         # Binance/Coinbase REST (1s cache)
+    → computeSignal(...)             # 5-layer signal from price history
+    → checkFills(ctx, window, ...)   # simulate fills against fair value
+    → updateQuotes(ctx, window, ...) # place/cancel resting bids
+    → resolveWindows(...)            # settle expired windows via Gamma API
+  → real WebSocket connections: Oracle (Chainlink), CLOB, Binance order flow
+State lives in process memory (no eviction), configs + trades persisted to D1 SQLite.
 ```
 
-**Data sources**: All strategies run on **REST polling only** (no streaming required):
+**Cloud deployment** uses the **StrategyDO** alarm system (`worker/src/strategy.ts`):
+```
+StrategyDO alarm (every 5s) → strategy.tick(ctx)
+  → same tick logic as standalone runner
+  → WebSocket features fall back to REST polling
+State serialized to DO storage (lost on eviction), configs + trades persisted to D1.
+```
+
+**Data sources**:
 - Binance REST `api/v3/ticker/price` — spot prices per symbol (primary)
 - Coinbase REST `v2/prices/{pair}/spot` — fallback if Binance fails
 - Gamma API `/markets?slug=` — market resolution verification
 - Data API `/trades?limit=200` — market discovery
 
-**Optional enhancement**: `enable_order_flow: true` enables a Binance WebSocket (`wss://stream.binance.com:9443/ws/{symbol}@aggTrade`) for real-time buy/sell volume imbalance. This is **local-dev only** — CF Workers cannot maintain persistent outbound WebSocket client connections. When disabled (default), order flow bonus is 0 and all 5 signal layers still work.
+**WebSocket connections** (standalone runner only — CF Workers cannot maintain persistent outbound WS):
+- Chainlink Data Streams — oracle prices for settlement-accurate P_true
+- Polymarket CLOB WebSocket — real-time order book and fill notifications
+- Binance aggTrade WebSocket — buy/sell volume imbalance (order flow signal)
 
 ## Data Flows
 
@@ -170,7 +191,8 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 | `worker/src/index.ts` | All HTTP routing, CopyListenerDO, StrategyDO routing, FIFO P&L, CORS, cron |
 | `worker/src/firehose-do.ts` | FirehoseDO: trade polling, wallet harvesting, detection batch orchestration |
 | `worker/src/listener.ts` | pollCycle(), fetchWalletActivity(), calculateCopyTrade(), handlePositionExit() |
-| `worker/src/strategy.ts` | Strategy framework: StrategyDO, paper model (order sim, book, fills), tick loop |
+| `worker/src/standalone-runner.ts` | Standalone runner: pure Node.js strategy execution, real setInterval/WebSocket, direct D1 SQLite (primary for local dev) |
+| `worker/src/strategy.ts` | StrategyDO: CF Durable Object wrapper, alarm-based tick loop (used for cloud deployment) |
 | `worker/src/strategies/price-feed.ts` | Price fetching (Binance/Coinbase REST), signal computation, market discovery, order flow (optional WS) |
 | `worker/src/strategies/spread-sniper.ts` | Direction-agnostic spread strategy: neutral fair value, adaptive bid sizing, pair cost optimization |
 | `worker/src/strategies/directional-maker.ts` | Aggressive signal-biased maker: sells ALL losing-side inventory on flip |
@@ -255,7 +277,7 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 - **Replay engine**: Pure function `replayWindow(snapshot, params)` mirrors safe-maker tick loop. Deterministic, no API calls. Uses `checkBucketFill()` against recorded volume buckets for fill simulation.
 - **TPE optimizer**: Standalone CLI (`npx tsx src/optimizer/optimize.ts`) reads local D1 SQLite, runs 2,000-iteration Bayesian search over 13 parameters, maximizes Sharpe ratio with 20% holdout. Buckets by crypto symbol, window duration, time of day, weekday/weekend.
 - **DO persistence**: `persistState()` strips `tickSnapshots` before writing (avoids SQLITE_TOOBIG). Status endpoint also strips them (prevents dashboard timeout). Both re-initialize on hydration.
-- **Always-on recording**: Mac mini at `clawdia@100.70.186.4` runs safe-maker-recorder 24/7. `dev-remote.sh` health-checks every 10s, keep-alive pings active strategies every 60s.
+- **Always-on recording**: Mac mini at `clawdia@100.70.186.4` runs the standalone runner (`npx tsx src/standalone-runner.ts`) 24/7. `dev-remote.sh` health-checks every 10s, keep-alive pings active strategies every 60s.
 
 ### Infrastructure
 - **Fee detection**: `marketHasFees()` checks title for crypto keywords (Bitcoin, Ethereum, up or down, above). Default: assume fees when title is empty. Rate: 6.25%. Formula: `fee = exec_price * (1 - exec_price) * 0.0625 * size`.

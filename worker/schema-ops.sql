@@ -165,3 +165,21 @@ CREATE TABLE IF NOT EXISTS tactic_scores (
     last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (strategy_id, regime, tactic_id)
 );
+
+-- Shadow wallet activity snapshots (compressed per-slug summaries)
+CREATE TABLE IF NOT EXISTS shadow_wallet_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id TEXT NOT NULL,
+    shadow_wallet TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    up_fills INTEGER NOT NULL DEFAULT 0,
+    dn_fills INTEGER NOT NULL DEFAULT 0,
+    up_avg_price REAL NOT NULL DEFAULT 0,
+    dn_avg_price REAL NOT NULL DEFAULT 0,
+    up_total_size REAL NOT NULL DEFAULT 0,
+    dn_total_size REAL NOT NULL DEFAULT 0,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_activity_strategy ON shadow_wallet_activity(strategy_id, slug);
+CREATE INDEX IF NOT EXISTS idx_shadow_activity_time ON shadow_wallet_activity(timestamp);

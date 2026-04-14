@@ -166,13 +166,16 @@ function connect(): void {
       }
     });
 
-    clobSocket.addEventListener("close", () => {
-      console.log("[CLOB-WS] Disconnected");
+    clobSocket.addEventListener("close", (event) => {
+      const ce = event as CloseEvent;
+      console.log(`[CLOB-WS] Disconnected: code=${ce.code} reason="${ce.reason || "none"}"`);
       scheduleReconnect();
     });
 
     clobSocket.addEventListener("error", (e) => {
-      console.error("[CLOB-WS] Error:", e);
+      // Log useful details from the error event
+      const detail = (e as { message?: string }).message || String(e);
+      console.error(`[CLOB-WS] Error: ${detail}`);
       scheduleReconnect();
     });
   } catch (e) {

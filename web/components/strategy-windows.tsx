@@ -350,7 +350,10 @@ export function ResolvingWindowRow(props: ResolvingWindowRowProps) {
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border border-amber-300 bg-amber-50/50 px-2 py-1 text-xs">
       <Tip tip={title}><span className="font-medium cursor-help">{compact}</span></Tip>
-      <span className="rounded px-1 py-0 text-[10px] font-medium bg-amber-100 text-amber-800 animate-pulse">resolving</span>
+      {prediction
+        ? <span className={`rounded px-1 py-0 text-[10px] font-medium ${prediction === "UP" ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}`}>{prediction} ⏳</span>
+        : <span className="rounded px-1 py-0 text-[10px] font-medium bg-amber-100 text-amber-800 animate-pulse">resolving</span>
+      }
       {chips}
       <InventoryBar up={up} down={dn} scale={scale} />
       <DualInventoryText up={up} dn={dn} upAvgCost={upAvgCost} dnAvgCost={dnAvgCost} costDp={costDp} />
@@ -359,11 +362,14 @@ export function ResolvingWindowRow(props: ResolvingWindowRowProps) {
       )}
       <PairPnl up={up} dn={dn} upAvgCost={upAvgCost} dnAvgCost={dnAvgCost} pairCost={pairCost}
         onMerge={onMerge} merging={merging} />
-      <span className="ml-auto text-[11px] text-muted-foreground italic">
-        {predictionText ? predictionText : prediction
-          ? <>{`Binance says ${prediction}`}{estPnl != null && <span className={`ml-1 font-medium ${estPnl >= 0 ? "text-green-600" : "text-red-600"}`}>{estPnl >= 0 ? "+" : ""}{fmt(estPnl)}</span>}</>
-          : "awaiting Polymarket..."}
-      </span>
+      {estPnl != null && (
+        <span className={`ml-auto text-[11px] font-medium tabular-nums ${estPnl >= 0 ? "text-green-600" : "text-red-600"}`}>
+          {estPnl >= 0 ? "+" : ""}{fmt(estPnl)}
+        </span>
+      )}
+      {predictionText && (
+        <span className="text-[11px] text-muted-foreground italic">{predictionText}</span>
+      )}
     </div>
   );
 }
@@ -434,6 +440,8 @@ export interface CompletedWindowRowProps {
   flipCount?: number; maxFlips?: number;
   // Merge
   totalMerged?: number;
+  // Rebates
+  estimatedRebates?: number;
   // Duration
   durationMs?: number;
   completedAt: string;
@@ -448,6 +456,7 @@ export function CompletedWindowRow(props: CompletedWindowRowProps) {
     netPnl, fillCount, takerFills,
     flipCount, maxFlips,
     totalMerged,
+    estimatedRebates,
     durationMs,
     completedAt,
     gammaConfirmed,
@@ -456,20 +465,25 @@ export function CompletedWindowRow(props: CompletedWindowRowProps) {
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1 text-xs">
       <Tip tip={title}><span className="font-medium cursor-help">{compact}</span></Tip>
-      <Tip tip={gammaConfirmed ? "Confirmed by Polymarket" : gammaConfirmed === false ? "Oracle outcome (awaiting Polymarket confirmation)" : "Market resolution outcome"}>
+      <Tip tip={gammaConfirmed ? "Confirmed by Polymarket" : "Oracle-resolved (same settlement source as Polymarket)"}>
         <span className={`rounded px-1 py-0 text-[10px] font-medium cursor-help ${
           outcome === "UP" ? "bg-green-100 text-green-800" : outcome === "DOWN" ? "bg-red-100 text-red-800" : "bg-gray-100"
-        }`}>{outcome}{gammaConfirmed ? " \u2713" : gammaConfirmed === false ? " \u25CB" : ""}</span>
+        }`}>{outcome}{gammaConfirmed ? " \u2705" : ""}</span>
       </Tip>
       {chips}
       <InventoryBar up={up} down={dn} scale={scale} />
       <DualInventoryText up={up} dn={dn} upAvgCost={upAvgCost} dnAvgCost={dnAvgCost} costDp={costDp} />
       <PairCostBadge pairCost={pairCost} />
-      <Tip tip="Net P&L = winning payout - losing cost + sell P&L - fees">
+      <Tip tip={`Net P&L = winning payout - losing cost + sell P&L - fees${estimatedRebates ? ` (+ est. $${estimatedRebates.toFixed(2)} rebates)` : ""}`}>
         <span className={`font-medium tabular-nums cursor-help ${netPnl >= 0 ? "text-green-600" : "text-red-600"}`}>
           {fmt(netPnl)}
         </span>
       </Tip>
+      {(estimatedRebates ?? 0) > 0.01 && (
+        <Tip tip="Estimated maker rebates (20% of taker fees on your maker fills)">
+          <span className="tabular-nums cursor-help text-purple-600 text-[10px]">+{fmt(estimatedRebates!)} reb</span>
+        </Tip>
+      )}
       {fillCount > 0 && <Tip tip="Maker fills in this window"><span className="tabular-nums text-muted-foreground cursor-help">{fillCount}f</span></Tip>}
       {(takerFills ?? 0) > 0 && <Tip tip="Taker sweeps"><span className="tabular-nums cursor-help text-orange-600">{takerFills}t</span></Tip>}
       {(flipCount ?? 0) > 0 && (
