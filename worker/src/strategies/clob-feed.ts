@@ -42,6 +42,31 @@ let pingInterval: ReturnType<typeof setInterval> | null = null;
 let zombieCheckInterval: ReturnType<typeof setInterval> | null = null;
 let reconnecting = false;
 
+// ── Book change callbacks (event-driven bidding) ────────────────────
+type BookChangeCallback = (tokenId: string, book: OrderBook) => void;
+const bookChangeCallbacks = new Map<string, Set<BookChangeCallback>>();
+
+/** Register a callback to fire when the book for a specific token changes. */
+export function onBookChange(tokenId: string, cb: BookChangeCallback): void {
+  if (!bookChangeCallbacks.has(tokenId)) bookChangeCallbacks.set(tokenId, new Set());
+  bookChangeCallbacks.get(tokenId)!.add(cb);
+}
+
+/** Remove a book change callback. */
+export function offBookChange(tokenId: string, cb: BookChangeCallback): void {
+  bookChangeCallbacks.get(tokenId)?.delete(cb);
+}
+
+function fireBookCallbacks(assetId: string): void {
+  const cbs = bookChangeCallbacks.get(assetId);
+  if (!cbs || cbs.size === 0) return;
+  const entry = clobBooks.get(assetId);
+  if (!entry) return;
+  for (const cb of cbs) {
+    try { cb(assetId, entry.book); } catch { /* don't let one callback break others */ }
+  }
+}
+
 const CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const PING_INTERVAL_MS = 10_000;
 const TRADE_RETENTION_MS = 60_000;
@@ -288,6 +313,7 @@ function handleBookSnapshot(assetId: string, msg: ClobMessage): void {
 
   clobBooks.set(assetId, { book, updatedAt: Date.now() });
   initializedTokens.add(assetId);
+  fireBookCallbacks(assetId);
 }
 
 function handlePriceChange(assetId: string, msg: ClobMessage): void {
@@ -323,6 +349,7 @@ function handlePriceChange(assetId: string, msg: ClobMessage): void {
   book.bids.sort((a, b) => b.price - a.price);
   book.asks.sort((a, b) => a.price - b.price);
   entry.updatedAt = Date.now();
+  fireBookCallbacks(assetId);
 }
 
 function handleLastTrade(assetId: string, msg: ClobMessage): void {

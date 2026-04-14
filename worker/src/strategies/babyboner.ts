@@ -48,6 +48,16 @@ import {
   disableReactiveFeed,
 } from "./reactive-feed";
 import { classifyRegime, computeRegimeFeatures } from "./regime";
+import {
+  enableClobFeed,
+  subscribeClobTokens,
+  unsubscribeClobTokens,
+  getClobBook,
+  isClobConnected,
+  onBookChange,
+  offBookChange,
+  type ClobTradeEntry,
+} from "./clob-feed";
 import type { TickSnapshot, TapeBucket, TapeMeta } from "../optimizer/types";
 
 // ── Bonereaper shadow fill types ─────────────────────────────────────
@@ -382,8 +392,17 @@ class BabyBoneRStrategy implements Strategy {
   private lastBrFetchAt = 0;
   private lastShadowPersistAt = 0;
   private brActivityCache: BrFill[] = [];
+  // Event-driven fill state
+  private registeredBookCallbacks = new Map<string, (tokenId: string, book: OrderBook) => void>();
+  private latestCtx: StrategyContext | null = null;
+  private latestParams: BabyBoneRParams | null = null;
+  private eventFillLock = false; // prevent concurrent event fills
 
   private async getBookCached(ctx: StrategyContext, tokenId: string): Promise<OrderBook> {
+    // Prefer real-time CLOB WebSocket book (updated on every price_change event)
+    const wsBook = getClobBook(tokenId);
+    if (wsBook) return wsBook;
+    // Fallback to REST with 5s cache (CF Worker or WS not connected)
     const now = Date.now();
     const cached = this.bookCache.get(tokenId);
     if (cached && now - cached.fetchedAt < 5_000) return cached.book;
@@ -397,6 +416,153 @@ class BabyBoneRStrategy implements Strategy {
     let best = book.asks[0].price;
     for (const a of book.asks) if (a.price < best) best = a.price;
     return best;
+  }
+
+  /** Subscribe a window's tokens to CLOB WebSocket and register event-driven fill callbacks. */
+  private subscribeClobWindow(w: BabyBoneRWindow): void {
+    const tokenIds = [w.market.upTokenId, w.market.downTokenId];
+    subscribeClobTokens(tokenIds);
+
+    for (const tokenId of tokenIds) {
+      if (this.registeredBookCallbacks.has(tokenId)) continue;
+      const cb = (_tid: string, book: OrderBook) => this.handleBookEvent(w, tokenId, book);
+      this.registeredBookCallbacks.set(tokenId, cb);
+      onBookChange(tokenId, cb);
+    }
+  }
+
+  /** Unsubscribe a window's tokens from CLOB WebSocket. */
+  private unsubscribeClobWindow(w: BabyBoneRWindow): void {
+    const tokenIds = [w.market.upTokenId, w.market.downTokenId];
+    for (const tokenId of tokenIds) {
+      const cb = this.registeredBookCallbacks.get(tokenId);
+      if (cb) { offBookChange(tokenId, cb); this.registeredBookCallbacks.delete(tokenId); }
+    }
+    unsubscribeClobTokens(tokenIds);
+  }
+
+  /**
+   * Event-driven fill handler — fires on every CLOB book change.
+   * Checks if new ask liquidity is available at our target price and fills immediately.
+   * Falls back gracefully: if no ctx/params yet (first tick hasn't run), skip.
+   */
+  private handleBookEvent(w: BabyBoneRWindow, tokenId: string, book: OrderBook): void {
+    if (this.eventFillLock || !this.latestCtx || !this.latestParams) return;
+    this.eventFillLock = true;
+    try {
+      this.tryEventFill(w, tokenId, book);
+    } finally {
+      this.eventFillLock = false;
+    }
+  }
+
+  private tryEventFill(w: BabyBoneRWindow, tokenId: string, book: OrderBook): void {
+    const ctx = this.latestCtx!;
+    const params = this.latestParams!;
+    const now = Date.now();
+
+    // Don't fill if window is winding down
+    if (now > w.windowEndTime - 30_000) return;
+    if (ctx.windingDown) return;
+
+    const isUp = tokenId === w.market.upTokenId;
+    const side: "UP" | "DOWN" = isUp ? "UP" : "DOWN";
+
+    // Compute current bid price (same logic as tick-based quoting)
+    const timeRemaining = Math.max(0, w.windowEndTime - now);
+    const pTrue = w.lastSpotPrice != null && w.oracleStrike != null
+      ? calculatePTrue(w.lastSpotPrice, w.oracleStrike, "above", timeRemaining, 0.20)
+      : 0.50;
+    const pCapped = Math.max(params.p_floor, Math.min(params.p_ceil, pTrue));
+    const pricingMode = params.pricing_mode || "hybrid";
+
+    let bid = 0;
+    if (pricingMode === "hybrid") {
+      bid = isUp ? Math.max(params.winning_share, pCapped) : Math.max(params.winning_share, 1 - pCapped);
+    } else if (pricingMode === "book") {
+      const bestAsk = this.getBestAsk(book);
+      bid = bestAsk !== null ? Math.min(0.95, bestAsk) : 0;
+    } else {
+      // ladder — skip event-driven for complex pricing modes
+      return;
+    }
+
+    // Apply suppressions
+    if (w.upInventory >= params.max_inventory_per_side && isUp) return;
+    if (w.downInventory >= params.max_inventory_per_side && !isUp) return;
+
+    const currentInvCost = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
+    if (currentInvCost >= params.max_total_cost) {
+      const isHeavy = isUp ? w.upInventory >= w.downInventory : w.downInventory >= w.upInventory;
+      if (isHeavy) return;
+    }
+
+    const totalTokens = w.upInventory + w.downInventory;
+    if (totalTokens >= params.skew_guard_min_tokens) {
+      const ratio = (isUp ? w.upInventory : w.downInventory) / totalTokens;
+      if (ratio > params.max_skew_ratio) return;
+    }
+
+    const roundedBid = Math.floor(bid * 100) / 100;
+    if (roundedBid <= 0) return;
+
+    // Check if book has ask liquidity at our bid price
+    const bestAsk = this.getBestAsk(book);
+    if (bestAsk === null || roundedBid < bestAsk) return; // doesn't cross, skip
+
+    // Size to available liquidity at ask levels <= our bid
+    let availableSize = 0;
+    for (const level of book.asks) {
+      if (level.price <= roundedBid) availableSize += level.size;
+    }
+    if (availableSize < 1) return;
+
+    const inv = isUp ? w.upInventory : w.downInventory;
+    const invRoom = params.max_inventory_per_side - inv;
+    const capitalRoom = params.max_total_cost - currentInvCost;
+    const capitalTokens = roundedBid > 0 ? capitalRoom / roundedBid : 0;
+    const fillSize = Math.max(1, Math.floor(Math.min(availableSize, invRoom, capitalTokens)));
+
+    const isReal = ctx.config.mode === "real";
+
+    if (isReal) {
+      // Real mode: place immediate GTC order
+      // Note: placeOrder is async but we're in a sync callback — queue it
+      ctx.api.placeOrder({
+        token_id: tokenId,
+        side: "BUY",
+        size: fillSize,
+        price: roundedBid,
+        market: w.market.slug,
+        title: `${w.market.title.slice(0, 25)} [BBR ${side} EVT]`,
+      }).then(result => {
+        if (result.status === "filled") {
+          this.recordBuyFill(ctx, w, side, result.size, result.price, `real_evt`, true);
+          this.persistTradeToD1(ctx, w, side, "BUY", result.price, result.size, 0, `real_evt`);
+        }
+      }).catch(() => { /* order failed, tick will retry */ });
+    } else {
+      // Paper mode: shadow fills or grounded fill
+      // Shadow: check if any BR fills at this price exist
+      const processedSet = new Set(w.processedBrFillIds || []);
+      for (const br of this.brActivityCache) {
+        if (br.slug !== w.market.slug || br.side !== side) continue;
+        if (processedSet.has(br.id)) continue;
+        if (br.timestamp * 1000 < w.enteredAt) { processedSet.add(br.id); continue; }
+        if (roundedBid < br.price) continue;
+        // Check capital/inventory per fill
+        const invNow = isUp ? w.upInventory : w.downInventory;
+        const costNow = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
+        if (invNow >= params.max_inventory_per_side) break;
+        const heavy = isUp ? w.upInventory >= w.downInventory : w.downInventory >= w.upInventory;
+        if (costNow >= params.max_total_cost && heavy) break;
+
+        this.recordBuyFill(ctx, w, side, br.size, br.price, "shadow_evt", false);
+        this.persistTradeToD1(ctx, w, side, "BUY", br.price, br.size, 0, "shadow_evt");
+        processedSet.add(br.id);
+        w.processedBrFillIds = [...processedSet];
+      }
+    }
   }
 
   async init(ctx: StrategyContext): Promise<void> {
@@ -446,6 +612,14 @@ class BabyBoneRStrategy implements Strategy {
     const binanceSymbols = params.target_cryptos.map(toBinanceSymbol);
     enableReactiveFeed(binanceSymbols);
 
+    // Enable CLOB WebSocket for real-time book updates (event-driven fills)
+    enableClobFeed();
+
+    // Subscribe existing windows to CLOB book updates
+    for (const w of this.custom.activeWindows) {
+      this.subscribeClobWindow(w);
+    }
+
     ctx.log(
       `BabyBoneR initialized: ${this.custom.activeWindows.length} active, ${this.custom.totalFills} fills, ${this.custom.totalSells} sells`,
     );
@@ -454,6 +628,10 @@ class BabyBoneRStrategy implements Strategy {
   async tick(ctx: StrategyContext): Promise<void> {
     const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as BabyBoneRParams;
     const now = Date.now();
+
+    // Store latest context for event-driven fill callbacks
+    this.latestCtx = ctx;
+    this.latestParams = params;
 
     // ── Dynamic capital scaling ─────────────────────────────────────
     // Derive bid size, windows, and duration limits from available capital.
@@ -481,6 +659,9 @@ class BabyBoneRStrategy implements Strategy {
         params.min_window_duration_ms = 4 * 60_000;
       }
     }
+
+    // Update params for event-driven callbacks (after dynamic scaling)
+    this.latestParams = params;
 
     // 1. Discover markets — use direct slug-based lookup for speed.
     //    BTC 5m windows have predictable slugs: btc-updown-5m-{unix_open_time}
@@ -1028,8 +1209,10 @@ class BabyBoneRStrategy implements Strategy {
       }
 
       this.custom.activeWindows.push(window);
+      // Subscribe to CLOB WebSocket for event-driven fills
+      this.subscribeClobWindow(window);
       ctx.log(
-        `ENTERED: ${market.title.slice(0, 40)} ${sym} oracle=${oracleStrike?.toFixed(0) ?? "none"}`,
+        `ENTERED: ${market.title.slice(0, 40)} ${sym} oracle=${oracleStrike?.toFixed(0) ?? "none"} clob=${isClobConnected() ? "WS" : "REST"}`,
         { level: "signal", symbol: sym, phase: "entry" },
       );
     }
@@ -1329,8 +1512,29 @@ class BabyBoneRStrategy implements Strategy {
         if (bid <= 0 || inv >= params.max_inventory_per_side || currentInvCost2 >= params.max_total_cost) continue;
 
         const tokenId = side === "UP" ? w.market.upTokenId : w.market.downTokenId;
-        const fillSize = params.maker_bid_size;
         const roundedBid = Math.floor(bid * 100) / 100;
+
+        // Size to available liquidity: scan the order book and buy exactly what's offered
+        // at ask levels <= our bid price. This replicates Bonereaper's behavior — they buy
+        // what's available, not a fixed size. Capped by remaining inventory/capital room.
+        let fillSize = params.maker_bid_size; // fallback if book unavailable
+        try {
+          const book = await this.getBookCached(ctx, tokenId);
+          let availableAtBid = 0;
+          for (const level of book.asks) {
+            if (level.price <= roundedBid) {
+              availableAtBid += level.size;
+            }
+          }
+          if (availableAtBid > 0) {
+            // Cap by inventory room and capital room
+            const invRoom = params.max_inventory_per_side - inv;
+            const capitalRoom = params.max_total_cost - currentInvCost2;
+            const capitalTokens = roundedBid > 0 ? capitalRoom / roundedBid : 0;
+            fillSize = Math.min(availableAtBid, invRoom, capitalTokens);
+            fillSize = Math.max(1, Math.floor(fillSize)); // at least 1 token, integer
+          }
+        } catch { /* book unavailable — use fallback size */ }
         const levelLabel = level === 2 ? "L2" : "L1";
 
         if (isReal) {
@@ -1398,7 +1602,7 @@ class BabyBoneRStrategy implements Strategy {
           const brMatches = this.brActivityCache.filter(br => br.slug === w.market.slug && br.side === side);
           const brCoverable = brMatches.filter(br => !processedSet.has(br.id) && roundedBid >= br.price);
           if (brMatches.length > 0 && ctx.state.ticks % 5 === 0) {
-            ctx.log(`SHADOW-DBG: ${side} L${level} bid=$${roundedBid} brTotal=${this.brActivityCache.length} matching=${brMatches.length} coverable=${brCoverable.length} processed=${processedSet.size}`, { level: "signal" });
+            ctx.log(`SHADOW-DBG: ${side} L${level} bid=$${roundedBid} bookSize=${fillSize} brTotal=${this.brActivityCache.length} matching=${brMatches.length} coverable=${brCoverable.length} processed=${processedSet.size}`, { level: "signal" });
           }
           for (const br of this.brActivityCache) {
             // Re-check capital/inventory per fill (they change as we accumulate)
@@ -1675,6 +1879,7 @@ class BabyBoneRStrategy implements Strategy {
 
     for (const idx of toRemove.reverse()) {
       const removed = this.custom.activeWindows.splice(idx, 1)[0];
+      this.unsubscribeClobWindow(removed);
       delete this.custom.windowRefPrices[removed.market.conditionId];
     }
   }
