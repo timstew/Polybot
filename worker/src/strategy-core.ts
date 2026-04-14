@@ -135,6 +135,7 @@ export interface StrategyAPI {
   }): Promise<PlaceOrderResult>;
 
   cancelOrder(order_id: string): Promise<boolean>;
+  cancelAllOrders(): Promise<{ success: boolean }>;
   getOrderStatus(order_id: string): Promise<OrderStatusResult>;
   getBook(token_id: string): Promise<OrderBook>;
   getBalance(): Promise<number>;
@@ -411,6 +412,12 @@ export class PaperStrategyAPI implements StrategyAPI {
     };
   }
 
+  async cancelAllOrders(): Promise<{ success: boolean }> {
+    // Paper mode: just clear all open orders
+    this.orders = this.orders.filter(o => o.status !== "open");
+    return { success: true };
+  }
+
   async cancelOrder(order_id: string): Promise<boolean> {
     const order = this.orders.find((o) => o.id === order_id);
     if (!order || order.status !== "open") return false;
@@ -588,6 +595,18 @@ export class RealStrategyAPI implements StrategyAPI {
       return data.success;
     } catch {
       return false;
+    }
+  }
+
+  async cancelAllOrders(): Promise<{ success: boolean }> {
+    try {
+      const resp = await fetch(`${this.pythonApiUrl}/api/strategy/cancel-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      return (await resp.json()) as { success: boolean };
+    } catch {
+      return { success: false };
     }
   }
 

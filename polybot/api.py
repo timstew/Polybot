@@ -1709,6 +1709,18 @@ def strategy_place_order(body: dict):
         return {"status": "failed", "error": str(e)}
 
 
+@app.post("/api/strategy/cancel-all")
+def strategy_cancel_all_orders():
+    """Cancel ALL open orders on the CLOB. Used on strategy stop and startup."""
+    client = _get_clob_client()
+    try:
+        resp = client.cancel_all()
+        return {"success": True, "canceled": resp.get("canceled", []), "not_canceled": resp.get("not_canceled", {})}
+    except Exception as e:
+        logger.exception("Strategy cancel-all failed")
+        return {"success": False, "error": str(e)}
+
+
 @app.post("/api/strategy/cancel")
 def strategy_cancel_order(body: dict):
     """Cancel an open order.

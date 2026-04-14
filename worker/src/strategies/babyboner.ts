@@ -666,6 +666,16 @@ class BabyBoneRStrategy implements Strategy {
     // Enable CLOB WebSocket for real-time book updates (event-driven fills)
     enableClobFeed();
 
+    // Real mode safety: cancel all CLOB orders on startup (catches orphans from crashes)
+    if (ctx.config.mode === "real") {
+      try {
+        const result = await ctx.api.cancelAllOrders();
+        ctx.log(`CLOB cancel-all on init: ${JSON.stringify(result)}`, { level: "info" });
+      } catch (e) {
+        ctx.log(`CLOB cancel-all on init failed: ${String(e).slice(0, 80)}`, { level: "warning" });
+      }
+    }
+
     // Subscribe existing windows to CLOB book updates
     for (const w of this.custom.activeWindows) {
       this.subscribeClobWindow(w);
@@ -934,8 +944,19 @@ class BabyBoneRStrategy implements Strategy {
 
   async stop(ctx: StrategyContext): Promise<void> {
     const params = { ...DEFAULT_PARAMS, ...ctx.config.params } as BabyBoneRParams;
+    // Cancel all tracked orders per window
     for (const w of this.custom.activeWindows) {
       await this.cancelAllOrders(ctx, w, params);
+      this.unsubscribeClobWindow(w);
+    }
+    // Belt and suspenders: cancel ALL orders on the CLOB (catches orphans from crashes/restarts)
+    if (ctx.config.mode === "real") {
+      try {
+        const result = await ctx.api.cancelAllOrders();
+        ctx.log(`CLOB cancel-all on stop: ${JSON.stringify(result)}`, { level: "info" });
+      } catch (e) {
+        ctx.log(`CLOB cancel-all failed: ${String(e).slice(0, 80)}`, { level: "warning" });
+      }
     }
     const binanceSymbols = params.target_cryptos.map(toBinanceSymbol);
     disableReactiveFeed(binanceSymbols);
@@ -1176,14 +1197,17 @@ class BabyBoneRStrategy implements Strategy {
   // ── Cancel all orders ─────────────────────────────────────────────
 
   private async cancelAllOrders(ctx: StrategyContext, w: BabyBoneRWindow, params: BabyBoneRParams): Promise<void> {
-    // Cancel all buy bids (L1 + L2)
-    for (const [side, level] of [["UP", 1], ["UP", 2], ["DOWN", 1], ["DOWN", 2]] as Array<["UP" | "DOWN", 1 | 2]>) {
-      const orderId = this.getRealOrderId(w, side, level);
-      if (orderId) {
-        const r = await safeCancelOrder(ctx.api, orderId);
-        if (r.cleared) {
-          if (r.fill) this.recordBuyFill(ctx, w, side, r.fill.size, r.fill.price, `cancel_L${level}`, false);
-          this.setRealOrderId(w, side, level, null);
+    // Cancel all buy bids — legacy L1/L2 + ladder levels
+    const maxLevel = Math.max(2, params.br_ladder_levels || 4);
+    for (const side of ["UP", "DOWN"] as const) {
+      for (let level = 1; level <= maxLevel; level++) {
+        const orderId = this.getRealOrderId(w, side, level);
+        if (orderId) {
+          const r = await safeCancelOrder(ctx.api, orderId);
+          if (r.cleared) {
+            if (r.fill) this.recordBuyFill(ctx, w, side, r.fill.size, r.fill.price, `cancel_L${level}`, false);
+            this.setRealOrderId(w, side, level, null);
+          }
         }
       }
     }
