@@ -42,6 +42,8 @@ The **standalone runner** (`worker/src/standalone-runner.ts`) is the primary way
 - **Real WebSocket connections** — Oracle (Chainlink), CLOB, Binance order flow all work natively
 - **No DO eviction** — state lives in memory for the process lifetime
 - **Direct D1 SQLite access** — uses `better-sqlite3` to read/write the same `.wrangler/state` D1 database that `wrangler dev` uses
+- **Graceful shutdown** — `SIGTERM`/`SIGINT` flushes state but preserves `active` flags, so strategies auto-restart after deploys
+- **Boundary-crossing discovery** — detects new 5m/15m windows within 1-3 seconds of opening (pre-fetches markets 5s before window open)
 
 ```bash
 cd worker && npx tsx src/standalone-runner.ts
@@ -57,27 +59,57 @@ The in-worker tick simulator (`worker/src/tick-simulator.ts`, `USE_SIMULATOR` en
 
 For cloud deployment, the existing DO/alarm system in `strategy.ts` still works. Strategies run via `StrategyDO` alarms with state serialization to DO storage. WebSocket-dependent features (Oracle, CLOB WS, Binance WS) fall back to REST polling.
 
-## Shadow Fill System
+## Paper Fill Systems
 
-The **shadow fill model** grounds paper trading in real market data instead of simulated fills.
+Paper mode has three fill systems. The choice depends on what question you're answering:
 
-Instead of simulating whether our orders would fill (which produces unrealistically optimistic results), the shadow system watches a real trader's actual fills via the Polymarket Data API and only grants fills that the real trader achieved:
+### 1. Shadow Fills (bot-mimicking)
 
-1. Every 10 seconds, fetch the shadow wallet's last 200 trades
-2. For each fill in the same market: if our bid price ≥ their fill price → grant a shadow fill at their actual execution price
-3. Track processed fill IDs to prevent double-counting
-4. Record shadow wallet activity to D1 `shadow_wallet_activity` table for post-analysis
+**Question: "If we copied this bot's exact behavior, would we get the same fills?"**
 
-Configure via strategy params:
+Watches a real trader's fills via the Polymarket Data API and only grants fills that the real trader achieved. Used by BabyBoneR when `shadow_wallet` is set.
+
+1. Every 10s, fetch the shadow wallet's last 200 trades
+2. For each fill in the same market: if our bid price >= their fill price, grant a fill at their execution price and size
+3. Only process fills that occurred after we entered the window (prevents inheriting stale one-sided inventory)
+4. Track processed fill IDs to prevent double-counting
+
+Best for: replicating a known profitable bot (e.g., Bonereaper). Only useful when you have a specific wallet to shadow.
+
+### 2. Grounded Fills (market-realistic)
+
+**Question: "Would the real market have filled our order?"**
+
+Checks whether our bid crosses the real CLOB ask, and if there's enough volume on the trade tape to fill our size. Used by most strategies when `grounded_fills: true` (default).
+
+1. If bid >= best ask and enough size available at ask levels, fill at ask price
+2. Otherwise, check the real trade tape for volume at our price level, accounting for queue position
+3. No fill if insufficient real-world liquidity
+
+Best for: realistic paper trading without a specific bot to shadow. The default for most strategies.
+
+### 3. Probabilistic Fills (simulation)
+
+**Question: "Roughly how often would orders at this price get filled?"**
+
+Uses a probability model based on distance from best ask and book depth. Not grounded in real market activity — useful for fast iteration but overly optimistic.
+
+Active when `grounded_fills: false` and no `shadow_wallet` is set.
+
+### Configuration
+
 ```json
 {
   "shadow_wallet": "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
-  "ladder_enabled": false,
-  "winning_share": 0.55
+  "pricing_mode": "hybrid"
 }
 ```
 
-When `shadow_wallet` is not set in paper mode, the system uses grounded volume-based fills (only fills when bid crosses real CLOB ask — no fake maker fills).
+- `shadow_wallet` set → shadow fills (BabyBoneR only)
+- `grounded_fills: true` (default) → grounded fills
+- `grounded_fills: false` → probabilistic fills
+
+In **real mode**, none of these apply. Orders go directly to the Polymarket CLOB and fill against real counterparties.
 
 ## Strategy Management
 

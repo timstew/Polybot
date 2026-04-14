@@ -81,12 +81,15 @@ Polymarket APIs (Data API, Leaderboard API, Gamma API, CLOB API)
 **Local development** uses the **standalone runner** (`worker/src/standalone-runner.ts`) — pure Node.js, no CF Worker limitations:
 ```
 standalone-runner.ts reads configs from D1 SQLite (better-sqlite3)
-  → starts real setInterval tick loops per strategy
-  → strategy.tick(ctx) every 5s
+  → auto-starts all strategies with active=1 in D1
+  → starts real setInterval tick loops per strategy (typically 2s for BabyBoneR)
+  → strategy.tick(ctx) every tick
     → fetchSpotPrice(symbol)         # Binance/Coinbase REST (1s cache)
-    → computeSignal(...)             # 5-layer signal from price history
-    → checkFills(ctx, window, ...)   # simulate fills against fair value
-    → updateQuotes(ctx, window, ...) # place/cancel resting bids
+    → boundary-crossing discovery    # pre-fetches markets, detects new windows within 1-3s of open
+    → manageWindows(ctx, params)     # pricing, suppression, quoting, fill checking
+    → enterWindows(ctx, params)      # only enters windows < 30s old
+    → resolveWindows(ctx, params)    # oracle-first resolution, auto-redeem
+  → graceful shutdown preserves active flags (strategies auto-restart after deploy)
     → resolveWindows(...)            # settle expired windows via Gamma API
   → real WebSocket connections: Oracle (Chainlink), CLOB, Binance order flow
 State lives in process memory (no eviction), configs + trades persisted to D1 SQLite.
@@ -193,7 +196,9 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 | `worker/src/listener.ts` | pollCycle(), fetchWalletActivity(), calculateCopyTrade(), handlePositionExit() |
 | `worker/src/standalone-runner.ts` | Standalone runner: pure Node.js strategy execution, real setInterval/WebSocket, direct D1 SQLite (primary for local dev) |
 | `worker/src/strategy.ts` | StrategyDO: CF Durable Object wrapper, alarm-based tick loop (used for cloud deployment) |
+| `worker/src/strategies/babyboner.ts` | BabyBoneR: primary strategy, Bonereaper replication with shadow fills, hybrid pricing, auto-merge |
 | `worker/src/strategies/price-feed.ts` | Price fetching (Binance/Coinbase REST), signal computation, market discovery, order flow (optional WS) |
+| `worker/src/strategies/merge.ts` | Auto-merge logic: pairs UP+DOWN tokens to lock in profit when pair cost < $1.00 |
 | `worker/src/strategies/spread-sniper.ts` | Direction-agnostic spread strategy: neutral fair value, adaptive bid sizing, pair cost optimization |
 | `worker/src/strategies/directional-maker.ts` | Aggressive signal-biased maker: sells ALL losing-side inventory on flip |
 | `worker/src/strategies/safe-maker.ts` | Conservative signal-biased maker: protects paired inventory from being sold |
@@ -268,9 +273,16 @@ Real mode: trade_pct% of source notional, capped at max_position_usd
 - **Per-tick inventory safety**: Both strategies cancel heavy-side resting bids every tick, not just on requote events. Without this, fills accumulate between requotes without inventory checks.
 - **Adaptive bid sizing**: Spread sniper scales bid size with window duration — `bid_size * min(1.0, windowDurationMin / 15)`. 5-min windows use 10 units, 15-min windows use 30.
 - **Signal computation (price-feed.ts)**: 5-layer signal from REST data only (magnitude, multi-window momentum, acceleration, volatility regime, dead-zone hysteresis). Optional 6th layer (order flow) requires WebSocket — local dev only.
-- **Market discovery**: `discoverCryptoMarkets()` polls Data API `/trades` to find active "Up or Down" crypto markets. Extracts symbol, window timing, token IDs from market titles.
-- **Resolution verification**: `checkMarketResolution()` calls Gamma API to confirm Polymarket's outcome. Binance price is used for narrative prediction only (never for actual outcome). 30-min timeout if Gamma never resolves.
+- **Market discovery**: BabyBoneR uses slug-based lookup (`btc-updown-5m-{unix_timestamp}`) with boundary-crossing detection for 1-3s entry. Other strategies use `discoverCryptoMarkets()` which polls Data API `/trades`.
+- **Resolution verification**: `checkMarketResolution()` calls Gamma API to confirm Polymarket's outcome. Oracle-first resolution (2s wait) when oracle WebSocket is connected; falls back to Binance price + 60s wait otherwise.
 - **Balance protection (ratchet lock)**: Per-strategy bankroll protection. Set `balance_usd` on a config to enable. `lock_increment_usd` (defaults to `balance_usd`) controls ratchet step size. The DO tracks `high_water_balance` in state and computes `locked_amount = max(0, floor(hwm / increment) - 1) * increment`. When `working_capital = current_balance - locked_amount <= 0`, the strategy auto-stops. Status endpoint returns `balance_protection` object with `current_balance`, `locked_amount`, `working_capital`, `high_water_balance`.
+
+### Paper Fill Systems
+Three fill systems for paper trading, each answering a different question:
+- **Shadow fills** (BabyBoneR with `shadow_wallet`): "Would this bot's fills have been our fills too?" Watches a real trader's fills and grants ours when `ourBid >= theirFillPrice`. Used to replicate a specific bot's behavior (e.g., Bonereaper).
+- **Grounded fills** (`grounded_fills: true`, default for most strategies): "Would the real market have filled our order?" Checks if bid crosses real CLOB ask with sufficient volume on the trade tape.
+- **Probabilistic fills** (`grounded_fills: false`): Rough simulation based on distance from best ask. Not grounded in real market activity — fast iteration but overly optimistic.
+- **Real mode**: None of these apply. Orders go directly to the Polymarket CLOB via `RealStrategyAPI`.
 
 ### Offline Optimization (see [OPTIMIZER.md](./OPTIMIZER.md))
 - **Snapshot recording**: Safe-maker captures per-tick market state (signal, regime, fair values, book conviction, volume-bucketed trade tape) when `record_snapshots: true`. Data flushes to D1 `strategy_snapshots` on window resolution. ~14KB/tick, ~40MB/day.

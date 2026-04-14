@@ -1,6 +1,6 @@
 # Strategy Improvements
 
-> Last updated: April 8, 2026. Added Chainlink Data Streams enhancements (oracle bid/ask spread, cross-source signals). Original data-driven estimates from 24h safe-maker analysis (424 windows, $200 capital) retained below.
+> Last updated: April 13, 2026. Added BabyBoneR improvement priorities. Chainlink Data Streams enhancements (oracle bid/ask spread, cross-source signals). Original data-driven estimates from 24h safe-maker analysis (424 windows, $200 capital) retained below.
 
 > **Chainlink Data Streams**: Authenticated oracle access is live (April 2026). All strategies use oracle spot for direction/magnitude signals. Safe-maker uses oracle P_true as primary fair value. V3 reports also provide bid/ask spread data that is captured but not yet exploited — see new improvements below.
 
@@ -1136,3 +1136,34 @@ The oracle is NOT a prediction tool — it's a settlement reference. Its value c
 **Requirements**: Real-time oracle P_true, CLOB book for token prices, minimum divergence threshold ($0.20+), inventory limits to avoid catching falling knives.
 
 **Tradeoff**: Contrarian — will feel wrong most of the time (buying into momentum). Needs careful position sizing and window selection. Best when combined with oracle P_true confidence.
+
+---
+
+## BabyBoneR Improvements (April 13, 2026)
+
+BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow fills or grounded fills in paper mode and real CLOB orders in real mode. These improvements are ranked by expected impact.
+
+### Completed
+
+| Improvement | Description | Date |
+|---|---|---|
+| Window entry safety | 30s stale window cutoff, skip pre-entry BR fills | Apr 13 |
+| Boundary-crossing discovery | Detect new windows within 1-3s of opening (was up to 15s) | Apr 13 |
+| Pre-fetch upcoming windows | Cache market data 5s before window opens | Apr 13 |
+| Hybrid pricing default | `max(0.55, P_true)` both sides for shadow fill matching | Apr 13 |
+| Graceful shutdown | Preserves active flags so strategies auto-restart after deploy | Apr 13 |
+| Auto-merge with rebate estimation | Merge paired tokens every tick, track estimated maker rebates | Apr 12 |
+| Dynamic capital scaling | Bid size, max windows, and duration limits derived from capital | Apr 12 |
+
+### Prioritized TODO
+
+| # | Improvement | Description | Complexity |
+|---|---|---|---|
+| 1 | **Size to available liquidity** | Bonereaper buys exactly what's offered at each ask level, not a fixed size. We should match: scan the book, sum available size at levels <= our bid, use that as fill size. | Medium |
+| 2 | **Unified pricing for paper/real** | Paper and real should make identical decisions. Paper uses hybrid ($0.55 floor) for shadow matching, real would use book (CLOB ask). The fill mechanism differs but pricing decisions should be the same. | Medium |
+| 3 | **Smarter capital gate re-opening** | Currently suppresses heavy side until merges free capital. Could be more aggressive: if the light side has been open for N ticks with no fills, widen the bid or try a different price level. | Low |
+| 4 | **Window-end inventory optimization** | Near window end, if one side is heavily excess, consider selling at a loss to reduce exposure rather than holding to binary resolution. Bonereaper never sells, but our smaller capital means one bad window hurts more. | Medium |
+| 5 | **Multi-window correlation** | Track which windows Bonereaper is most active in. If they skip a window, maybe we should too. Could use BR activity as an entry signal beyond just fill matching. | Medium |
+| 6 | **Oracle-informed bid pricing** | Use oracle strike + current spot to compute a tighter bid range instead of the flat $0.55 floor. Early in window (uncertain), bid near $0.50. Late in window (more certain), bid closer to P_true. | Medium |
+| 7 | **Fill velocity tracking** | Monitor how quickly each side fills. If UP fills are arriving 3x faster than DOWN, proactively suppress UP before the skew guard triggers. Prevents the "sudden 100 UP tokens, 0 DOWN" scenario. | Low |
+| 8 | **Per-window P&L targets** | Set a target pair cost (e.g., $0.92) and stop buying both sides once achieved. Prevents over-accumulation that dilutes the pair cost advantage. | Low |
