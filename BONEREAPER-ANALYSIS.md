@@ -4,7 +4,7 @@
 >
 > Data sources: 982 trades across 11 windows (initial analysis, early April), 192 trades cross-referenced with oracle data (April 9 correlation study), 10,000 trade live pull (April 11 via Data API), position snapshot (April 11), BabyBoneR replication testing (April 11).
 >
-> Last updated: April 14, 2026. Added Section 10 (new behavioral findings), Section 11 (BabyBoneR feature gap analysis). Previous major revision April 12 overturned fixed-offset model.
+> Last updated: April 14, 2026 (evening). Added Section 12 (5m vs 15m window analysis), updated Section 10 (multi-level bid ladder), Section 11 (real-mode lessons learned). Previous major revision April 12 overturned fixed-offset model.
 
 ---
 
@@ -366,6 +366,10 @@ Based on the above data, the refined model of Bonereaper's per-window behavior:
 
 The "losing side stops" transition happens at ~50% of window duration when P_true moves beyond ~0.65.
 
+### Multi-Level Bid Ladder — Confirmed
+
+Bonereaper fills at many price levels within the same window — $0.05, $0.13, $0.21, $0.35, $0.48. This is not a single resting bid that gets repriced, but a **ladder of simultaneous bids** at multiple levels. Evidence: 41% of fills are at $0.01-0.20 (deep value), while 21% are at $0.61-0.80 (above fair). Both happen concurrently within the same window.
+
 ---
 
 ## 11. BabyBoneR Feature Gap Analysis (April 14, 2026)
@@ -383,9 +387,12 @@ The "losing side stops" transition happens at ~50% of window duration when P_tru
 | Boundary-crossing discovery | Done | Detects new windows within 1-3s of opening |
 | Event-driven fills | Done | CLOB WebSocket fires on book changes (millisecond latency) |
 | Book-derived sizing | Done | Sizes to available liquidity at each ask level |
+| Multi-level bid ladder | Done | 2-4 levels per side (deep value → fair), scales with capital |
 | Balance protection | Done | HWM ratchet lock + capital cap |
-| Deep value bidding | Done | Bonereaper mode bids $0.15 when P_true near 0.50 |
+| Deep value bidding | Done | Bonereaper mode bids $0.15 at deepest level |
 | Late-window certainty loading | Done | Suppresses losing side, 2x size on winning side past 50% |
+| Cancel-all on stop/startup | Done | Prevents orphan GTC orders draining balance |
+| Capital-aware scaling | Done | Ladder levels, windows, duration all scale with capital |
 | Three pricing modes | Done | `bonereaper` (adaptive), `hybrid` (shadow matching), `book` (CLOB ask) |
 
 ### What BabyBoneR Is Missing vs Bonereaper
@@ -395,11 +402,21 @@ The "losing side stops" transition happens at ~50% of window duration when P_tru
 | **Sticky certainty mode** | Medium | When BR enters certainty mode late, they don't flip back on price wobbles. BabyBoneR can flip back to [STD] on a momentary P_true dip, buying losing-side tokens unnecessarily. |
 | **Higher certainty bid prices** | Medium | BR bids $0.96-0.98 on the winning side late. BabyBoneR bids at P_true ($0.70-0.90). Missing the most aggressive certainty fills. |
 | **Batch merge at resolution** | Low | BR merges all pairs at window end. BabyBoneR auto-merges every tick. Net P&L is similar but timing of capital freeing differs. |
-| **Maker rebate income** | High | BR earns estimated $1,100-1,900/hr in maker rebates from volume. BabyBoneR at small capital ($95) generates negligible rebate volume. This is likely BR's largest profit source at scale. |
+| **Maker rebate income** | High | BR earns estimated $1,100-1,900/hr in maker rebates from volume. BabyBoneR at small capital generates negligible rebate volume. This is likely BR's largest profit source at scale. |
 | **Queue priority** | High | BR has established queue position from persistent resting orders. BabyBoneR in real mode would be behind BR in the queue, getting fewer maker fills. |
-| **Scale** | High | BR trades 30,000-90,000 tokens per window. BabyBoneR at $95 capital trades ~200-500. Many of BR's strategies (accepting pc>$1.00 for rebate volume) only work at scale. |
-| **Multi-window capital allocation** | Low | BR runs 6+ concurrent windows. BabyBoneR supports this but capital-constrained accounts should limit to 1-2. |
-| **Losing-side deep value in late window** | Unknown | BR may continue resting deep value bids ($0.01-0.05) on the losing side even late, collecting rare panic sells. BabyBoneR suppresses the losing side entirely in [LOAD] phase. |
+| **Scale** | High | BR trades 30,000-90,000 tokens per window. BabyBoneR at small capital trades ~5-50. Many of BR's strategies (accepting pc>$1.00 for rebate volume) only work at scale. |
+
+### Real-Mode Lessons Learned (April 14, 2026)
+
+First real-mode test with $95 USDC revealed critical issues:
+
+1. **Orphan orders**: Stopping the strategy did not cancel resting GTC orders on the CLOB. Orders continued filling after stop, draining the balance from $95 to $0.74. **Fixed**: cancel-all on stop and startup.
+
+2. **Budget overflow**: Multi-level ladder placed 16 orders simultaneously (4 levels × 2 sides × 2 windows), exceeding the $95 balance in 2-3 tick cycles. **Fixed**: per-tick capital budget, break-on-failure, capital-aware ladder scaling (2 levels at $39, 3 at $100, 4 at $200+).
+
+3. **Restart amnesia**: After process restart, the strategy lost track of resting CLOB orders and attempted to place duplicates, all rejected with "not enough balance." **Fixed**: cancel-all on init clears orphans before placing new orders.
+
+4. **Window scaling**: $39 capital should trade 1 window at a time, 5m only. Dynamic scaling now: $39→1 window 5m, $80→15m unlocked, $120→2 concurrent, $200+→full 4-level ladder.
 
 ### Paper Fill Systems
 
@@ -411,4 +428,45 @@ BabyBoneR has three paper fill systems for validation:
 | **Grounded fills** | "Would the real market have filled us?" | Medium — checks CLOB book crossing + trade tape. More conservative on fill count. |
 | **Bonereaper pricing mode** | "If we made BR's decisions independently, what happens?" | Best for untethered testing — makes the same decisions BR does but fill outcomes depend on the fill system used. |
 
-Shadow and grounded fill results are remarkably similar over 24h+ runs, suggesting both are reasonable approximations. The bonereaper pricing mode outperformed both in initial testing (11/11 wins, avg +$147/window vs shadow +$57/window) by better directional loading, but has only 1 hour of data.
+Shadow and grounded fill results are remarkably similar over 24h+ runs, suggesting both are reasonable approximations. The bonereaper pricing mode outperformed both in initial testing (11/11 wins, avg +$147/window vs shadow +$57/window) by better directional loading.
+
+---
+
+## 12. 5-Minute vs 15-Minute Window Analysis (April 14, 2026)
+
+Analysis of 1,018 5m windows and 269 15m windows from Bonereaper's shadow_wallet_activity (April 12-14).
+
+### Key Metrics
+
+| Metric | 5-minute | 15-minute |
+|---|---|---|
+| Windows analyzed | 1,018 | 269 |
+| Avg tokens/window | 1,511 | 986 |
+| Avg fills/window | 34 | 19 |
+| **Pairing rate** | **42%** | **31%** |
+| **Heavy skew (>70%)** | **60%** | **69%** |
+| Avg pair cost | $0.731 | $0.597 |
+| PC < $1.00 | 63% | 67% |
+| Merge P&L/window | -$2.20 | $0.00 |
+| **Merge P&L/token** | **$0.0033** | **$0.0010** |
+| Well balanced (>80%) | 25% | 16% |
+
+### Interpretation
+
+**5-minute windows are better for merges.** Higher pairing rate (42% vs 31%), 3x more efficient per token ($0.003 vs $0.001 merge P&L/token), and 25% of windows are well-balanced vs only 16% for 15m.
+
+**15-minute windows are directional bets.** 69% have heavy skew — the market has more time to trend one way, leaving excess on one side. Profit comes from the excess winning at resolution, not from merges (merge P&L ≈ $0 per window). When the directional bet is right, it pays well. When wrong, it's a larger loss than a 5m window.
+
+**For capital-constrained accounts:**
+- **5m windows are safer** — more merges, more pairing, less directional risk
+- **15m windows require more capital** — need to survive occasional one-sided losses
+- BabyBoneR unlocks 15m at $80 effective capital, which provides enough buffer
+
+### Why Bonereaper Trades Both
+
+Bonereaper trades both 5m and 15m concurrently. The 15m windows provide:
+1. **Longer exposure** — more time for certainty to develop (P_true approaches 0 or 1)
+2. **Larger directional profits** — 784 avg excess tokens × winning probability
+3. **Diversification** — not all windows resolve the same way
+
+At Bonereaper's scale (30K-90K tokens/window), the occasional 15m loss is absorbed easily. At small scale ($50-100), the same loss could wipe out a significant portion of capital.

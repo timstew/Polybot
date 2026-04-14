@@ -1147,16 +1147,21 @@ BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow 
 
 | Improvement | Description | Date |
 |---|---|---|
-| **Bonereaper pricing mode** | Three-phase adaptive: deep value ($0.15) early, P_true mid, suppress losing + 2x winning late. Data-driven from 54-window analysis showing 100% losing-side suppression. | Apr 14 |
-| **Event-driven fills via CLOB WS** | Book change callbacks fire fills between 2s ticks. ~36% of fills come from event-driven path. | Apr 14 |
-| **Book-derived order sizing** | Size to available liquidity at ask levels, not fixed maker_bid_size. Matches BR's actual behavior. | Apr 14 |
+| **Cancel-all on stop/startup** | Prevents orphan GTC orders draining balance. First real-mode test lost $55 to orphan orders. | Apr 14 |
+| **Multi-level bid ladder** | 2-4 levels per side (deep→fair), matching BR's multi-price fills. Scales with capital. | Apr 14 |
+| **Capital-aware scaling** | Ladder levels (2-4), windows (1-6), duration (5m/15m) all scale with effective capital. | Apr 14 |
+| **Per-tick capital budget** | Tracks committed capital across all orders, breaks on failure. Prevents over-deploying. | Apr 14 |
+| **Bonereaper pricing mode** | Three-phase adaptive: deep value ($0.15) early, P_true mid, suppress losing + 2x winning late. | Apr 14 |
+| **Event-driven fills via CLOB WS** | Book change callbacks fire fills between 2s ticks. ~36% of fills from event-driven path. | Apr 14 |
+| **Book-derived order sizing** | Size to available liquidity at ask levels, not fixed maker_bid_size. | Apr 14 |
 | **Capital cap** | `capital_cap_usd` param: working capital capped, excess locked as profit. | Apr 14 |
-| **Balance protection in UI** | Standalone runner returns balance_protection in status. Working capital, locked, HWM, cap all visible. | Apr 14 |
-| **RoR% on peak capital at risk** | Uses peak unmatched capital deployed, not initial balance. Matched pairs excluded from risk. | Apr 14 |
+| **CLOB book display in UI** | tickAction shows best ask price + volume per side, ladder prices in cents format. | Apr 14 |
+| **Strategy creation UI** | Full per-strategy-type parameter forms with defaults, tooltips, advanced toggle. All 15 types. | Apr 14 |
+| Balance protection in UI | Standalone runner returns balance_protection in status. Working capital, locked, HWM, cap. | Apr 14 |
+| RoR% on peak capital at risk | Uses peak unmatched capital deployed, not initial balance. Matched pairs excluded. | Apr 14 |
 | Window entry safety | 30s stale window cutoff, skip pre-entry BR fills | Apr 13 |
 | Boundary-crossing discovery | Detect new windows within 1-3s of opening (was up to 15s) | Apr 13 |
 | Pre-fetch upcoming windows | Cache market data 5s before window opens | Apr 13 |
-| Hybrid pricing default | `max(0.55, P_true)` both sides for shadow fill matching | Apr 13 |
 | Graceful shutdown | Preserves active flags so strategies auto-restart after deploy | Apr 13 |
 | Auto-merge with rebate estimation | Merge paired tokens every tick, track estimated maker rebates | Apr 12 |
 | Dynamic capital scaling | Bid size, max windows, and duration limits derived from capital | Apr 12 |
@@ -1165,11 +1170,12 @@ BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow 
 
 | # | Improvement | Description | Complexity |
 |---|---|---|---|
-| 1 | **Sticky certainty mode** | Once [LOAD] phase activates, don't flip back to [STD] on momentary P_true dips. BR doesn't resume buying both sides after committing to one. Currently a brief price wobble can cause unnecessary losing-side buys. | Low |
-| 2 | **Higher certainty bid prices** | BR bids $0.96-0.98 on the winning side late. Our bonereaper mode bids at P_true ($0.70-0.90). Missing the most aggressive certainty fills that BR captures. Need to test whether this is profitable at small capital. | Low |
-| 3 | **Deep value fill validation** | BR gets 41% of fills at $0.01-0.20. Our $0.15 deep value bids may be too high or not resting long enough. Need to compare DVB-phase fill rates vs BR's actual deep fills. | Medium |
-| 4 | **Fill velocity tracking** | Monitor how quickly each side fills. If UP fills arriving 3x faster than DOWN, proactively suppress UP before skew guard triggers. Prevents "sudden 100 UP, 0 DOWN" scenario. | Low |
-| 5 | **Losing-side deep value in late window** | BR may continue resting $0.01-0.05 bids on the losing side even late — collecting rare panic sells at near-zero cost. We suppress entirely in [LOAD]. Worth testing whether keeping a very cheap resting bid helps. | Low |
-| 6 | **Smarter capital gate re-opening** | Currently suppresses heavy side until merges free capital. Could widen bid or try different price level if light side gets no fills for N ticks. | Low |
-| 7 | **Per-window P&L targets** | Stop buying both sides once target pair cost achieved (e.g., $0.92). Prevents over-accumulation that dilutes pair cost advantage. | Low |
-| 8 | **Multi-window correlation** | Track which windows BR is most active in. Use BR activity as entry signal — if they skip a window, maybe we should too. | Medium |
+| 1 | **Sticky certainty mode** | Once [LOAD] phase activates, don't flip back to [STD] on momentary P_true dips. BR doesn't resume buying both sides after committing to one. Currently a brief price wobble can cause unnecessary losing-side buys. Observed in live testing. | Low |
+| 2 | **Higher certainty bid prices** | BR bids $0.96-0.98 on the winning side late. Our bonereaper mode bids at P_true ($0.70-0.90). Missing the most aggressive certainty fills. Need to test at small capital — may not be affordable. | Low |
+| 3 | **CLOB balance check before order** | Query actual CLOB free balance before placing, not just internal budget. Prevents "not enough balance" rejections seen in real-mode testing. | Low |
+| 4 | **Order state persistence** | Persist resting CLOB order IDs to D1 so restarts don't lose track. Current cancel-all-on-init is a workaround, not a fix. | Medium |
+| 5 | **5m-focused at small capital** | Data shows 5m windows have 42% pairing (vs 31% for 15m) and 3x merge efficiency per token. Small accounts should heavily prefer 5m. Current $80 threshold for 15m seems right but could be data-validated further. | Low |
+| 6 | **Fill velocity tracking** | Monitor how quickly each side fills. If UP arriving 3x faster than DOWN, proactively suppress UP before skew guard triggers. | Low |
+| 7 | **Losing-side deep value in late window** | BR may continue resting $0.01-0.05 bids on the losing side even late. We suppress entirely in [LOAD]. Worth testing. | Low |
+| 8 | **Per-window P&L targets** | Stop buying both sides once target pair cost achieved. Prevents over-accumulation. | Low |
+| 9 | **Atomic cancel+replace** | Current requoting cancels old order then places new one. If cancel succeeds but place fails, capital is freed but not redeployed. Need atomic swap or at least retry logic. | Medium |
