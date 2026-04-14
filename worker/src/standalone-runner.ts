@@ -203,7 +203,12 @@ let sharedClobBalance = 0;
 let sharedClobBalanceAt = 0;
 const BALANCE_POLL_INTERVAL_MS = 30_000;
 
-export function getClobBalance(): number { return sharedClobBalance; }
+/** Get the shared CLOB balance. Returns 0 if stale (>2 minutes since last successful poll). */
+export function getClobBalance(): number {
+  const MAX_STALENESS_MS = 120_000; // 2 minutes
+  if (sharedClobBalanceAt > 0 && Date.now() - sharedClobBalanceAt > MAX_STALENESS_MS) return 0;
+  return sharedClobBalance;
+}
 export function adjustClobBalance(delta: number): void { sharedClobBalance = Math.max(0, sharedClobBalance + delta); }
 
 async function pollClobBalance(pythonApiUrl: string): Promise<void> {

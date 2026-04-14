@@ -582,21 +582,9 @@ class BabyBoneRStrategy implements Strategy {
     const isReal = ctx.config.mode === "real";
 
     if (isReal) {
-      // Real mode: place immediate GTC order
-      // Note: placeOrder is async but we're in a sync callback — queue it
-      ctx.api.placeOrder({
-        token_id: tokenId,
-        side: "BUY",
-        size: fillSize,
-        price: roundedBid,
-        market: w.market.slug,
-        title: `${w.market.title.slice(0, 25)} [BBR ${side} EVT]`,
-      }).then(result => {
-        if (result.status === "filled") {
-          this.recordBuyFill(ctx, w, side, result.size, result.price, `real_evt`, true);
-          this.persistTradeToD1(ctx, w, side, "BUY", result.price, result.size, 0, `real_evt`);
-        }
-      }).catch(() => { /* order failed, tick will retry */ });
+      // Real mode: event-driven handler is too risky for real orders (no await, no budget tracking).
+      // The tick loop handles all real-mode order placement with proper budget/balance management.
+      return;
     } else {
       // Paper mode: shadow fills or grounded fill
       // Shadow: check if any BR fills at this price exist
@@ -677,7 +665,15 @@ class BabyBoneRStrategy implements Strategy {
         const result = await ctx.api.cancelAllOrders();
         ctx.log(`CLOB cancel-all on init: ${JSON.stringify(result)}`, { level: "info" });
       } catch (e) {
-        ctx.log(`CLOB cancel-all on init failed: ${String(e).slice(0, 80)}`, { level: "warning" });
+        ctx.log(`CLOB cancel-all on init failed — RETRYING: ${String(e).slice(0, 80)}`, { level: "warning" });
+        // Retry once after 2s — orphan orders are the #1 real-mode risk
+        try {
+          await new Promise(r => setTimeout(r, 2000));
+          await ctx.api.cancelAllOrders();
+          ctx.log("CLOB cancel-all retry succeeded", { level: "info" });
+        } catch {
+          ctx.log("CLOB cancel-all retry also failed — PROCEED WITH CAUTION", { level: "warning" });
+        }
       }
     }
 
@@ -1747,6 +1743,10 @@ class BabyBoneRStrategy implements Strategy {
 
         const levelLabel = `L${level}`;
 
+        // Minimum order size: Polymarket CLOB requires >= 5 tokens
+        const MIN_ORDER_SIZE = 5;
+        if (isReal && fillSize < MIN_ORDER_SIZE) continue;
+
         if (isReal) {
           // ── REAL MODE: place GTC orders, check fills ──────────────
           // Use the order slot for this side+level; check if existing order filled
@@ -1760,8 +1760,19 @@ class BabyBoneRStrategy implements Strategy {
               this.recordBuyFill(ctx, w, side, fillSz, fillPrice, `real_${levelLabel}`, false);
               await this.persistTradeToD1(ctx, w, side, "BUY", fillPrice, fillSz, 0, `real_${levelLabel}`);
               this.setRealOrderId(w, side, level, null);
+              // Balance: order was locked when placed. Fill consumed it at actual price.
+              // Adjust for any difference between locked amount and actual fill cost.
+              if (isReal) {
+                const lockedCost = this.getRealOrderPrice(w, side, level) * fillSz;
+                const actualCost = fillPrice * fillSz;
+                if (lockedCost !== actualCost) adjustClobBalance(lockedCost - actualCost); // refund or deduct difference
+              }
             } else if (status.status === "ERROR" || status.status === "UNKNOWN" || status.status === "CANCELLED") {
-              // Order gone from CLOB (expired, cancelled, or API error) — clear slot
+              // Order gone from CLOB — refund locked capital
+              if (isReal) {
+                const lockedCost = this.getRealOrderPrice(w, side, level) * params.maker_bid_size;
+                adjustClobBalance(lockedCost); // return locked capital
+              }
               this.setRealOrderId(w, side, level, null);
             } else {
               // Still resting (LIVE) — check if price drifted enough to requote
@@ -1769,13 +1780,16 @@ class BabyBoneRStrategy implements Strategy {
               if (Math.abs(roundedBid - existingPrice) >= 0.01) {
                 const r = await safeCancelOrder(ctx.api, existingId);
                 if (r.cleared) {
+                  // Cancel freed the locked capital
+                  if (isReal) adjustClobBalance(existingPrice * params.maker_bid_size);
                   if (r.fill) {
                     this.recordBuyFill(ctx, w, side, r.fill.size, r.fill.price, `real_${levelLabel}_cancel`, false);
                     await this.persistTradeToD1(ctx, w, side, "BUY", r.fill.price, r.fill.size, 0, `real_${levelLabel}_cancel`);
+                    // Fill consumed capital at actual price
+                    if (isReal) adjustClobBalance(-(r.fill.price * r.fill.size));
                   }
                   this.setRealOrderId(w, side, level, null);
                 } else {
-                  // Cancel failed but order might be gone — clear if status was ERROR
                   this.setRealOrderId(w, side, level, null);
                 }
               } else {
