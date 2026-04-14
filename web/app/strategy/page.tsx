@@ -449,6 +449,10 @@ function TickAction({ text }: { text: string }) {
     [/\binv=(\d+)\/(\d+)/g, "Inventory: UP tokens / DOWN tokens held"],
     [/\bchop=([0-9.]+)/g, "Choppiness: how noisy/directionless the price action is (0-1)"],
     [/(\d+)\s*flips?\s*>\s*(\d+)\s*max/g, "Signal changed direction too many times (choppy market)"],
+    [/\bbook:([0-9.—]+)\/([0-9.—]+)/g, "CLOB order book: best UP ask / best DN ask (what sellers are offering)"],
+    [/\[DVB\]/g, "Deep Value Bidding: resting cheap bids ($0.15) on both sides, market uncertain"],
+    [/\[STD\]/g, "Standard: following P_true with deep-value floor on both sides"],
+    [/\[LOAD\]/g, "Certainty Loading: suppressing losing side, aggressively buying winning side"],
   ];
 
   // Check if any abbreviation exists

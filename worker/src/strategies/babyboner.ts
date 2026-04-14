@@ -1547,11 +1547,21 @@ class BabyBoneRStrategy implements Strategy {
 
       const isReal = ctx.config.mode === "real";
 
-      // Fetch book asks for crossing detection
+      // Fetch book asks for crossing detection + UI display
       let upAsk: number | null = null;
       let dnAsk: number | null = null;
-      try { upAsk = this.getBestAsk(await this.getBookCached(ctx, w.market.upTokenId)); } catch {}
-      try { dnAsk = this.getBestAsk(await this.getBookCached(ctx, w.market.downTokenId)); } catch {}
+      let upAskVol = 0;
+      let dnAskVol = 0;
+      try {
+        const book = await this.getBookCached(ctx, w.market.upTokenId);
+        upAsk = this.getBestAsk(book);
+        if (upAsk != null) upAskVol = book.asks.filter(a => Math.abs(a.price - upAsk!) < 0.001).reduce((s, a) => s + a.size, 0);
+      } catch {}
+      try {
+        const book = await this.getBookCached(ctx, w.market.downTokenId);
+        dnAsk = this.getBestAsk(book);
+        if (dnAsk != null) dnAskVol = book.asks.filter(a => Math.abs(a.price - dnAsk!) < 0.001).reduce((s, a) => s + a.size, 0);
+      } catch {}
 
       const upCrosses = upBid > 0 && upAsk !== null && upBid >= upAsk;
       const dnCrosses = dnBid > 0 && dnAsk !== null && dnBid >= dnAsk;
@@ -1777,7 +1787,16 @@ class BabyBoneRStrategy implements Strategy {
         const isStrong = pCapped > params.br_certainty_threshold || pCapped < (1 - params.br_certainty_threshold);
         phaseLabel = isLate && isStrong ? " [LOAD]" : !isLate && isUncertain ? " [DVB]" : " [STD]";
       }
-      w.tickAction = `Quoting: up=${upBid.toFixed(2)}${ladderStr} dn=${dnBid.toFixed(2)}${ladderStrDn}${phaseLabel}`;
+      // Expose book state for UI visibility
+      (w as Record<string, unknown>).upAsk = upAsk;
+      (w as Record<string, unknown>).dnAsk = dnAsk;
+      (w as Record<string, unknown>).upAskVol = upAskVol;
+      (w as Record<string, unknown>).dnAskVol = dnAskVol;
+      const fmtAsk = (p: number | null, v: number) => p != null ? `${p.toFixed(2)}(${Math.round(v)})` : "—";
+      const bookStr = upAsk != null || dnAsk != null
+        ? ` book:${fmtAsk(upAsk, upAskVol)}/${fmtAsk(dnAsk, dnAskVol)}`
+        : "";
+      w.tickAction = `Quoting: up=${upBid.toFixed(2)}${ladderStr} dn=${dnBid.toFixed(2)}${ladderStrDn}${phaseLabel}${bookStr}`;
 
       this.recordSnapshot(ctx, w, params, pTrue, currentPrice, history, oracleTick);
       acknowledgePriceChange(w.cryptoSymbol);
