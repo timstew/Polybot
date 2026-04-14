@@ -650,12 +650,30 @@ function startServer(port: number, pythonApiUrl: string) {
             });
           }
 
+          // Compute balance protection for the response
+          let balanceProtection = null;
+          if (inst.config.balance_usd != null) {
+            const currentBalance = inst.config.balance_usd + inst.state.total_pnl;
+            const hwm = inst.state.high_water_balance || 0;
+            const reinvestPct = ((inst.config.params as Record<string, unknown>)?.profit_reinvest_pct as number) ?? 0;
+            const hwmProfit = Math.max(0, hwm - inst.config.balance_usd);
+            const lockedAmount = Math.min(hwmProfit * (1 - reinvestPct), Math.max(0, currentBalance));
+            const workingCapital = currentBalance - lockedAmount;
+            balanceProtection = {
+              current_balance: Math.round(currentBalance * 100) / 100,
+              locked_amount: Math.round(lockedAmount * 100) / 100,
+              working_capital: Math.round(workingCapital * 100) / 100,
+              high_water_balance: Math.round(hwm * 100) / 100,
+            };
+          }
+
           jsonResponse(res, {
             running: true,
             winding_down: inst.state.windingDown,
             active_windows: ((inst.state.custom as Record<string, unknown>)?.activeWindows as unknown[] | undefined)?.length ?? 0,
             config: inst.config,
             state: responseState,
+            balance_protection: balanceProtection,
             standalone: true,
           });
         } else {
@@ -689,12 +707,28 @@ function startServer(port: number, pythonApiUrl: string) {
                 return { ...rest, snapshotCount: Array.isArray(_) ? _.length : 0 };
               });
             }
+            // Compute balance protection
+            let bp = null;
+            if (inst.config.balance_usd != null) {
+              const cb = inst.config.balance_usd + inst.state.total_pnl;
+              const hwm = inst.state.high_water_balance || 0;
+              const rp = ((inst.config.params as Record<string, unknown>)?.profit_reinvest_pct as number) ?? 0;
+              const hwmP = Math.max(0, hwm - inst.config.balance_usd);
+              const locked = Math.min(hwmP * (1 - rp), Math.max(0, cb));
+              bp = {
+                current_balance: Math.round(cb * 100) / 100,
+                locked_amount: Math.round(locked * 100) / 100,
+                working_capital: Math.round((cb - locked) * 100) / 100,
+                high_water_balance: Math.round(hwm * 100) / 100,
+              };
+            }
             statuses[row.id] = {
               running: true,
               winding_down: inst.state.windingDown,
               active_windows: ((inst.state.custom as Record<string, unknown>)?.activeWindows as unknown[] | undefined)?.length ?? 0,
               config: inst.config,
               state: responseState,
+              balance_protection: bp,
               standalone: true,
             };
           } else {
