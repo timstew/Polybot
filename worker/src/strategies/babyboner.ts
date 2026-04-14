@@ -89,8 +89,9 @@ export interface BabyBoneRParams {
   br_certainty_threshold: number;    // P_true threshold for "strong signal" — suppress losing side (default 0.65)
   br_suppress_after_pct: number;     // suppress losing side after this % of window elapsed (default 0.50)
   br_late_size_mult: number;         // multiply winning bid size in late window (default 2.0)
-  br_deep_value_price: number;       // bid price when market is uncertain (default 0.15)
+  br_deep_value_price: number;       // deepest resting bid price (default 0.15)
   br_uncertain_range: number;        // P_true within 0.50 ± this is "uncertain" (default 0.10)
+  br_ladder_levels: number;          // number of bid levels per side (default 4: deep, value, mid, fair)
 
   // Capital cap
   capital_cap_usd?: number;          // max working capital — excess locked as profit
@@ -177,8 +178,9 @@ export const DEFAULT_PARAMS: BabyBoneRParams = {
   br_certainty_threshold: 0.65,  // P_true above this = strong signal, suppress losing side
   br_suppress_after_pct: 0.50,   // suppress losing side after 50% of window elapsed
   br_late_size_mult: 2.0,        // double bid size on winning side in late window
-  br_deep_value_price: 0.15,     // bid $0.15 when market uncertain (P_true near 0.50)
+  br_deep_value_price: 0.15,     // deepest resting bid price
   br_uncertain_range: 0.10,      // P_true in [0.40, 0.60] = "uncertain"
+  br_ladder_levels: 4,           // bid levels per side: deep($0.15), value($0.30), mid($0.45), fair(P_true)
 
   // Legacy pricing params (used by hybrid and ladder modes)
   target_pair_cost: 1.00,
@@ -296,6 +298,9 @@ interface BabyBoneRWindow {
   // Signal tracking
   confirmedDirection: "UP" | "DOWN" | null;
 
+  // Multi-level order tracking (for bonereaper ladder — keyed by "UP_3" or "DOWN_1")
+  ladderOrders?: Record<string, { orderId: string | null; price: number }>;
+
   // Prediction at end
   binancePrediction?: "UP" | "DOWN" | null;
 
@@ -311,6 +316,14 @@ interface BabyBoneRWindow {
 
   // Latest spot price — updated every tick so UI can predict outcome even if strategy stops
   lastSpotPrice?: number;
+
+  // Dynamic fields set per-tick (not persisted, used for display and fill logic)
+  _upLadder?: number[];
+  _dnLadder?: number[];
+  upAsk?: number | null;
+  dnAsk?: number | null;
+  upAskVol?: number;
+  dnAskVol?: number;
 }
 
 interface CompletedWindow {
@@ -1002,22 +1015,43 @@ class BabyBoneRStrategy implements Strategy {
 
   // ── Real-mode order slot helpers ─────────────────────────────────
 
-  private getRealOrderId(w: BabyBoneRWindow, side: "UP" | "DOWN", level: 1 | 2): string | null {
+  private getRealOrderId(w: BabyBoneRWindow, side: "UP" | "DOWN", level: number): string | null {
+    // Support N levels via ladderOrders map, fall back to legacy L1/L2 fields
+    if (w.ladderOrders) {
+      return w.ladderOrders[`${side}_${level}`]?.orderId ?? null;
+    }
     if (side === "UP") return level === 2 ? w.upBid2OrderId : w.upBidOrderId;
     return level === 2 ? w.downBid2OrderId : w.downBidOrderId;
   }
 
-  private setRealOrderId(w: BabyBoneRWindow, side: "UP" | "DOWN", level: 1 | 2, id: string | null): void {
+  private setRealOrderId(w: BabyBoneRWindow, side: "UP" | "DOWN", level: number, id: string | null): void {
+    if (level > 2 || w.ladderOrders) {
+      if (!w.ladderOrders) w.ladderOrders = {};
+      const key = `${side}_${level}`;
+      if (!w.ladderOrders[key]) w.ladderOrders[key] = { orderId: null, price: 0 };
+      w.ladderOrders[key].orderId = id;
+      return;
+    }
     if (side === "UP") { if (level === 2) w.upBid2OrderId = id; else w.upBidOrderId = id; }
     else { if (level === 2) w.downBid2OrderId = id; else w.downBidOrderId = id; }
   }
 
-  private getRealOrderPrice(w: BabyBoneRWindow, side: "UP" | "DOWN", level: 1 | 2): number {
+  private getRealOrderPrice(w: BabyBoneRWindow, side: "UP" | "DOWN", level: number): number {
+    if (w.ladderOrders) {
+      return w.ladderOrders[`${side}_${level}`]?.price ?? 0;
+    }
     if (side === "UP") return level === 2 ? w.upBid2Price : w.upBidPrice;
     return level === 2 ? w.downBid2Price : w.downBidPrice;
   }
 
-  private setRealOrderPrice(w: BabyBoneRWindow, side: "UP" | "DOWN", level: 1 | 2, price: number): void {
+  private setRealOrderPrice(w: BabyBoneRWindow, side: "UP" | "DOWN", level: number, price: number): void {
+    if (level > 2 || w.ladderOrders) {
+      if (!w.ladderOrders) w.ladderOrders = {};
+      const key = `${side}_${level}`;
+      if (!w.ladderOrders[key]) w.ladderOrders[key] = { orderId: null, price: 0 };
+      w.ladderOrders[key].price = price;
+      return;
+    }
     if (side === "UP") { if (level === 2) w.upBid2Price = price; else w.upBidPrice = price; }
     else { if (level === 2) w.downBid2Price = price; else w.downBidPrice = price; }
   }
@@ -1480,33 +1514,44 @@ class BabyBoneRStrategy implements Strategy {
         dnBid = Math.max(0.01, dnBid);
         dnBid2 = Math.max(0.01, dnBid2);
       } else if (pricingMode === "bonereaper") {
-        // Bonereaper three-phase adaptive pricing:
-        // 1. Deep value: bid $0.15 both sides when market uncertain (P_true near 0.50)
-        // 2. Standard: follow P_true with deep-value floor
-        // 3. Late certainty: suppress losing side, aggressively load winning side
+        // Bonereaper multi-level adaptive pricing:
+        // Places a LADDER of bids at multiple price levels per side, like Bonereaper does.
+        // Deep bids catch panic sellers, mid bids catch normal flow, fair bids cross the spread.
+        // Late window: suppress losing side entirely, boost winning side.
         const windowDuration = w.windowEndTime - w.windowOpenTime;
         const elapsedPct = (now - w.windowOpenTime) / windowDuration;
         const isLateWindow = elapsedPct > params.br_suppress_after_pct;
-        const isUncertain = pCapped > (0.50 - params.br_uncertain_range)
-                         && pCapped < (0.50 + params.br_uncertain_range);
         const isStrongUp = pCapped > params.br_certainty_threshold;
         const isStrongDn = pCapped < (1 - params.br_certainty_threshold);
 
-        if (isLateWindow && (isStrongUp || isStrongDn)) {
-          // Phase 3: Late certainty — suppress losing side, bid aggressively on winning side
-          upBid = isStrongUp ? pCapped : 0;
-          dnBid = isStrongDn ? (1 - pCapped) : 0;
-        } else if (!isLateWindow && isUncertain) {
-          // Phase 1: Deep value — rest cheap bids on both sides, get filled by panicked sellers
-          upBid = params.br_deep_value_price;
-          dnBid = params.br_deep_value_price;
-        } else {
-          // Phase 2: Standard — follow P_true with deep-value floor
-          upBid = Math.max(params.br_deep_value_price, pCapped);
-          dnBid = Math.max(params.br_deep_value_price, 1 - pCapped);
+        // Generate ladder levels from deep value up to P_true
+        const upFair = pCapped;
+        const dnFair = 1 - pCapped;
+        const deepPrice = params.br_deep_value_price;
+        const nLevels = params.br_ladder_levels;
+
+        // Build UP ladder: evenly spaced from deep to fair
+        const upLadder: number[] = [];
+        const dnLadder: number[] = [];
+        for (let i = 0; i < nLevels; i++) {
+          const t = nLevels > 1 ? i / (nLevels - 1) : 1; // 0 = deep, 1 = fair
+          upLadder.push(Math.min(0.95, deepPrice + t * Math.max(0, upFair - deepPrice)));
+          dnLadder.push(Math.min(0.95, deepPrice + t * Math.max(0, dnFair - deepPrice)));
         }
-        upBid = Math.min(0.95, upBid);
-        dnBid = Math.min(0.95, dnBid);
+
+        // Late certainty: suppress losing side ladder entirely
+        if (isLateWindow && (isStrongUp || isStrongDn)) {
+          if (isStrongDn) upLadder.fill(0);
+          if (isStrongUp) dnLadder.fill(0);
+        }
+
+        // L1 bid = highest level (fair price), used for display + legacy suppression
+        upBid = upLadder[upLadder.length - 1];
+        dnBid = dnLadder[dnLadder.length - 1];
+
+        // Store full ladder for fill attempts (attached to window for this tick)
+        w._upLadder = upLadder;
+        w._dnLadder = dnLadder;
       } else {
         // Hybrid: max(winning_share, P_true) both sides — for shadow fill matching
         upBid = Math.max(params.winning_share, pCapped);
@@ -1575,18 +1620,31 @@ class BabyBoneRStrategy implements Strategy {
       // Build fill attempts: alternate UP/DN to force balanced accumulation.
       // Bonereaper achieves 74-92% pairing — alternating ensures we never go
       // more than 1 fill ahead on either side.
-      const fillAttempts: Array<{ side: "UP" | "DOWN"; bid: number; level: 1 | 2 }> = [];
+      const fillAttempts: Array<{ side: "UP" | "DOWN"; bid: number; level: number }> = [];
 
       // Determine which side goes first: the side with FEWER tokens
       const firstSide: "UP" | "DOWN" = w.upInventory <= w.downInventory ? "UP" : "DOWN";
       const secondSide: "UP" | "DOWN" = firstSide === "UP" ? "DOWN" : "UP";
 
-      // Interleave: light-side L1, heavy-side L1, light-side L2, heavy-side L2
-      fillAttempts.push({ side: firstSide, bid: firstSide === "UP" ? upBid : dnBid, level: 1 });
-      fillAttempts.push({ side: secondSide, bid: secondSide === "UP" ? upBid : dnBid, level: 1 });
-      if (params.ladder_enabled) {
-        fillAttempts.push({ side: firstSide, bid: firstSide === "UP" ? upBid2 : dnBid2, level: 2 });
-        fillAttempts.push({ side: secondSide, bid: secondSide === "UP" ? upBid2 : dnBid2, level: 2 });
+      if (pricingMode === "bonereaper") {
+        // Multi-level ladder: interleave UP/DN at each price level (highest first for best fills)
+        const upLadder = (w._upLadder as number[]) || [upBid];
+        const dnLadder = (w._dnLadder as number[]) || [dnBid];
+        const maxLevels = Math.max(upLadder.length, dnLadder.length);
+        for (let lvl = maxLevels - 1; lvl >= 0; lvl--) { // highest price first
+          const firstBid = firstSide === "UP" ? (upLadder[lvl] ?? 0) : (dnLadder[lvl] ?? 0);
+          const secondBid = secondSide === "UP" ? (upLadder[lvl] ?? 0) : (dnLadder[lvl] ?? 0);
+          fillAttempts.push({ side: firstSide, bid: firstBid, level: lvl + 1 });
+          fillAttempts.push({ side: secondSide, bid: secondBid, level: lvl + 1 });
+        }
+      } else {
+        // Legacy L1/L2 interleave
+        fillAttempts.push({ side: firstSide, bid: firstSide === "UP" ? upBid : dnBid, level: 1 });
+        fillAttempts.push({ side: secondSide, bid: secondSide === "UP" ? upBid : dnBid, level: 1 });
+        if (params.ladder_enabled) {
+          fillAttempts.push({ side: firstSide, bid: firstSide === "UP" ? upBid2 : dnBid2, level: 2 });
+          fillAttempts.push({ side: secondSide, bid: secondSide === "UP" ? upBid2 : dnBid2, level: 2 });
+        }
       }
 
       for (const { side, bid, level } of fillAttempts) {
@@ -1775,9 +1833,9 @@ class BabyBoneRStrategy implements Strategy {
         );
       }
 
-      const ladderStr = params.ladder_enabled ? `/${upBid2.toFixed(2)}` : "";
-      const ladderStrDn = params.ladder_enabled ? `/${dnBid2.toFixed(2)}` : "";
-      // Phase label for bonereaper mode
+      const ladderStr = params.ladder_enabled && pricingMode !== "bonereaper" ? `/${upBid2.toFixed(2)}` : "";
+      const ladderStrDn = params.ladder_enabled && pricingMode !== "bonereaper" ? `/${dnBid2.toFixed(2)}` : "";
+      // Phase label and ladder display for bonereaper mode
       let phaseLabel = "";
       if (pricingMode === "bonereaper") {
         const windowDuration = w.windowEndTime - w.windowOpenTime;
@@ -1785,13 +1843,17 @@ class BabyBoneRStrategy implements Strategy {
         const isLate = elapsedPct > params.br_suppress_after_pct;
         const isUncertain = pCapped > (0.50 - params.br_uncertain_range) && pCapped < (0.50 + params.br_uncertain_range);
         const isStrong = pCapped > params.br_certainty_threshold || pCapped < (1 - params.br_certainty_threshold);
-        phaseLabel = isLate && isStrong ? " [LOAD]" : !isLate && isUncertain ? " [DVB]" : " [STD]";
+        const phase = isLate && isStrong ? "LOAD" : !isLate && isUncertain ? "DVB" : "STD";
+        const upLadder = (w._upLadder as number[]) || [];
+        const dnLadder = (w._dnLadder as number[]) || [];
+        const fmtL = (arr: number[]) => arr.filter(p => p > 0).map(p => p.toFixed(2)).join("/");
+        phaseLabel = ` [${phase}] bids:${fmtL(upLadder)}|${fmtL(dnLadder)}`;
       }
       // Expose book state for UI visibility
-      (w as Record<string, unknown>).upAsk = upAsk;
-      (w as Record<string, unknown>).dnAsk = dnAsk;
-      (w as Record<string, unknown>).upAskVol = upAskVol;
-      (w as Record<string, unknown>).dnAskVol = dnAskVol;
+      w.upAsk = upAsk;
+      w.dnAsk = dnAsk;
+      w.upAskVol = upAskVol;
+      w.dnAskVol = dnAskVol;
       const fmtAsk = (p: number | null, v: number) => p != null ? `${p.toFixed(2)}(${Math.round(v)})` : "—";
       const bookStr = upAsk != null || dnAsk != null
         ? ` book:${fmtAsk(upAsk, upAskVol)}/${fmtAsk(dnAsk, dnAskVol)}`
