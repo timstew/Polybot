@@ -4,7 +4,7 @@
 >
 > Data sources: 982 trades across 11 windows (initial analysis, early April), 192 trades cross-referenced with oracle data (April 9 correlation study), 10,000 trade live pull (April 11 via Data API), position snapshot (April 11), BabyBoneR replication testing (April 11).
 >
-> Last updated: April 12, 2026 (major revision — live side-by-side comparison overturned fixed-offset model).
+> Last updated: April 14, 2026. Added Section 10 (new behavioral findings), Section 11 (BabyBoneR feature gap analysis). Previous major revision April 12 overturned fixed-offset model.
 
 ---
 
@@ -250,11 +250,13 @@ Early PC: $1.004 → Mid PC: $0.995 → Late PC: $1.012 (Δ < $0.02)
 ## 7. Open Questions
 
 1. ~~**Bid vs fill prices**~~ — **RESOLVED**: Live monitoring confirmed dynamic pricing. Bids follow P_true, not fixed offsets.
-2. **Fill size variation** — Sizes range from 0.2 to 639 tokens. Partial fills on thin books, or deliberate sizing? Still unexplored.
+2. ~~**Fill size variation**~~ — **RESOLVED (April 14)**: Bonereaper sizes to available liquidity at each ask level. Fills range 0.2-639 because book depth varies. BabyBoneR now does the same (book-derived sizing).
 3. **Reward optimization** — Almost certainly yes. The strategy structure (never sells, resting GTC on both sides, extreme volume, accepts pc>$1.00) is optimal for maker rebate farming. Estimated $1,100-$1,900/hr in rebates.
 4. **Queue priority** — Critical for real-mode replication. Our real-mode test showed one-sided fills because we couldn't match Bonereaper's queue position. Shadow mode bypasses this by using their fills as proof of fillability.
 5. **Break-even pair cost** — At what pc does merge loss exceed rebate income? Bonereaper shows pc up to $1.08. With 20% taker fee rebate on their volume, that may be ~$0.02-$0.05/pair in rebates, covering pc up to ~$1.05.
 6. **Scaling from shadow to real** — Shadow mode proves the pricing logic works. But real mode needs actual CLOB queue position, which we can't replicate at small scale. The path may be: shadow validate → small real test → scale up as fill rate improves.
+7. ~~**Late-window behavior**~~ — **RESOLVED (April 14)**: Bonereaper stops buying the losing side in 100% of windows and accelerates the winning side in 93% of windows. See Section 10.
+8. ~~**Fill price distribution**~~ — **RESOLVED (April 14)**: 66% of fills are maker (price ≤ $0.60, zero fee), 34% are higher-priced. Average fill price $0.21. Most volume is deep value ($0.01-$0.20). See Section 10.
 
 ---
 
@@ -312,4 +314,101 @@ Usage: `cd worker && ./node_modules/.bin/tsx src/optimizer/bonereaper-3tests.ts`
 
 ### Shadow Fill Strategy
 
-The shadow fill model runs as `bbr-shadow-v6` strategy config in paper mode. It watches Bonereaper's live trades and simulates fills at their execution prices. See Section 8 for details.
+The shadow fill model runs as paper-mode BabyBoneR configs. It watches Bonereaper's live trades and simulates fills at their execution prices. See Section 8 for details.
+
+---
+
+## 10. New Behavioral Findings (April 14, 2026)
+
+Analysis of 55,196 shadow_wallet_activity records (April 12-14) and 200 recent fills from the Data API.
+
+### Late-Window Certainty Taking — Confirmed
+
+Analyzed 54 windows with sufficient data (last 12 hours of 5-minute windows):
+
+| Behavior | Frequency | Description |
+|----------|-----------|-------------|
+| Light side stops late | **100%** (54/54) | Bonereaper completely stops buying the losing side in the second half of every window |
+| Heavy side accelerates late | **93%** (50/54) | Winning side receives 3,000-5,000 additional tokens in the last 2.5 minutes |
+
+This is oracle-driven: once the price settles relative to the strike, Bonereaper knows which side will win and loads it aggressively while abandoning the other.
+
+### Fill Price Distribution
+
+200 recent BUY fills analyzed:
+
+| Price range | Fills | Tokens | Interpretation |
+|---|---|---|---|
+| $0.01-0.20 | 81 (41%) | 8,588 | Deep value — resting maker fills |
+| $0.21-0.40 | 21 (11%) | 496 | Value — resting maker fills |
+| $0.41-0.60 | 30 (15%) | 767 | Near-fair — maker fills at $0.50 |
+| $0.61-0.80 | 41 (21%) | 685 | Above fair — may be maker or taker |
+| $0.81-0.95 | 27 (14%) | 1,315 | High conviction — likely taker sweeps |
+| $0.96-0.99 | 0 (0%) | 0 | — |
+
+**Key findings:**
+- Average fill price: **$0.21** — most volume is deep value
+- 66% maker fills (≤ $0.60): zero fee, possibly earning rebates
+- Total taker fees: ~$15 across 200 fills (0.6% of cost) — negligible
+- Estimated maker rebates: $6.75 per 200 fills
+
+Bonereaper is overwhelmingly a **maker** — resting cheap bids that get filled when panicked sellers dump. The late-window certainty fills ($0.81-0.95) are the only significant taker activity.
+
+### Three-Phase Behavioral Model (Refined)
+
+Based on the above data, the refined model of Bonereaper's per-window behavior:
+
+| Phase | When | Bid price | Volume | Fill type |
+|---|---|---|---|---|
+| **Deep value** | Early window, uncertain | $0.01-0.20 both sides | Moderate | Maker (resting) |
+| **Following** | Mid-window, directional | P_true both sides | High | Mix |
+| **Certainty load** | Late window, strong signal | $0.80-0.95 winning side only | Very high (3-5K tokens) | Taker (crossing) |
+
+The "losing side stops" transition happens at ~50% of window duration when P_true moves beyond ~0.65.
+
+---
+
+## 11. BabyBoneR Feature Gap Analysis (April 14, 2026)
+
+### What BabyBoneR Does That Matches Bonereaper
+
+| Feature | Status | Notes |
+|---|---|---|
+| Two-sided bidding | Done | Both UP and DOWN simultaneously |
+| Zero sells | Done | Exit only via merge + redeem |
+| Auto-merge | Done | Every tick (BR batch-merges at resolution — different timing but same net effect) |
+| Capital recycling | Done | Merged pairs free capital for more fills |
+| Dynamic pricing | Done | Follows P_true, not fixed offsets |
+| BTC-focused | Done | `target_cryptos: ["Bitcoin"]` |
+| Boundary-crossing discovery | Done | Detects new windows within 1-3s of opening |
+| Event-driven fills | Done | CLOB WebSocket fires on book changes (millisecond latency) |
+| Book-derived sizing | Done | Sizes to available liquidity at each ask level |
+| Balance protection | Done | HWM ratchet lock + capital cap |
+| Deep value bidding | Done | Bonereaper mode bids $0.15 when P_true near 0.50 |
+| Late-window certainty loading | Done | Suppresses losing side, 2x size on winning side past 50% |
+| Three pricing modes | Done | `bonereaper` (adaptive), `hybrid` (shadow matching), `book` (CLOB ask) |
+
+### What BabyBoneR Is Missing vs Bonereaper
+
+| Gap | Impact | Description |
+|---|---|---|
+| **Sticky certainty mode** | Medium | When BR enters certainty mode late, they don't flip back on price wobbles. BabyBoneR can flip back to [STD] on a momentary P_true dip, buying losing-side tokens unnecessarily. |
+| **Higher certainty bid prices** | Medium | BR bids $0.96-0.98 on the winning side late. BabyBoneR bids at P_true ($0.70-0.90). Missing the most aggressive certainty fills. |
+| **Batch merge at resolution** | Low | BR merges all pairs at window end. BabyBoneR auto-merges every tick. Net P&L is similar but timing of capital freeing differs. |
+| **Maker rebate income** | High | BR earns estimated $1,100-1,900/hr in maker rebates from volume. BabyBoneR at small capital ($95) generates negligible rebate volume. This is likely BR's largest profit source at scale. |
+| **Queue priority** | High | BR has established queue position from persistent resting orders. BabyBoneR in real mode would be behind BR in the queue, getting fewer maker fills. |
+| **Scale** | High | BR trades 30,000-90,000 tokens per window. BabyBoneR at $95 capital trades ~200-500. Many of BR's strategies (accepting pc>$1.00 for rebate volume) only work at scale. |
+| **Multi-window capital allocation** | Low | BR runs 6+ concurrent windows. BabyBoneR supports this but capital-constrained accounts should limit to 1-2. |
+| **Losing-side deep value in late window** | Unknown | BR may continue resting deep value bids ($0.01-0.05) on the losing side even late, collecting rare panic sells. BabyBoneR suppresses the losing side entirely in [LOAD] phase. |
+
+### Paper Fill Systems
+
+BabyBoneR has three paper fill systems for validation:
+
+| System | What it answers | Accuracy |
+|---|---|---|
+| **Shadow fills** | "Would BR's fills have been ours?" | High — uses BR's actual prices and sizes. Overly optimistic because we'd compete for the same liquidity. |
+| **Grounded fills** | "Would the real market have filled us?" | Medium — checks CLOB book crossing + trade tape. More conservative on fill count. |
+| **Bonereaper pricing mode** | "If we made BR's decisions independently, what happens?" | Best for untethered testing — makes the same decisions BR does but fill outcomes depend on the fill system used. |
+
+Shadow and grounded fill results are remarkably similar over 24h+ runs, suggesting both are reasonable approximations. The bonereaper pricing mode outperformed both in initial testing (11/11 wins, avg +$147/window vs shadow +$57/window) by better directional loading, but has only 1 hour of data.

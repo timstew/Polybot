@@ -1139,14 +1139,20 @@ The oracle is NOT a prediction tool — it's a settlement reference. Its value c
 
 ---
 
-## BabyBoneR Improvements (April 13, 2026)
+## BabyBoneR Improvements (April 14, 2026)
 
-BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow fills or grounded fills in paper mode and real CLOB orders in real mode. These improvements are ranked by expected impact.
+BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow fills or grounded fills in paper mode and real CLOB orders in real mode. Bonereaper pricing mode (`pricing_mode: "bonereaper"`) replicates Bonereaper's three-phase behavior: deep value early, P_true following mid, certainty loading late.
 
 ### Completed
 
 | Improvement | Description | Date |
 |---|---|---|
+| **Bonereaper pricing mode** | Three-phase adaptive: deep value ($0.15) early, P_true mid, suppress losing + 2x winning late. Data-driven from 54-window analysis showing 100% losing-side suppression. | Apr 14 |
+| **Event-driven fills via CLOB WS** | Book change callbacks fire fills between 2s ticks. ~36% of fills come from event-driven path. | Apr 14 |
+| **Book-derived order sizing** | Size to available liquidity at ask levels, not fixed maker_bid_size. Matches BR's actual behavior. | Apr 14 |
+| **Capital cap** | `capital_cap_usd` param: working capital capped, excess locked as profit. | Apr 14 |
+| **Balance protection in UI** | Standalone runner returns balance_protection in status. Working capital, locked, HWM, cap all visible. | Apr 14 |
+| **RoR% on peak capital at risk** | Uses peak unmatched capital deployed, not initial balance. Matched pairs excluded from risk. | Apr 14 |
 | Window entry safety | 30s stale window cutoff, skip pre-entry BR fills | Apr 13 |
 | Boundary-crossing discovery | Detect new windows within 1-3s of opening (was up to 15s) | Apr 13 |
 | Pre-fetch upcoming windows | Cache market data 5s before window opens | Apr 13 |
@@ -1159,11 +1165,11 @@ BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow 
 
 | # | Improvement | Description | Complexity |
 |---|---|---|---|
-| 1 | **Size to available liquidity** | Bonereaper buys exactly what's offered at each ask level, not a fixed size. We should match: scan the book, sum available size at levels <= our bid, use that as fill size. | Medium |
-| 2 | **Unified pricing for paper/real** | Paper and real should make identical decisions. Paper uses hybrid ($0.55 floor) for shadow matching, real would use book (CLOB ask). The fill mechanism differs but pricing decisions should be the same. | Medium |
-| 3 | **Smarter capital gate re-opening** | Currently suppresses heavy side until merges free capital. Could be more aggressive: if the light side has been open for N ticks with no fills, widen the bid or try a different price level. | Low |
-| 4 | **Window-end inventory optimization** | Near window end, if one side is heavily excess, consider selling at a loss to reduce exposure rather than holding to binary resolution. Bonereaper never sells, but our smaller capital means one bad window hurts more. | Medium |
-| 5 | **Multi-window correlation** | Track which windows Bonereaper is most active in. If they skip a window, maybe we should too. Could use BR activity as an entry signal beyond just fill matching. | Medium |
-| 6 | **Oracle-informed bid pricing** | Use oracle strike + current spot to compute a tighter bid range instead of the flat $0.55 floor. Early in window (uncertain), bid near $0.50. Late in window (more certain), bid closer to P_true. | Medium |
-| 7 | **Fill velocity tracking** | Monitor how quickly each side fills. If UP fills are arriving 3x faster than DOWN, proactively suppress UP before the skew guard triggers. Prevents the "sudden 100 UP tokens, 0 DOWN" scenario. | Low |
-| 8 | **Per-window P&L targets** | Set a target pair cost (e.g., $0.92) and stop buying both sides once achieved. Prevents over-accumulation that dilutes the pair cost advantage. | Low |
+| 1 | **Sticky certainty mode** | Once [LOAD] phase activates, don't flip back to [STD] on momentary P_true dips. BR doesn't resume buying both sides after committing to one. Currently a brief price wobble can cause unnecessary losing-side buys. | Low |
+| 2 | **Higher certainty bid prices** | BR bids $0.96-0.98 on the winning side late. Our bonereaper mode bids at P_true ($0.70-0.90). Missing the most aggressive certainty fills that BR captures. Need to test whether this is profitable at small capital. | Low |
+| 3 | **Deep value fill validation** | BR gets 41% of fills at $0.01-0.20. Our $0.15 deep value bids may be too high or not resting long enough. Need to compare DVB-phase fill rates vs BR's actual deep fills. | Medium |
+| 4 | **Fill velocity tracking** | Monitor how quickly each side fills. If UP fills arriving 3x faster than DOWN, proactively suppress UP before skew guard triggers. Prevents "sudden 100 UP, 0 DOWN" scenario. | Low |
+| 5 | **Losing-side deep value in late window** | BR may continue resting $0.01-0.05 bids on the losing side even late — collecting rare panic sells at near-zero cost. We suppress entirely in [LOAD]. Worth testing whether keeping a very cheap resting bid helps. | Low |
+| 6 | **Smarter capital gate re-opening** | Currently suppresses heavy side until merges free capital. Could widen bid or try different price level if light side gets no fills for N ticks. | Low |
+| 7 | **Per-window P&L targets** | Stop buying both sides once target pair cost achieved (e.g., $0.92). Prevents over-accumulation that dilutes pair cost advantage. | Low |
+| 8 | **Multi-window correlation** | Track which windows BR is most active in. Use BR activity as entry signal — if they skip a window, maybe we should too. | Medium |
