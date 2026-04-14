@@ -1147,6 +1147,8 @@ BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow 
 
 | Improvement | Description | Date |
 |---|---|---|
+| **Certainty hysteresis** | Once [LOAD] activates, stays locked — wobbles don't flip to [STD]. Only full reversal past 0.50 flips to loading other side. Matches BR data (42% flip, 39% late). Shows [LOAD↑]/[LOAD↓]. | Apr 14 |
+| **Shared CLOB balance** | Standalone runner polls real CLOB balance every 30s, shared by all strategies. Real mode uses this as budget ceiling. Prevents "not enough balance" failures from stale internal tracking. | Apr 14 |
 | **Cancel-all on stop/startup** | Prevents orphan GTC orders draining balance. First real-mode test lost $55 to orphan orders. | Apr 14 |
 | **Multi-level bid ladder** | 2-4 levels per side (deep→fair), matching BR's multi-price fills. Scales with capital. | Apr 14 |
 | **Capital-aware scaling** | Ladder levels (2-4), windows (1-6), duration (5m/15m) all scale with effective capital. | Apr 14 |
@@ -1170,12 +1172,9 @@ BabyBoneR is the primary strategy — a Bonereaper replication that uses shadow 
 
 | # | Improvement | Description | Complexity |
 |---|---|---|---|
-| 1 | **Sticky certainty mode** | Once [LOAD] phase activates, don't flip back to [STD] on momentary P_true dips. BR doesn't resume buying both sides after committing to one. Currently a brief price wobble can cause unnecessary losing-side buys. Observed in live testing. | Low |
-| 2 | **Higher certainty bid prices** | BR bids $0.96-0.98 on the winning side late. Our bonereaper mode bids at P_true ($0.70-0.90). Missing the most aggressive certainty fills. Need to test at small capital — may not be affordable. | Low |
-| 3 | **CLOB balance check before order** | Query actual CLOB free balance before placing, not just internal budget. Prevents "not enough balance" rejections seen in real-mode testing. | Low |
-| 4 | **Order state persistence** | Persist resting CLOB order IDs to D1 so restarts don't lose track. Current cancel-all-on-init is a workaround, not a fix. | Medium |
-| 5 | **5m-focused at small capital** | Data shows 5m windows have 42% pairing (vs 31% for 15m) and 3x merge efficiency per token. Small accounts should heavily prefer 5m. Current $80 threshold for 15m seems right but could be data-validated further. | Low |
-| 6 | **Fill velocity tracking** | Monitor how quickly each side fills. If UP arriving 3x faster than DOWN, proactively suppress UP before skew guard triggers. | Low |
-| 7 | **Losing-side deep value in late window** | BR may continue resting $0.01-0.05 bids on the losing side even late. We suppress entirely in [LOAD]. Worth testing. | Low |
-| 8 | **Per-window P&L targets** | Stop buying both sides once target pair cost achieved. Prevents over-accumulation. | Low |
-| 9 | **Atomic cancel+replace** | Current requoting cancels old order then places new one. If cancel succeeds but place fails, capital is freed but not redeployed. Need atomic swap or at least retry logic. | Medium |
+| 1 | **Higher certainty bid prices** | BR bids $0.96-0.98 on the winning side late. Our bonereaper mode bids at P_true ($0.70-0.90). Missing the most aggressive certainty fills. Need to test at small capital — may not be affordable. | Low |
+| 2 | **Order state persistence** | Persist resting CLOB order IDs to D1 so restarts don't lose track. Current cancel-all-on-init is a workaround, not a fix. | Medium |
+| 3 | **Fill velocity tracking** | Monitor how quickly each side fills. If UP arriving 3x faster than DOWN, proactively suppress UP before skew guard triggers. | Low |
+| 4 | **Losing-side deep value in late window** | BR may continue resting $0.01-0.05 bids on the losing side even late. We suppress entirely in [LOAD]. Worth testing. | Low |
+| 5 | **Atomic cancel+replace** | Current requoting cancels old order then places new one. If cancel succeeds but place fails, capital is freed but not redeployed. Need atomic swap or at least retry logic. | Medium |
+| 6 | **Per-window P&L targets** | Stop buying both sides once target pair cost achieved. Prevents over-accumulation. | Low |
