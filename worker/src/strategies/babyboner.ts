@@ -430,6 +430,7 @@ class BabyBoneRStrategy implements Strategy {
   private latestCtx: StrategyContext | null = null;
   private latestParams: BabyBoneRParams | null = null;
   private eventFillLock = false; // prevent concurrent event fills
+  private effectiveCapital = 0; // current effective capital (updated each tick)
 
   private async getBookCached(ctx: StrategyContext, tokenId: string): Promise<OrderBook> {
     // Prefer real-time CLOB WebSocket book (updated on every price_change event)
@@ -692,18 +693,15 @@ class BabyBoneRStrategy implements Strategy {
     if (capitalCap != null && effectiveCapital > capitalCap) effectiveCapital = capitalCap;
     if (effectiveCapital > 0) {
       // Bid size capped at 50 tokens — Bonereaper averages 53.6 (P50=26.4).
-      // Large capital scales via fill count (more windows, faster cooldown), not larger orders.
-      // Big orders eat through thin books, signal intent, and get worse prices.
       params.maker_bid_size = Math.min(50, Math.max(5, Math.floor(effectiveCapital / 10)));
       params.taker_bid_size = params.maker_bid_size;
-      params.max_concurrent_windows = Math.min(6, Math.max(1, Math.floor(effectiveCapital / 30))); // $20→1, $60→2, $180→6
-      params.max_total_cost = effectiveCapital * 0.5;  // deploy max 50% per window
-      params.max_inventory_per_side = Math.max(20, Math.floor(effectiveCapital * 2)); // $20→40, $100→200
-      // No cooldown — alternating fill logic ensures balanced accumulation.
-      // Real mode: GTC orders rest on CLOB and fill when counterparty arrives.
-      // Paper mode: cooldown still applies (set in config params).
+      // Windows: 1 under $60, 2 under $180, up to 6
+      params.max_concurrent_windows = Math.min(6, Math.max(1, Math.floor(effectiveCapital / 60)));
+      // Deploy max 50% of capital per window
+      params.max_total_cost = effectiveCapital * 0.5;
+      params.max_inventory_per_side = Math.max(20, Math.floor(effectiveCapital * 2));
       if (ctx.config.mode === "real") params.buy_cooldown_ms = 0;
-      // Only trade 5m windows until we have enough capital for 15m exposure
+      // Only trade 5m windows until enough capital for 15m
       if (effectiveCapital < 80) {
         params.max_window_duration_ms = 5 * 60_000;
         params.min_window_duration_ms = 4 * 60_000;
@@ -711,10 +709,15 @@ class BabyBoneRStrategy implements Strategy {
         params.max_window_duration_ms = 15 * 60_000;
         params.min_window_duration_ms = 4 * 60_000;
       }
+      // Scale ladder levels with capital: $39→2, $100→3, $200+→4
+      if (effectiveCapital < 60) params.br_ladder_levels = 2;
+      else if (effectiveCapital < 150) params.br_ladder_levels = 3;
+      // else keep the configured value (default 4)
     }
 
-    // Update params for event-driven callbacks (after dynamic scaling)
+    // Update params and effective capital for event-driven callbacks (after dynamic scaling)
     this.latestParams = params;
+    this.effectiveCapital = effectiveCapital;
 
     // 1. Discover markets — use direct slug-based lookup for speed.
     //    BTC 5m windows have predictable slugs: btc-updown-5m-{unix_open_time}
@@ -1647,7 +1650,12 @@ class BabyBoneRStrategy implements Strategy {
         }
       }
 
+      // Track capital committed this tick across all orders (prevents over-deploying small balances)
+      let tickCapitalCommitted = 0;
+      let orderFailed = false;
+
       for (const { side, bid, level } of fillAttempts) {
+        if (orderFailed) break; // stop placing orders after a failure (likely balance exhausted)
         const inv = side === "UP" ? w.upInventory : w.downInventory;
         const currentInvCost2 = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
         if (bid <= 0 || inv >= params.max_inventory_per_side || currentInvCost2 >= params.max_total_cost) continue;
@@ -1687,7 +1695,7 @@ class BabyBoneRStrategy implements Strategy {
           }
         }
 
-        const levelLabel = level === 2 ? "L2" : "L1";
+        const levelLabel = `L${level}`;
 
         if (isReal) {
           // ── REAL MODE: place GTC orders, check fills ──────────────
@@ -1728,23 +1736,43 @@ class BabyBoneRStrategy implements Strategy {
 
           // Place new GTC order if no order resting
           if (!this.getRealOrderId(w, side, level)) {
-            const result = await ctx.api.placeOrder({
-              token_id: tokenId,
-              side: "BUY",
-              size: fillSize,
-              price: roundedBid,
-              market: w.market.slug,
-              title: `${w.market.title.slice(0, 30)} [BBR ${side} ${levelLabel}]`,
-            });
-            if (result.status === "filled") {
-              // Use the CLOB-reported price — this is what was actually charged.
-              // GTC orders that cross pay their limit price on Polymarket.
-              this.recordBuyFill(ctx, w, side, result.size, result.price, `real_${levelLabel}_imm`, true);
-              await this.persistTradeToD1(ctx, w, side, "BUY", result.price, result.size, 0, `real_${levelLabel}_imm`);
-            } else if (result.status === "placed") {
-              this.setRealOrderId(w, side, level, result.order_id);
-              this.setRealOrderPrice(w, side, level, roundedBid);
+            // Capital budget: don't commit more than effective capital across all orders this tick
+            const orderCost = roundedBid * fillSize;
+            if (tickCapitalCommitted + orderCost > this.effectiveCapital) {
+              continue; // skip this level — not enough budget
             }
+            try {
+              ctx.log(`ORDER: ${side} ${levelLabel} $${roundedBid} sz=${fillSize} cost=$${orderCost.toFixed(1)} budget=$${(this.effectiveCapital - tickCapitalCommitted).toFixed(1)}`, { level: "signal" });
+              const result = await ctx.api.placeOrder({
+                token_id: tokenId,
+                side: "BUY",
+                size: fillSize,
+                price: roundedBid,
+                market: w.market.slug,
+                title: `${w.market.title.slice(0, 30)} [BBR ${side} ${levelLabel}]`,
+              });
+              if (result.status === "filled") {
+                ctx.log(`FILL: ${side} ${levelLabel} ${result.size}@$${result.price?.toFixed(3)}`, { level: "signal" });
+                this.recordBuyFill(ctx, w, side, result.size, result.price, `real_${levelLabel}_imm`, true);
+                await this.persistTradeToD1(ctx, w, side, "BUY", result.price, result.size, 0, `real_${levelLabel}_imm`);
+                tickCapitalCommitted += result.price * result.size;
+              } else if (result.status === "placed") {
+                this.setRealOrderId(w, side, level, result.order_id);
+                this.setRealOrderPrice(w, side, level, roundedBid);
+                tickCapitalCommitted += orderCost; // reserved by resting order
+              } else {
+                // Order failed — likely insufficient balance. Stop placing more.
+                ctx.log(`ORDER FAILED: ${side} ${levelLabel} $${roundedBid} — ${result.error?.slice(0, 80) ?? "unknown"}`, { level: "warning" });
+                orderFailed = true;
+              }
+            } catch (e) {
+              ctx.log(`ORDER ERROR: ${side} ${levelLabel} $${roundedBid} — ${String(e).slice(0, 80)}`, { level: "warning" });
+              orderFailed = true;
+            }
+          } else {
+            // Existing resting order — count its capital commitment (use stored price × bid size)
+            const restingPrice = this.getRealOrderPrice(w, side, level);
+            tickCapitalCommitted += restingPrice * params.maker_bid_size;
           }
         } else {
           // ── PAPER MODE: Shadow fills from Bonereaper's actual trades ──
