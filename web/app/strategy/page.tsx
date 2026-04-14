@@ -644,7 +644,10 @@ function extractOverviewStats(custom: Record<string, unknown> | undefined, strat
   const totalCapitalCycled = allWindows.reduce((s, w) => s + (w.totalBuyCost ?? 0), 0);
   // Return on risk: P&L vs peak unmatched capital actually at risk (not initial balance or total cycled)
   const peakCapital = (custom?.peakCapitalDeployed as number) ?? 0;
-  const riskDenominator = peakCapital > 0 ? peakCapital : riskCapital; // fallback to config if no peak tracked yet
+  // Use peak capital at risk as denominator. Fallback chain: peakCapitalDeployed → balance_usd → max_capital_usd
+  // For strategies with $1M max_capital_usd and no balance_usd, avoid absurd denominators
+  const sensibleFallback = riskCapital <= 100000 ? riskCapital : (totalCapitalCycled > 0 ? totalCapitalCycled : riskCapital);
+  const riskDenominator = peakCapital > 0 ? peakCapital : sensibleFallback;
   const returnOnRisk = riskDenominator > 0 ? pnl / riskDenominator : 0;
 
   if (isUnified) {
