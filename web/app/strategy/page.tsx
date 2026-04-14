@@ -656,7 +656,7 @@ function extractOverviewStats(custom: Record<string, unknown> | undefined, strat
     const wins = (stats?.sniperWins ?? 0) + (stats?.makerWins ?? 0);
     const losses = traded - wins;
     const winRate = traded > 0 ? wins / traded : 0;
-    return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled };
+    return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled, riskDenominator };
   }
   if (isOrchestrator) {
     const stats = custom?.stats as { windowsTraded?: number; perTactic?: Record<string, { wins?: number }> } | undefined;
@@ -664,14 +664,14 @@ function extractOverviewStats(custom: Record<string, unknown> | undefined, strat
     const wins = stats?.perTactic ? Object.values(stats.perTactic).reduce((s, t) => s + (t.wins ?? 0), 0) : 0;
     const losses = traded - wins;
     const winRate = traded > 0 ? wins / traded : 0;
-    return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled };
+    return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled, riskDenominator };
   }
   // Directional strategies
   const traded = (custom?.windowsTraded as number) ?? 0;
   const wins = (custom?.windowsWon as number) ?? 0;
   const losses = (custom?.windowsLost as number) ?? 0;
   const winRate = (custom?.directionalAccuracy as number) ?? (traded > 0 ? wins / traded : 0);
-  return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled };
+  return { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled, riskDenominator };
 }
 
 // ── Unified Adaptive detail section ───────────────────────────────────
@@ -2458,7 +2458,7 @@ export default function StrategyPage() {
                 const pnl = (state?.total_pnl ?? 0) as number;
                 const activeWins = ((custom?.activeWindows as unknown[]) ?? []).length;
                 const riskCapital = c.balance_usd ?? c.max_capital_usd;
-                const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
+                const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled, riskDenominator } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
                 const bp = st?.balance_protection;
                 const runTime = fmtRunTime(state?.cumulative_runtime_ms ?? (state?.ticks ?? 0) * (c.tick_interval_ms ?? 5000));
                 return (
@@ -2554,7 +2554,7 @@ export default function StrategyPage() {
               const pnl = (state?.total_pnl ?? 0) as number;
               const activeWins = ((custom?.activeWindows as unknown[]) ?? []).length;
               const riskCapital = c.balance_usd ?? c.max_capital_usd;
-              const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
+              const { traded, wins, losses, winRate, returnOnRisk, totalCapitalCycled, riskDenominator } = extractOverviewStats(custom, c.strategy_type, pnl, riskCapital);
               const bp = st?.balance_protection;
               const runTime = fmtRunTime(state?.cumulative_runtime_ms ?? (state?.ticks ?? 0) * (c.tick_interval_ms ?? 5000));
               return (
