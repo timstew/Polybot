@@ -1707,15 +1707,17 @@ class BabyBoneRStrategy implements Strategy {
       }
 
       // Track capital committed this tick across all orders (prevents over-deploying small balances)
-      // For real mode: refresh CLOB balance every tick (the 30s poll is too slow)
-      // For paper mode: compute free capital = effectiveCapital - total deployed across all windows
+      // Budget = min(CLOB free balance, effectiveCapital - already deployed)
+      // This ensures a $50 strategy with $1,633 in the wallet only uses $50.
+      const totalDeployed = this.custom.activeWindows.reduce((sum, aw) =>
+        sum + aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost, 0);
+      const capitalBudget = Math.max(0, this.effectiveCapital - totalDeployed);
       let clobFreeBalance: number;
       if (isReal) {
-        clobFreeBalance = await refreshClobBalance();
+        const actualClob = await refreshClobBalance();
+        clobFreeBalance = Math.min(actualClob, capitalBudget);
       } else {
-        const totalDeployed = this.custom.activeWindows.reduce((sum, aw) =>
-          sum + aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost, 0);
-        clobFreeBalance = Math.max(0, this.effectiveCapital - totalDeployed);
+        clobFreeBalance = capitalBudget;
       }
       let tickCapitalCommitted = 0;
       let orderFailed = false;
