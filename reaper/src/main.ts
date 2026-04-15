@@ -1,0 +1,100 @@
+/**
+ * Reaper — Bonereaper Clone for Polymarket
+ *
+ * Event-driven architecture:
+ * - User WebSocket for fill notifications (real-time, no polling)
+ * - Durable order ledger in SQLite (survives restarts)
+ * - 5s tick for pricing/discovery (NOT for order management)
+ * - 30s reconciliation as safety net
+ */
+
+import { initDb, logActivity } from "./db.js";
+import { userWs } from "./feeds/user-ws.js";
+import { processUserWsFill } from "./orders/fill-processor.js";
+import { cancelAllOrders } from "./orders/order-placer.js";
+
+const PYTHON_API_URL = process.env.PYTHON_API_URL || "http://127.0.0.1:8000";
+
+async function main() {
+  console.log("=".repeat(60));
+  console.log("  REAPER — Bonereaper Clone for Polymarket");
+  console.log("  Event-driven order management + durable ledger");
+  console.log("=".repeat(60));
+
+  // 1. Initialize database
+  const db = initDb();
+  logActivity("STARTUP", "Reaper starting up");
+
+  // 2. Cancel any orphan orders from previous session
+  console.log("[STARTUP] Cancelling orphan CLOB orders...");
+  await cancelAllOrders();
+
+  // 3. Get CLOB API credentials for User WebSocket
+  console.log("[STARTUP] Fetching CLOB API credentials...");
+  const creds = await fetchClobCredentials();
+  if (creds) {
+    // 4. Connect User WebSocket for real-time fill notifications
+    userWs.on("fill", (event) => {
+      processUserWsFill(event);
+    });
+    userWs.on("confirmed", (event) => {
+      logActivity("FILL_CONFIRMED", `Order ${event.orderId.slice(0, 16)} confirmed on-chain`, { level: "info" });
+    });
+    userWs.on("failed", (event) => {
+      logActivity("FILL_REVERTED", `Order ${event.orderId.slice(0, 16)} reverted on-chain`, { level: "error" });
+    });
+    userWs.on("reconnecting", () => {
+      logActivity("USER_WS", "Reconnecting — will reconcile on reconnect", { level: "warning" });
+    });
+    userWs.connect(creds);
+    console.log("[STARTUP] User WebSocket connected — fill notifications active");
+  } else {
+    console.warn("[STARTUP] Could not get CLOB credentials — User WebSocket disabled");
+    console.warn("[STARTUP] Fill detection will rely on REST reconciliation only (SLOWER)");
+  }
+
+  // TODO: Phase 2-6 implementation
+  // 5. Start market WebSocket (book updates)
+  // 6. Start oracle + Binance feeds
+  // 7. Start strategy engine (5s tick loop)
+  // 8. Start reconciliation loop (30s)
+  // 9. Start HTTP API server for dashboard
+
+  console.log("\n[STARTUP] Phase 1 complete — order infrastructure ready");
+  console.log("[STARTUP] Remaining: feeds, strategy engine, reconciler, dashboard");
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    console.log("\n[SHUTDOWN] Stopping Reaper...");
+    userWs.disconnect();
+    await cancelAllOrders();
+    logActivity("SHUTDOWN", "Reaper stopped cleanly");
+    db.close();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}
+
+/** Fetch CLOB API credentials from the Python API. */
+async function fetchClobCredentials(): Promise<{ apiKey: string; secret: string; passphrase: string } | null> {
+  try {
+    // The Python API can derive API credentials from the private key
+    const resp = await fetch(`${PYTHON_API_URL}/api/strategy/clob-creds`);
+    if (!resp.ok) {
+      console.warn("[STARTUP] /api/strategy/clob-creds not available — need to add this endpoint");
+      return null;
+    }
+    const data = await resp.json() as { apiKey: string; secret: string; passphrase: string };
+    if (data.apiKey && data.secret && data.passphrase) return data;
+    return null;
+  } catch (err) {
+    console.warn("[STARTUP] Could not fetch CLOB credentials:", err);
+    return null;
+  }
+}
+
+main().catch((err) => {
+  console.error("FATAL:", err);
+  process.exit(1);
+});
