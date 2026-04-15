@@ -61,16 +61,34 @@ async function main() {
   // 8. Start reconciliation loop (30s)
   // 9. Start HTTP API server for dashboard
 
-  // Start the dashboard + API server
+  // 5. Set default config if not set
+  const { setConfig: sc, getConfig: gc } = await import("./db.js");
+  if (!gc("max_capital_usd")) sc("max_capital_usd", "500");
+  if (!gc("balance_usd")) sc("balance_usd", "500");
+  if (!gc("profit_reinvest_pct")) sc("profit_reinvest_pct", "0.75");
+  if (!gc("capital_cap_usd")) sc("capital_cap_usd", "5000");
+  if (!gc("mode")) sc("mode", "paper"); // paper or real — default SAFE
+
+  // 6. Start the strategy engine
+  const { start: startEngine, stop: stopEngine } = await import("./core/engine.js");
+  const mode = gc("mode") || "paper";
+  console.log(`[STARTUP] Mode: ${mode.toUpperCase()}`);
+  if (mode === "real" || mode === "paper") {
+    startEngine();
+  }
+
+  // 7. Start the dashboard + API server
   const port = parseInt(process.env.PORT || "3001", 10);
   startApiServer(port);
 
-  console.log("\n[STARTUP] Phase 1 complete — order infrastructure + dashboard ready");
-  console.log("[STARTUP] Remaining: feeds, strategy engine, reconciler");
+  console.log("\n[STARTUP] Reaper fully operational");
+  console.log("[STARTUP] Dashboard: http://localhost:" + port);
 
   // Graceful shutdown
   const shutdown = async () => {
     console.log("\n[SHUTDOWN] Stopping Reaper...");
+    const { stop: stopEngine } = await import("./core/engine.js");
+    await stopEngine();
     userWs.disconnect();
     await cancelAllOrders();
     logActivity("SHUTDOWN", "Reaper stopped cleanly");

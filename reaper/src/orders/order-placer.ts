@@ -10,8 +10,14 @@ import { logActivity } from "../db.js";
 import * as ledger from "./order-ledger.js";
 import * as fillProcessor from "./fill-processor.js";
 
+import { getConfig } from "../db.js";
+
 const PYTHON_API_URL = process.env.PYTHON_API_URL || "http://127.0.0.1:8000";
 const MIN_ORDER_SIZE = 5; // Polymarket minimum
+
+function isPaperMode(): boolean {
+  return (getConfig("mode") || "paper") !== "real";
+}
 
 export interface PlaceOrderResult {
   localId: string;
@@ -54,7 +60,41 @@ export async function placeBuyOrder(opts: {
     return { localId: "", clobOrderId: "", status: "failed", error: "Slot already has active order" };
   }
 
-  // 1. Write PENDING to SQLite FIRST
+  // Paper mode: simulate fill if bid would cross the ask
+  if (isPaperMode()) {
+    const localId = ledger.createPendingOrder({
+      tokenId, windowSlug, side,
+      price: Math.floor(price * 10000) / 10000,
+      size: Math.floor(size * 100) / 100,
+      ladderLevel,
+    });
+    const fakeOrderId = `paper-${localId}`;
+    ledger.markSent(localId, fakeOrderId);
+
+    // Check book to see if it would cross
+    try {
+      const bookResp = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+      const book = await bookResp.json() as { asks?: Array<{ price: string; size: string }> };
+      const bestAsk = book.asks?.[0] ? parseFloat(book.asks[0].price) : null;
+
+      if (bestAsk !== null && price >= bestAsk) {
+        // Would cross — simulate immediate fill at ask price
+        fillProcessor.processImmediateFill(localId, fakeOrderId, windowSlug, tokenId, side, bestAsk, size);
+        logActivity("ORDER_FILLED", `${side} L${ladderLevel} ${size.toFixed(1)}@$${bestAsk.toFixed(3)} [paper]`, {
+          windowSlug, side, level: "trade",
+        });
+        return { localId, clobOrderId: fakeOrderId, status: "filled", fillPrice: bestAsk, fillSize: size };
+      }
+    } catch { /* book unavailable */ }
+
+    // Doesn't cross — resting order (paper mode can't simulate resting fills)
+    logActivity("ORDER_PLACED", `${side} L${ladderLevel} ${size.toFixed(1)}@$${price.toFixed(3)} resting [paper]`, {
+      windowSlug, side, level: "info",
+    });
+    return { localId, clobOrderId: fakeOrderId, status: "placed" };
+  }
+
+  // 1. Write PENDING to SQLite FIRST (REAL MODE)
   const localId = ledger.createPendingOrder({
     tokenId,
     windowSlug,
@@ -156,6 +196,10 @@ export async function placeBuyOrder(opts: {
  * the User WebSocket will deliver the fill event.
  */
 export async function cancelOrder(clobOrderId: string): Promise<boolean> {
+  if (isPaperMode()) {
+    ledger.markCancelled(clobOrderId);
+    return true;
+  }
   try {
     const resp = await fetch(`${PYTHON_API_URL}/api/strategy/cancel`, {
       method: "POST",
@@ -186,6 +230,13 @@ export async function cancelOrder(clobOrderId: string): Promise<boolean> {
  * Used on stop and startup for cleanup.
  */
 export async function cancelAllOrders(): Promise<boolean> {
+  if (isPaperMode()) {
+    const openOrders = ledger.getOpenOrders();
+    for (const order of openOrders) {
+      if (order.clob_order_id) ledger.markCancelled(order.clob_order_id);
+    }
+    return true;
+  }
   try {
     const resp = await fetch(`${PYTHON_API_URL}/api/strategy/cancel-all`, {
       method: "POST",

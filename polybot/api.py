@@ -1628,6 +1628,21 @@ def _get_clob_client():
         raise HTTPException(status_code=503, detail=f"ClobClient init failed: {e}")
 
 
+@app.get("/api/strategy/clob-creds")
+def strategy_clob_creds():
+    """Return CLOB API credentials for WebSocket authentication.
+    These are derived from the private key and cached by the CLOB API."""
+    client = _get_clob_client()
+    creds = client.creds
+    if not creds:
+        raise HTTPException(status_code=503, detail="No CLOB credentials available")
+    return {
+        "apiKey": creds.api_key,
+        "secret": creds.api_secret,
+        "passphrase": creds.api_passphrase,
+    }
+
+
 @app.post("/api/strategy/order")
 def strategy_place_order(body: dict):
     """Place an order for a strategy.
