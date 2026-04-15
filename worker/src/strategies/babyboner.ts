@@ -1837,16 +1837,22 @@ class BabyBoneRStrategy implements Strategy {
               ctx.log(`${dryRun ? "DRY " : ""}ORDER: ${side} ${levelLabel} $${roundedBid} sz=${fillSize} cost=$${orderCost.toFixed(1)} budget=$${budgetRemaining.toFixed(1)} clob=$${clobFreeBalance.toFixed(1)}`, { level: "signal" });
 
               if (dryRun) {
-                // Dry run: simulate what would happen without touching the CLOB
-                // Check if bid crosses ask — would fill immediately
+                // Dry run: simulate what would happen without touching the CLOB.
+                // Record fills in state so the UI shows realistic inventory and P&L.
                 const bookForDry = await this.getBookCached(ctx, tokenId);
                 const bestAskDry = this.getBestAsk(bookForDry);
                 if (bestAskDry !== null && roundedBid >= bestAskDry) {
-                  ctx.log(`DRY FILL: ${side} ${levelLabel} WOULD fill ${fillSize}@$${bestAskDry.toFixed(3)} (bid $${roundedBid} >= ask $${bestAskDry.toFixed(3)})`, { level: "signal" });
+                  // Would cross — simulate an immediate fill at ask price
+                  const dryFillPrice = bestAskDry;
+                  const dryFillSize = fillSize;
+                  this.recordBuyFill(ctx, w, side, dryFillSize, dryFillPrice, `dry_${levelLabel}`, true);
+                  await this.persistTradeToD1(ctx, w, side, "BUY", dryFillPrice, dryFillSize, 0, `dry_${levelLabel}`);
+                  tickCapitalCommitted += dryFillPrice * dryFillSize;
                 } else {
-                  ctx.log(`DRY RESTING: ${side} ${levelLabel} WOULD rest at $${roundedBid} (ask=${bestAskDry?.toFixed(3) ?? "none"})`, { level: "signal" });
+                  // Would rest — log but don't record fill (it might fill later, but we can't know)
+                  ctx.log(`DRY RESTING: ${side} ${levelLabel} $${roundedBid} (ask=${bestAskDry?.toFixed(3) ?? "none"})`, { level: "signal" });
+                  tickCapitalCommitted += orderCost;
                 }
-                tickCapitalCommitted += orderCost;
                 continue;
               }
 
