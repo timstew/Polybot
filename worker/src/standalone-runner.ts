@@ -210,6 +210,17 @@ export function getClobBalance(): number {
   return sharedClobBalance;
 }
 export function adjustClobBalance(delta: number): void { sharedClobBalance = Math.max(0, sharedClobBalance + delta); }
+/** Force-refresh the CLOB balance (called before placing real-mode orders). */
+export async function refreshClobBalance(): Promise<number> {
+  const url = process.env.PYTHON_API_URL || "http://127.0.0.1:8000";
+  try {
+    const resp = await fetch(`${url}/api/strategy/balance`);
+    const data = (await resp.json()) as { balance: number };
+    sharedClobBalance = data.balance || 0;
+    sharedClobBalanceAt = Date.now();
+  } catch { /* keep stale */ }
+  return sharedClobBalance;
+}
 
 async function pollClobBalance(pythonApiUrl: string): Promise<void> {
   try {

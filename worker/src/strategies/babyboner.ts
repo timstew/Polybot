@@ -48,7 +48,7 @@ import {
   disableReactiveFeed,
 } from "./reactive-feed";
 import { classifyRegime, computeRegimeFeatures } from "./regime";
-import { getClobBalance, adjustClobBalance } from "../standalone-runner";
+import { getClobBalance, adjustClobBalance, refreshClobBalance } from "../standalone-runner";
 import {
   enableClobFeed,
   subscribeClobTokens,
@@ -737,6 +737,7 @@ class BabyBoneRStrategy implements Strategy {
     const crossedBoundary = boundary5m > this.lastBoundary5m;
     if (crossedBoundary) this.lastBoundary5m = boundary5m;
     if (now - this.lastDiscovery > params.discovery_interval_ms || crossedBoundary) {
+      if (crossedBoundary) ctx.log(`DISCOVERY: boundary crossed at ${boundary5m}`, { level: "signal" });
       try {
         const markets: CryptoMarket[] = [];
         const nowSec = Math.floor(now / 1000);
@@ -784,11 +785,13 @@ class BabyBoneRStrategy implements Strategy {
         if (markets.length === 0) {
           const allMarkets = await discoverCryptoMarkets(params.target_cryptos, 30_000);
           this.marketCache = allMarkets.filter(m => /up or down/i.test(m.title));
+          ctx.log(`DISCOVERY: fallback found ${this.marketCache.length} markets`, { level: "signal" });
         } else {
           this.marketCache = markets;
+          ctx.log(`DISCOVERY: slug lookup found ${markets.length} markets`, { level: "signal" });
         }
-      } catch {
-        // Discovery failure — keep existing cache
+      } catch (e) {
+        ctx.log(`DISCOVERY ERROR: ${String(e).slice(0, 100)}`, { level: "warning" });
       }
       this.lastDiscovery = now;
     } else {
@@ -1117,6 +1120,9 @@ class BabyBoneRStrategy implements Strategy {
     w.fillCount++;
     w.totalBuyCost += costBasis * size;
     this.custom.totalFills++;
+    // Log EVERY fill immediately — critical for real-mode visibility
+    ctx.log(`FILL ${side} [${label}]: ${w.market.title.slice(0, 30)} ${size.toFixed(2)}@$${price.toFixed(3)} inv=${w.upInventory.toFixed(1)}↑/${w.downInventory.toFixed(1)}↓`,
+      { level: "signal" });
     // Rebate estimation is handled at the framework level (autoMergeProfitablePairs)
     // for all strategies, not per-fill here.
     // Track peak inventory for UI (auto-merge reduces current to 0)
@@ -1300,7 +1306,7 @@ class BabyBoneRStrategy implements Strategy {
         realizedSellPnl: 0,
         enteredAt: now,
         lastRequoteAt: 0,
-        tickAction: "",
+        tickAction: "Entered — waiting for first quote",
         confirmedDirection: null,
         lastUpBuyAt: 0,
         lastDownBuyAt: 0,
@@ -1331,6 +1337,12 @@ class BabyBoneRStrategy implements Strategy {
     const now = Date.now();
 
     for (const w of this.custom.activeWindows) {
+      // Always set a baseline tickAction so the UI never shows empty for an active window
+      const secsLeft = Math.max(0, Math.round((w.windowEndTime - now) / 1000));
+      if (!w.tickAction || w.tickAction.startsWith("Entered") || w.tickAction.startsWith("Active")) {
+        w.tickAction = `Active ${secsLeft}s left | ${w.fillCount}f ${w.upInventory.toFixed(0)}↑/${w.downInventory.toFixed(0)}↓`;
+      }
+
       // Set oracle prediction for windows past their end time (used by UI)
       if (now > w.windowEndTime && !w.binancePrediction) {
         const oracleTick = getOracleSpot(w.cryptoSymbol);
@@ -1695,8 +1707,8 @@ class BabyBoneRStrategy implements Strategy {
       }
 
       // Track capital committed this tick across all orders (prevents over-deploying small balances)
-      // For real mode: use the shared CLOB balance as ground truth
-      const clobFreeBalance = isReal ? getClobBalance() : this.effectiveCapital;
+      // For real mode: refresh CLOB balance every tick (the 30s poll is too slow — orders fill between polls)
+      const clobFreeBalance = isReal ? await refreshClobBalance() : this.effectiveCapital;
       let tickCapitalCommitted = 0;
       let orderFailed = false;
 
