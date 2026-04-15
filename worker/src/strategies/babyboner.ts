@@ -1792,11 +1792,11 @@ class BabyBoneRStrategy implements Strategy {
             }
           }
           if (availableAtBid > 0) {
-            // Cap by inventory room and capital room
+            // Cap by inventory room, capital room, AND maker_bid_size (prevents all-in on one fill)
             const invRoom = params.max_inventory_per_side - inv;
             const capitalRoom = params.max_total_cost - currentInvCost2;
             const capitalTokens = roundedBid > 0 ? capitalRoom / roundedBid : 0;
-            fillSize = Math.min(availableAtBid, invRoom, capitalTokens);
+            fillSize = Math.min(availableAtBid, invRoom, capitalTokens, params.maker_bid_size);
             fillSize = Math.max(1, Math.floor(fillSize)); // at least 1 token, integer
           }
         } catch { /* book unavailable — use fallback size */ }
