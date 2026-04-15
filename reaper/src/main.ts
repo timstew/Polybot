@@ -72,11 +72,29 @@ async function main() {
 
   // 6. Set default config if not set
   const { setConfig: sc, getConfig: gc } = await import("./db.js");
-  if (!gc("max_capital_usd")) sc("max_capital_usd", "500");
-  if (!gc("balance_usd")) sc("balance_usd", "500");
-  if (!gc("profit_reinvest_pct")) sc("profit_reinvest_pct", "0.75");
-  if (!gc("capital_cap_usd")) sc("capital_cap_usd", "5000");
-  if (!gc("mode")) sc("mode", "paper"); // paper or real — default SAFE
+  const defaults: Record<string, string> = {
+    mode: "paper",                    // paper or real — default SAFE
+    max_capital_usd: "500",
+    balance_usd: "500",
+    profit_reinvest_pct: "0.75",
+    capital_cap_usd: "5000",
+    // Pricing
+    pricing_mode: "hybrid",            // hybrid (best for shadow paper), bonereaper (for real), book
+    paper_fill_mode: "shadow",          // shadow (BR activity — proven), grounded (trade tape — WIP), book (ask crossing)
+    deep_value_price: "0.15",
+    certainty_threshold: "0.65",
+    suppress_after_pct: "0.50",
+    uncertain_range: "0.10",
+    late_size_mult: "2.0",
+    // Windows
+    max_concurrent_windows: "6",
+    discovery_interval_ms: "15000",
+    // Shadow fills
+    shadow_wallet: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    if (!gc(key)) sc(key, value);
+  }
 
   // 6. Start the strategy engine
   const { start: startEngine, stop: stopEngine } = await import("./core/engine.js");

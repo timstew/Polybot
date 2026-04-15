@@ -179,7 +179,8 @@ async function tick(): Promise<void> {
     const pTrue = calculatePTrue(spotPrice, strike, timeLeft, vol);
 
     // Compute target bids
-    const bids = pricing.computeBids(w, pTrue, config);
+    const pricingMode = getConfig("pricing_mode") || "bonereaper";
+    const bids = pricing.computeBids(w, pTrue, config, pricingMode);
     const phase = pricing.getPhaseLabel(w, pTrue, config);
 
     // Budget check: how much can we still deploy?
@@ -240,10 +241,17 @@ async function tick(): Promise<void> {
     await tryResolveWindow(w, spotPrice);
   }
 
-  // 5. Paper mode: use Bonereaper's actual fills as proof of fillability
+  // 5. Paper mode: simulate fills based on selected fill mode
   const mode = getConfig("mode") || "paper";
+  const fillMode = getConfig("paper_fill_mode") || "grounded";
   if (mode === "paper") {
-    await processShadowFills();
+    if (fillMode === "shadow") {
+      await processShadowFills();
+    } else if (fillMode === "grounded") {
+      const { checkGroundedFills } = await import("../orders/grounded-fills.js");
+      await checkGroundedFills();
+    }
+    // "book" mode fills only happen at order placement (already handled)
   }
 
   // 6. Auto-merge profitable pairs

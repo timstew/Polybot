@@ -106,8 +106,23 @@ export function startApiServer(port = 3001): void {
         return;
       }
 
-      if (url.pathname === "/api/config") {
+      if (url.pathname === "/api/config" && req.method === "GET") {
         json(res, getAllConfig());
+        return;
+      }
+
+      if (url.pathname === "/api/config" && req.method === "POST") {
+        const body = await new Promise<string>((resolve) => {
+          let data = "";
+          req.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+          req.on("end", () => resolve(data));
+        });
+        const updates = JSON.parse(body) as Record<string, string>;
+        const { setConfig } = await import("./db.js");
+        for (const [key, value] of Object.entries(updates)) {
+          setConfig(key, String(value));
+        }
+        json(res, { status: "updated", config: getAllConfig() });
         return;
       }
 
@@ -232,9 +247,83 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+  <!-- Settings panel -->
+  <details class="mt-4">
+    <summary class="text-sm font-bold text-gray-400 uppercase tracking-wide cursor-pointer hover:text-gray-200">Settings</summary>
+    <div class="card mt-2">
+      <div id="settings-grid" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 text-xs">
+        Loading...
+      </div>
+      <div class="mt-3 flex gap-2">
+        <button onclick="saveSettings()" class="px-3 py-1 bg-blue-600 text-white rounded text-xs hover:bg-blue-500">Save</button>
+        <span id="save-status" class="text-xs text-gray-500"></span>
+      </div>
+    </div>
+  </details>
+
   <script>
     const API = '';
     let lastActivityId = 0;
+    let settingsLoaded = false;
+
+    const SETTING_LABELS = {
+      mode: { label: 'Mode', type: 'select', options: ['paper', 'real'] },
+      paper_fill_mode: { label: 'Paper Fill Mode', type: 'select', options: ['grounded', 'shadow', 'book'] },
+      pricing_mode: { label: 'Pricing Mode', type: 'select', options: ['bonereaper', 'hybrid', 'book'] },
+      max_capital_usd: { label: 'Max Capital ($)', type: 'number' },
+      balance_usd: { label: 'Balance ($)', type: 'number' },
+      profit_reinvest_pct: { label: 'Reinvest %', type: 'number' },
+      capital_cap_usd: { label: 'Capital Cap ($)', type: 'number' },
+      deep_value_price: { label: 'Deep Value Bid', type: 'number' },
+      certainty_threshold: { label: 'Certainty Threshold', type: 'number' },
+      suppress_after_pct: { label: 'Suppress After %', type: 'number' },
+      uncertain_range: { label: 'Uncertain Range', type: 'number' },
+      late_size_mult: { label: 'Late Size Mult', type: 'number' },
+      max_concurrent_windows: { label: 'Max Windows', type: 'number' },
+      discovery_interval_ms: { label: 'Discovery (ms)', type: 'number' },
+      shadow_wallet: { label: 'Shadow Wallet', type: 'text' },
+    };
+
+    async function loadSettings() {
+      if (settingsLoaded) return;
+      const config = await fetch(API + '/api/config').then(r => r.json());
+      const grid = document.getElementById('settings-grid');
+      grid.innerHTML = Object.entries(SETTING_LABELS).map(([key, meta]) => {
+        const val = config[key] || '';
+        let input;
+        if (meta.type === 'select') {
+          input = '<select id="cfg-' + key + '" class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs">' +
+            meta.options.map(o => '<option value="' + o + '"' + (o === val ? ' selected' : '') + '>' + o + '</option>').join('') +
+            '</select>';
+        } else {
+          input = '<input id="cfg-' + key + '" type="' + (meta.type === 'number' ? 'number' : 'text') +
+            '" value="' + val + '" step="any" class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-white text-xs font-mono" />';
+        }
+        return '<div><label class="text-gray-500 text-[10px]">' + meta.label + '</label>' + input + '</div>';
+      }).join('');
+      settingsLoaded = true;
+    }
+
+    async function saveSettings() {
+      const updates = {};
+      for (const key of Object.keys(SETTING_LABELS)) {
+        const el = document.getElementById('cfg-' + key);
+        if (el) updates[key] = el.value;
+      }
+      const resp = await fetch(API + '/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      });
+      const data = await resp.json();
+      document.getElementById('save-status').textContent = data.status === 'updated' ? 'Saved!' : 'Error';
+      setTimeout(() => document.getElementById('save-status').textContent = '', 2000);
+    }
+
+    // Load settings when panel opens
+    document.querySelector('details').addEventListener('toggle', (e) => {
+      if (e.target.open) loadSettings();
+    });
 
     function fmt(n) { return n == null ? '—' : '$' + Number(n).toFixed(2); }
     function fmtPnl(n) {

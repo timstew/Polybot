@@ -34,11 +34,12 @@ export interface BidLevel {
 // Per-window sticky state for certainty loading
 const loadState = new Map<string, { activated: boolean; side: "UP" | "DOWN" }>();
 
-/** Compute all bid levels for a window. */
+/** Compute all bid levels for a window. Supports bonereaper and hybrid pricing. */
 export function computeBids(
   window: WindowRow,
   pTrue: number,
   config: PricingConfig,
+  pricingMode: string = "bonereaper",
 ): BidLevel[] {
   const now = Date.now();
   const windowDuration = window.end_time - window.open_time;
@@ -67,7 +68,7 @@ export function computeBids(
   }
   loadState.set(window.slug, state);
 
-  // Generate ladder
+  // Generate ladder based on pricing mode
   const upFair = pCapped;
   const dnFair = 1 - pCapped;
   const deep = config.deepValuePrice;
@@ -75,10 +76,22 @@ export function computeBids(
 
   const upPrices: number[] = [];
   const dnPrices: number[] = [];
-  for (let i = 0; i < nLevels; i++) {
-    const t = nLevels > 1 ? i / (nLevels - 1) : 1;
-    upPrices.push(Math.min(0.95, deep + t * Math.max(0, upFair - deep)));
-    dnPrices.push(Math.min(0.95, deep + t * Math.max(0, dnFair - deep)));
+
+  if (pricingMode === "hybrid") {
+    // Hybrid: max(0.55, P_true) on both sides — designed for shadow fill matching
+    const HYBRID_FLOOR = 0.55;
+    const upBid = Math.min(0.95, Math.max(HYBRID_FLOOR, upFair));
+    const dnBid = Math.min(0.95, Math.max(HYBRID_FLOOR, dnFair));
+    // Single level for hybrid (no ladder)
+    upPrices.push(upBid);
+    dnPrices.push(dnBid);
+  } else {
+    // Bonereaper: multi-level ladder from deep value to fair
+    for (let i = 0; i < nLevels; i++) {
+      const t = nLevels > 1 ? i / (nLevels - 1) : 1;
+      upPrices.push(Math.min(0.95, deep + t * Math.max(0, upFair - deep)));
+      dnPrices.push(Math.min(0.95, deep + t * Math.max(0, dnFair - deep)));
+    }
   }
 
   // Apply certainty suppression
