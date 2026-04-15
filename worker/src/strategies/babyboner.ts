@@ -440,6 +440,7 @@ class BabyBoneRStrategy implements Strategy {
   private latestParams: BabyBoneRParams | null = null;
   private eventFillLock = false; // prevent concurrent event fills
   private effectiveCapital = 0; // current effective capital (updated each tick)
+  private hasUnreconciledOrders = false; // true if we placed orders last tick that haven't been checked yet
 
   private async getBookCached(ctx: StrategyContext, tokenId: string): Promise<OrderBook> {
     // Prefer real-time CLOB WebSocket book (updated on every price_change event)
@@ -1710,6 +1711,36 @@ class BabyBoneRStrategy implements Strategy {
         }
       }
 
+      // ── Reconciliation phase: check all existing orders before placing new ones ──
+      // This runs FIRST every tick. Only after all orders are accounted for can new ones be placed.
+      if (isReal && this.hasUnreconciledOrders) {
+        let allReconciled = true;
+        const maxLevel = Math.max(2, params.br_ladder_levels || 4);
+        for (const checkSide of ["UP", "DOWN"] as const) {
+          for (let lvl = 1; lvl <= maxLevel; lvl++) {
+            const oid = this.getRealOrderId(w, checkSide, lvl);
+            if (oid) {
+              // This order is still tracked — check its status
+              const st = await ctx.api.getOrderStatus(oid);
+              if (st.status === "MATCHED" && st.size_matched > 0) {
+                const fp = st.price || this.getRealOrderPrice(w, checkSide, lvl);
+                this.recordBuyFill(ctx, w, checkSide, st.size_matched, fp, `real_L${lvl}`, false);
+                await this.persistTradeToD1(ctx, w, checkSide, "BUY", fp, st.size_matched, 0, `real_L${lvl}`);
+                this.setRealOrderId(w, checkSide, lvl, null);
+              } else if (st.status === "LIVE") {
+                allReconciled = false; // still resting — don't place new orders yet
+              } else {
+                // CANCELLED, ERROR, UNKNOWN — clear the slot, refund
+                const lockedCost = this.getRealOrderPrice(w, checkSide, lvl) * params.maker_bid_size;
+                adjustClobBalance(lockedCost);
+                this.setRealOrderId(w, checkSide, lvl, null);
+              }
+            }
+          }
+        }
+        if (allReconciled) this.hasUnreconciledOrders = false;
+      }
+
       // Track capital committed this tick across all orders (prevents over-deploying small balances)
       // Budget = min(CLOB free balance, effectiveCapital - already deployed)
       // This ensures a $50 strategy with $1,633 in the wallet only uses $50.
@@ -1774,8 +1805,10 @@ class BabyBoneRStrategy implements Strategy {
         if (isReal && fillSize < MIN_ORDER_SIZE) continue;
 
         if (isReal) {
-          // ── REAL MODE: place GTC orders, check fills ──────────────
-          // Use the order slot for this side+level; check if existing order filled
+          // ── REAL MODE: reconcile-then-order ──────────────────────
+          // RULE: Never place new orders until ALL previous orders are reconciled.
+          // This prevents the runaway bug where fills go undetected and new orders
+          // keep being placed every tick.
           const existingId = this.getRealOrderId(w, side, level);
           if (existingId) {
             // Check if it filled
@@ -1824,8 +1857,8 @@ class BabyBoneRStrategy implements Strategy {
             }
           }
 
-          // Place new GTC order if no order resting
-          if (!this.getRealOrderId(w, side, level)) {
+          // Place new GTC order if no order resting AND previous orders are reconciled
+          if (!this.getRealOrderId(w, side, level) && !this.hasUnreconciledOrders) {
             // Capital budget: don't commit more than effective capital across all orders this tick
             const orderCost = roundedBid * fillSize;
             const budgetRemaining = clobFreeBalance - tickCapitalCommitted;
@@ -1876,6 +1909,7 @@ class BabyBoneRStrategy implements Strategy {
                 this.setRealOrderPrice(w, side, level, roundedBid);
                 tickCapitalCommitted += orderCost; // reserved by resting order
                 if (isReal) adjustClobBalance(-orderCost); // CLOB locks this capital
+                this.hasUnreconciledOrders = true; // don't place more until these are checked
               } else {
                 // Order failed — likely insufficient balance. Stop placing more.
                 ctx.log(`ORDER FAILED: ${side} ${levelLabel} $${roundedBid} — ${result.error?.slice(0, 80) ?? "unknown"}`, { level: "warning" });

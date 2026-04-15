@@ -400,18 +400,23 @@ async function startStrategy(configId: string, pythonApiUrl: string): Promise<st
     "UPDATE strategy_configs SET active = 1, updated_at = datetime('now') WHERE id = ?"
   ).run(configId);
 
-  // Start tick loop
-  inst.interval = setInterval(async () => {
-    if (inst.ticking) return; // prevent re-entrance
-    inst.ticking = true;
-    try {
-      await tick(inst);
-    } catch (e) {
-      console.error(`[TICK ERROR] ${inst.config.name}:`, e);
-      inst.state.errors++;
-    }
-    inst.ticking = false;
-  }, config.tick_interval_ms);
+  // Start tick loop — tick-then-schedule for fastest possible response.
+  // Each tick runs, completes, then schedules the next one after a short pause.
+  // Real mode: 100ms pause (reconcile fast). Paper mode: use configured interval.
+  const tickPauseMs = config.mode === "real" ? 100 : config.tick_interval_ms;
+  const scheduleNextTick = () => {
+    if (!instances.has(configId)) return; // strategy was stopped
+    inst.interval = setTimeout(async () => {
+      try {
+        await tick(inst);
+      } catch (e) {
+        console.error(`[TICK ERROR] ${inst.config.name}:`, e);
+        inst.state.errors++;
+      }
+      scheduleNextTick();
+    }, tickPauseMs) as unknown as ReturnType<typeof setInterval>;
+  };
+  scheduleNextTick();
 
   return "started";
 }
