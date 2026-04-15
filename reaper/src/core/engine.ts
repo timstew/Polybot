@@ -11,6 +11,7 @@
 
 import { getDb, logActivity, getConfig, setConfig } from "../db.js";
 import { fetchSpotPrice, calculatePTrue, estimateVolatility } from "../feeds/binance-feed.js";
+import { getOracleSpot, getOracleStrike, setOracleStrike, isOracleConnected, enableOracleFeed } from "../feeds/oracle-feed.js";
 import * as windowMgr from "./window-manager.js";
 import * as pricing from "./pricing.js";
 import * as ledger from "../orders/order-ledger.js";
@@ -115,8 +116,10 @@ async function tick(): Promise<void> {
   const config = getScaledConfig(effectiveCapital);
   const now = Date.now();
 
-  // 1. Fetch spot price
-  const spotPrice = await fetchSpotPrice();
+  // 1. Fetch spot price — prefer oracle, fallback to Binance
+  const oracleSpot = getOracleSpot("BTCUSDT");
+  const binanceSpot = await fetchSpotPrice();
+  const spotPrice = oracleSpot?.price ?? binanceSpot;
   if (spotPrice <= 0) return;
   priceHistory.push(spotPrice);
   if (priceHistory.length > 60) priceHistory = priceHistory.slice(-60);
@@ -157,16 +160,23 @@ async function tick(): Promise<void> {
       continue;
     }
 
-    // Compute oracle strike (use price at open as fallback)
-    const strike = w.oracle_strike || w.price_at_open || spotPrice;
+    // Compute oracle strike — prefer Chainlink oracle, fallback to Binance at open
+    let strike = w.oracle_strike;
+    if (!strike) {
+      // Try oracle
+      const oracleStrike = getOracleStrike("BTCUSDT", w.open_time);
+      if (oracleStrike) {
+        strike = oracleStrike;
+      } else {
+        // Capture current price as strike (Binance fallback)
+        strike = w.price_at_open || spotPrice;
+        setOracleStrike("BTCUSDT", w.open_time, strike);
+      }
+      getDb().prepare("UPDATE windows SET oracle_strike = ? WHERE slug = ?").run(strike, w.slug);
+    }
 
     // Compute P_true
     const pTrue = calculatePTrue(spotPrice, strike, timeLeft, vol);
-
-    // Update oracle strike if not set
-    if (!w.oracle_strike) {
-      getDb().prepare("UPDATE windows SET oracle_strike = ? WHERE slug = ?").run(strike, w.slug);
-    }
 
     // Compute target bids
     const bids = pricing.computeBids(w, pTrue, config);
@@ -230,7 +240,13 @@ async function tick(): Promise<void> {
     await tryResolveWindow(w, spotPrice);
   }
 
-  // 5. Auto-merge profitable pairs
+  // 5. Paper mode: check if resting orders would now cross the ask
+  const mode = getConfig("mode") || "paper";
+  if (mode === "paper") {
+    await checkPaperRestingFills();
+  }
+
+  // 6. Auto-merge profitable pairs
   for (const w of windows) {
     await tryMerge(w);
   }
@@ -327,6 +343,33 @@ async function tryRedeem(w: windowMgr.WindowRow): Promise<void> {
       logActivity("REDEEM", `Redeemed ${w.slug.slice(-13)}`, { windowSlug: w.slug, level: "info" });
     }
   } catch { /* will be caught by sweep */ }
+}
+
+/** Paper mode: check if any resting orders would now cross the ask. */
+async function checkPaperRestingFills(): Promise<void> {
+  const openOrders = ledger.getOpenOrders();
+  for (const order of openOrders) {
+    if (!order.clob_order_id?.startsWith("paper-")) continue; // only paper orders
+    try {
+      const bookResp = await fetch(`https://clob.polymarket.com/book?token_id=${order.token_id}`);
+      const book = await bookResp.json() as { asks?: Array<{ price: string; size: string }> };
+      const bestAsk = book.asks?.[0] ? parseFloat(book.asks[0].price) : null;
+
+      if (bestAsk !== null && order.price >= bestAsk) {
+        // Would cross now — simulate fill
+        const { processReconcileFill } = await import("../orders/fill-processor.js");
+        processReconcileFill(
+          `paper-rest-${order.id}-${Date.now()}`,
+          order.clob_order_id!,
+          order.window_slug,
+          order.token_id,
+          order.side as "UP" | "DOWN",
+          bestAsk,
+          order.size,
+        );
+      }
+    } catch { /* skip */ }
+  }
 }
 
 /** 30s reconciliation — cross-check CLOB activity against our ledger. */

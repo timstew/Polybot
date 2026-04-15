@@ -61,7 +61,16 @@ async function main() {
   // 8. Start reconciliation loop (30s)
   // 9. Start HTTP API server for dashboard
 
-  // 5. Set default config if not set
+  // 5. Start oracle feed (Chainlink via RTDS)
+  try {
+    const { enableOracleFeed } = await import("./feeds/oracle-feed.js");
+    enableOracleFeed();
+    console.log("[STARTUP] Oracle feed enabled (Chainlink via RTDS)");
+  } catch (err) {
+    console.warn("[STARTUP] Oracle feed unavailable:", err);
+  }
+
+  // 6. Set default config if not set
   const { setConfig: sc, getConfig: gc } = await import("./db.js");
   if (!gc("max_capital_usd")) sc("max_capital_usd", "500");
   if (!gc("balance_usd")) sc("balance_usd", "500");

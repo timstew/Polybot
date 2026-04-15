@@ -101,6 +101,7 @@ export function startApiServer(port = 3001): void {
           recentFills,
           config,
           stats,
+          mode: config.mode || "paper",
         });
         return;
       }
@@ -286,8 +287,17 @@ function getDashboardHtml(): string {
 
         // Connection
         const connEl = document.getElementById('connection-status');
-        connEl.textContent = status.activeWindows?.length > 0 ? 'LIVE' : 'IDLE';
-        connEl.className = 'badge ' + (status.activeWindows?.length > 0 ? 'badge-green pulse' : 'badge-gray');
+        const isPaper = status.mode === 'paper';
+        const hasWindows = status.activeWindows?.length > 0;
+        connEl.textContent = isPaper ? (hasWindows ? 'PAPER' : 'PAPER (idle)') : (hasWindows ? 'REAL' : 'IDLE');
+        connEl.className = 'badge ' + (isPaper ? 'badge-yellow' : (hasWindows ? 'badge-green pulse' : 'badge-gray'));
+        if (isPaper) {
+          document.getElementById('balance').textContent = 'PAPER';
+          document.getElementById('balance').className = 'text-xl font-bold text-yellow-400';
+        } else {
+          document.getElementById('balance').textContent = fmt(status.balance);
+          document.getElementById('balance').className = 'text-xl font-bold text-white';
+        }
 
         // Windows
         const winsEl = document.getElementById('windows');
