@@ -240,10 +240,10 @@ async function tick(): Promise<void> {
     await tryResolveWindow(w, spotPrice);
   }
 
-  // 5. Paper mode: check if resting orders would now cross the ask
+  // 5. Paper mode: use Bonereaper's actual fills as proof of fillability
   const mode = getConfig("mode") || "paper";
   if (mode === "paper") {
-    await checkPaperRestingFills();
+    await processShadowFills();
   }
 
   // 6. Auto-merge profitable pairs
@@ -345,7 +345,72 @@ async function tryRedeem(w: windowMgr.WindowRow): Promise<void> {
   } catch { /* will be caught by sweep */ }
 }
 
-/** Paper mode: check if any resting orders would now cross the ask. */
+const BONEREAPER_WALLET = "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30";
+let lastBrFetchAt = 0;
+let brCache: Array<{ id: string; slug: string; side: "UP" | "DOWN"; price: number; size: number; timestamp: number }> = [];
+
+/** Paper mode: fetch Bonereaper's fills and grant shadow fills for matching orders. */
+async function processShadowFills(): Promise<void> {
+  const now = Date.now();
+  // Fetch BR activity every 10s
+  if (now - lastBrFetchAt < 10_000) return;
+  lastBrFetchAt = now;
+
+  try {
+    const resp = await fetch(`https://data-api.polymarket.com/activity?user=${BONEREAPER_WALLET}&limit=200&_t=${now}`);
+    if (!resp.ok) return;
+    const items = await resp.json() as Array<Record<string, unknown>>;
+    brCache = [];
+    for (const item of items) {
+      if (item.type !== "TRADE" || item.side !== "BUY") continue;
+      const outcome = ((item.outcome as string) || "").toLowerCase();
+      brCache.push({
+        id: (item.transactionHash as string) || `${item.timestamp}-${item.price}-${item.size}`,
+        slug: (item.slug as string) || "",
+        side: outcome === "up" ? "UP" : "DOWN",
+        price: item.price as number,
+        size: item.size as number,
+        timestamp: item.timestamp as number,
+      });
+    }
+  } catch { return; }
+
+  // Match BR fills against our resting paper orders
+  const openOrders = ledger.getOpenOrders();
+  for (const order of openOrders) {
+    if (!order.clob_order_id?.startsWith("paper-")) continue;
+
+    const w = windowMgr.getWindow(order.window_slug);
+    if (!w || w.status !== "ACTIVE") continue;
+
+    // Find BR fills for this window+side that our bid covers
+    const matching = brCache.filter(br =>
+      br.slug === order.window_slug &&
+      br.side === (order.side as string) &&
+      order.price >= br.price &&
+      br.timestamp * 1000 >= new Date(w.entered_at || "").getTime()
+    );
+
+    if (matching.length === 0) continue;
+
+    // Grant shadow fill at BR's price and size
+    for (const br of matching) {
+      const tradeId = `shadow-${br.id}`;
+      const { processReconcileFill } = await import("../orders/fill-processor.js");
+      processReconcileFill(
+        tradeId,
+        order.clob_order_id!,
+        order.window_slug,
+        order.token_id,
+        order.side as "UP" | "DOWN",
+        br.price,
+        Math.min(br.size, order.size - order.size_matched), // don't overfill
+      );
+    }
+  }
+}
+
+/** Paper mode: check if any resting orders would now cross the ask (book-based fallback). */
 async function checkPaperRestingFills(): Promise<void> {
   const openOrders = ledger.getOpenOrders();
   for (const order of openOrders) {

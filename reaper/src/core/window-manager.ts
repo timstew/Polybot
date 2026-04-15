@@ -40,6 +40,7 @@ export interface WindowRow {
   total_merged: number;
   merge_pnl: number;
   net_pnl: number;
+  entered_at: string | null;
 }
 
 let lastBoundary5m = 0;
