@@ -1707,8 +1707,16 @@ class BabyBoneRStrategy implements Strategy {
       }
 
       // Track capital committed this tick across all orders (prevents over-deploying small balances)
-      // For real mode: refresh CLOB balance every tick (the 30s poll is too slow — orders fill between polls)
-      const clobFreeBalance = isReal ? await refreshClobBalance() : this.effectiveCapital;
+      // For real mode: refresh CLOB balance every tick (the 30s poll is too slow)
+      // For paper mode: compute free capital = effectiveCapital - total deployed across all windows
+      let clobFreeBalance: number;
+      if (isReal) {
+        clobFreeBalance = await refreshClobBalance();
+      } else {
+        const totalDeployed = this.custom.activeWindows.reduce((sum, aw) =>
+          sum + aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost, 0);
+        clobFreeBalance = Math.max(0, this.effectiveCapital - totalDeployed);
+      }
       let tickCapitalCommitted = 0;
       let orderFailed = false;
 
@@ -1869,10 +1877,14 @@ class BabyBoneRStrategy implements Strategy {
             const invNow = side === "UP" ? w.upInventory : w.downInventory;
             const costNow = w.upInventory * w.upAvgCost + w.downInventory * w.downAvgCost;
             if (invNow >= params.max_inventory_per_side) break;
-            // Capital gate: only block heavy side
+            // Per-window capital gate: only block heavy side
             const isHeavy = (side === "UP" && w.upInventory >= w.downInventory) ||
                             (side === "DOWN" && w.downInventory >= w.upInventory);
             if (costNow >= params.max_total_cost && isHeavy) break;
+            // Global capital gate: total deployed across ALL windows can't exceed effectiveCapital
+            const globalDeployed = this.custom.activeWindows.reduce((sum, aw) =>
+              sum + aw.upInventory * aw.upAvgCost + aw.downInventory * aw.downAvgCost, 0);
+            if (globalDeployed >= this.effectiveCapital) break;
 
             if (br.slug !== w.market.slug) continue;
             if (br.side !== side) continue;
