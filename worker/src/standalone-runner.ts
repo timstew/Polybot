@@ -210,15 +210,24 @@ export function getClobBalance(): number {
   return sharedClobBalance;
 }
 export function adjustClobBalance(delta: number): void { sharedClobBalance = Math.max(0, sharedClobBalance + delta); }
-/** Force-refresh the CLOB balance (called before placing real-mode orders). */
+/** Force-refresh the CLOB balance (called before placing real-mode orders).
+ *  Returns -1 if the balance cannot be fetched (API down). Caller must NOT place orders on -1. */
 export async function refreshClobBalance(): Promise<number> {
   const url = process.env.PYTHON_API_URL || "http://127.0.0.1:8000";
   try {
     const resp = await fetch(`${url}/api/strategy/balance`);
     const data = (await resp.json()) as { balance: number };
-    sharedClobBalance = data.balance || 0;
-    sharedClobBalanceAt = Date.now();
-  } catch { /* keep stale */ }
+    if (data.balance != null && data.balance >= 0) {
+      sharedClobBalance = data.balance;
+      sharedClobBalanceAt = Date.now();
+    } else {
+      console.error("[BALANCE] API returned invalid balance:", data);
+      return -1;
+    }
+  } catch (e) {
+    console.error("[BALANCE] refresh failed:", e);
+    return -1; // unknown — don't trade
+  }
   return sharedClobBalance;
 }
 

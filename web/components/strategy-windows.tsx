@@ -204,7 +204,7 @@ export function ActiveWindowRow(props: ActiveWindowRowProps) {
   const secs = Math.floor((timeLeftMs % 60000) / 1000);
 
   return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1.5 text-xs">
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded border px-2 py-1.5 text-xs overflow-hidden min-w-0">
       <Tip tip={title}><span className="font-medium cursor-help">{compact}</span></Tip>
       {chips}
       <InventoryBar up={up} down={dn} scale={scale} />

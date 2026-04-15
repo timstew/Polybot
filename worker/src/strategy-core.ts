@@ -593,7 +593,8 @@ export class RealStrategyAPI implements StrategyAPI {
       });
       const data = (await resp.json()) as { success: boolean };
       return data.success;
-    } catch {
+    } catch (e) {
+      console.error("[RealStrategyAPI] cancelOrder failed:", e);
       return false;
     }
   }
@@ -605,7 +606,8 @@ export class RealStrategyAPI implements StrategyAPI {
         headers: { "Content-Type": "application/json" },
       });
       return (await resp.json()) as { success: boolean };
-    } catch {
+    } catch (e) {
+      console.error("[RealStrategyAPI] cancelAllOrders failed:", e);
       return { success: false };
     }
   }
@@ -615,15 +617,20 @@ export class RealStrategyAPI implements StrategyAPI {
       const resp = await fetch(
         `${this.pythonApiUrl}/api/strategy/order-status/${encodeURIComponent(order_id)}`
       );
-      const data = (await resp.json()) as OrderStatusResult;
+      const data = (await resp.json()) as OrderStatusResult & { error?: string };
+      if (data.error) {
+        console.error(`[RealStrategyAPI] getOrderStatus error for ${order_id}: ${data.error}`);
+        return { order_id, status: "ERROR", size_matched: 0, original_size: 0, price: 0 };
+      }
       return {
-        order_id: data.order_id || order_id,
-        status: data.status || "UNKNOWN",
-        size_matched: data.size_matched || 0,
-        original_size: data.original_size || 0,
-        price: data.price || 0,
+        order_id: data.order_id ?? order_id,
+        status: data.status ?? "UNKNOWN",
+        size_matched: data.size_matched ?? 0,
+        original_size: data.original_size ?? 0,
+        price: data.price ?? 0,
       };
-    } catch {
+    } catch (e) {
+      console.error(`[RealStrategyAPI] getOrderStatus exception for ${order_id}:`, e);
       return { order_id, status: "ERROR", size_matched: 0, original_size: 0, price: 0 };
     }
   }
@@ -644,9 +651,10 @@ export class RealStrategyAPI implements StrategyAPI {
     try {
       const resp = await fetch(`${this.pythonApiUrl}/api/strategy/balance`);
       const data = (await resp.json()) as { balance: number };
-      return data.balance;
-    } catch {
-      return 0;
+      return data.balance ?? -1; // -1 signals "could not fetch" — caller must handle
+    } catch (e) {
+      console.error("[RealStrategyAPI] getBalance failed:", e);
+      return -1; // -1 = unknown, NOT 0 (which would halt all orders)
     }
   }
 

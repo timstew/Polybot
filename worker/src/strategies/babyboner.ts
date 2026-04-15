@@ -1753,6 +1753,11 @@ class BabyBoneRStrategy implements Strategy {
       let clobFreeBalance: number;
       if (isReal) {
         const actualClob = await refreshClobBalance();
+        if (actualClob < 0) {
+          // Balance API failed — do NOT place any orders this tick
+          ctx.log("BALANCE FETCH FAILED — skipping order placement this tick", { level: "warning" });
+          continue; // skip this window's orders entirely
+        }
         clobFreeBalance = Math.min(actualClob, capitalBudget);
       } else {
         clobFreeBalance = capitalBudget;
@@ -1856,7 +1861,8 @@ class BabyBoneRStrategy implements Strategy {
                   }
                   this.setRealOrderId(w, side, level, null);
                 } else {
-                  this.setRealOrderId(w, side, level, null);
+                  // Cancel failed — order might still be on CLOB. DON'T clear the slot.
+                  ctx.log(`CANCEL FAILED: ${side} ${levelLabel} — order may still be live, keeping slot`, { level: "warning" });
                 }
               } else {
                 continue; // price close enough, keep existing order
