@@ -2253,6 +2253,11 @@ class BabyBoneRStrategy implements Strategy {
       this.unsubscribeClobWindow(removed);
       delete this.custom.windowRefPrices[removed.market.conditionId];
     }
+    // Clear reconciliation flag when windows are resolved — prevents flag from
+    // being permanently stuck when old window's orders disappear with the window
+    if (toRemove.length > 0) {
+      this.hasUnreconciledOrders = false;
+    }
   }
 
   // ── Snapshot Recording ────────────────────────────────────────────
