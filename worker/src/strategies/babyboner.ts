@@ -94,6 +94,10 @@ export interface BabyBoneRParams {
   br_uncertain_range: number;        // P_true within 0.50 ± this is "uncertain" (default 0.10)
   br_ladder_levels: number;          // number of bid levels per side (default 4: deep, value, mid, fair)
 
+  // Dry run: execute all real-mode logic but don't actually place/cancel CLOB orders.
+  // Logs what WOULD happen. Use mode="real" + dry_run=true.
+  dry_run?: boolean;
+
   // Capital cap
   capital_cap_usd?: number;          // max working capital — excess locked as profit
 
@@ -1829,7 +1833,23 @@ class BabyBoneRStrategy implements Strategy {
               continue; // skip this level — not enough budget
             }
             try {
-              ctx.log(`ORDER: ${side} ${levelLabel} $${roundedBid} sz=${fillSize} cost=$${orderCost.toFixed(1)} budget=$${budgetRemaining.toFixed(1)}${isReal ? " clob=$" + clobFreeBalance.toFixed(1) : ""}`, { level: "signal" });
+              const dryRun = !!params.dry_run;
+              ctx.log(`${dryRun ? "DRY " : ""}ORDER: ${side} ${levelLabel} $${roundedBid} sz=${fillSize} cost=$${orderCost.toFixed(1)} budget=$${budgetRemaining.toFixed(1)} clob=$${clobFreeBalance.toFixed(1)}`, { level: "signal" });
+
+              if (dryRun) {
+                // Dry run: simulate what would happen without touching the CLOB
+                // Check if bid crosses ask — would fill immediately
+                const bookForDry = await this.getBookCached(ctx, tokenId);
+                const bestAskDry = this.getBestAsk(bookForDry);
+                if (bestAskDry !== null && roundedBid >= bestAskDry) {
+                  ctx.log(`DRY FILL: ${side} ${levelLabel} WOULD fill ${fillSize}@$${bestAskDry.toFixed(3)} (bid $${roundedBid} >= ask $${bestAskDry.toFixed(3)})`, { level: "signal" });
+                } else {
+                  ctx.log(`DRY RESTING: ${side} ${levelLabel} WOULD rest at $${roundedBid} (ask=${bestAskDry?.toFixed(3) ?? "none"})`, { level: "signal" });
+                }
+                tickCapitalCommitted += orderCost;
+                continue;
+              }
+
               const result = await ctx.api.placeOrder({
                 token_id: tokenId,
                 side: "BUY",

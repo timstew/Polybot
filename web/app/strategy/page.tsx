@@ -152,6 +152,7 @@ const STRATEGY_DEFAULTS: Record<string, { description: string; tickInterval: num
       { key: "observation_seconds", label: "Observation (s)", type: "number", default: 0, tip: "Seconds to observe before entering" },
       { key: "profit_reinvest_pct", label: "Reinvest %", type: "number", default: 0.75, tip: "Fraction of profits to reinvest (0-1)" },
       { key: "capital_cap_usd", label: "Capital Cap ($)", type: "number", default: undefined as unknown as number, tip: "Max working capital — profits above this are locked. Empty = no cap." },
+      { key: "dry_run", label: "Dry Run", type: "boolean", default: false, tip: "Real mode logic but no actual CLOB orders. Logs what WOULD happen." },
       { key: "max_skew_ratio", label: "Max Skew Ratio", type: "number", default: 0.9, tip: "Stop buying heavy side above this ratio" },
       { key: "skew_guard_min_tokens", label: "Skew Guard Min", type: "number", default: 50, tip: "Min tokens before skew guard activates" },
       { key: "buy_cooldown_ms", label: "Buy Cooldown (ms)", type: "number", default: 0, tip: "Min ms between buys (paper mode)" },
