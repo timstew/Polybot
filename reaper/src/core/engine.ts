@@ -385,21 +385,34 @@ async function processShadowFills(): Promise<void> {
 
   // Match BR fills against our resting paper orders
   const openOrders = ledger.getOpenOrders();
-  for (const order of openOrders) {
-    if (!order.clob_order_id?.startsWith("paper-")) continue;
+  const paperOrders = openOrders.filter(o => o.clob_order_id?.startsWith("paper-"));
+  if (brCache.length > 0 && paperOrders.length > 0) {
+    const sampleBr = brCache[0];
+    const sampleOrder = paperOrders[0];
+    logActivity("SHADOW_DBG", `BR: ${brCache.length} fills (sample: slug=${sampleBr.slug.slice(-15)} ${sampleBr.side} $${sampleBr.price.toFixed(2)}) | Orders: ${paperOrders.length} (sample: slug=${sampleOrder.window_slug.slice(-15)} ${sampleOrder.side} $${sampleOrder.price.toFixed(2)})`, {
+      level: "signal",
+    });
+  }
+  for (const order of paperOrders) {
 
     const w = windowMgr.getWindow(order.window_slug);
-    if (!w || w.status !== "ACTIVE") continue;
+    if (!w) continue;
+    // Don't filter by window status — BR fills for recently-expired windows are still valid
 
     // Find BR fills for this window+side that our bid covers
+    const enteredAtMs = w.entered_at ? new Date(w.entered_at + "Z").getTime() : 0; // append Z for UTC
     const matching = brCache.filter(br =>
       br.slug === order.window_slug &&
       br.side === (order.side as string) &&
       order.price >= br.price &&
-      br.timestamp * 1000 >= new Date(w.entered_at || "").getTime()
+      br.timestamp * 1000 >= enteredAtMs
     );
 
     if (matching.length === 0) continue;
+    logActivity("SHADOW_MATCH", `${order.side} L${order.ladder_level}: ${matching.length} BR fills match (bid=$${order.price} covers). Processing...`, {
+      windowSlug: order.window_slug, side: order.side, level: "trade",
+    });
+    console.log(`[SHADOW] ${matching.length} matches for ${order.side} L${order.ladder_level} in ${order.window_slug.slice(-15)}`);
 
     // Grant shadow fill at BR's price and size
     for (const br of matching) {
