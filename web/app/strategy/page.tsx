@@ -2383,10 +2383,11 @@ export default function StrategyPage() {
           </Card>
           <Card>
             <CardContent className="pt-4 pb-3 px-4">
-              <Tip tip="Capital currently deployed across all running real-mode strategies">
+              <Tip tip="Total value of all positions at current market prices (active windows + pending resolution)">
                 <div className="cursor-help">
-                  <p className="text-xs text-muted-foreground">Deployed</p>
-                  <p className="text-xl font-bold">{fmt(deployedCapital)}</p>
+                  <p className="text-xs text-muted-foreground">In Positions</p>
+                  <p className="text-xl font-bold">{fmt((walletOverview as Record<string, unknown>).positions_value as number ?? deployedCapital)}</p>
+                  <p className="text-xs text-muted-foreground">{(walletOverview as Record<string, unknown>).positions_count ?? 0} positions</p>
                 </div>
               </Tip>
             </CardContent>

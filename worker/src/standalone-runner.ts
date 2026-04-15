@@ -1020,36 +1020,33 @@ function startServer(port: number, pythonApiUrl: string) {
           // Delegate to Python API which reads on-chain USDC + Data API positions in one snapshot.
           // This avoids double-counting during redemptions (CLOB balance updates before positions disappear).
           const overview = await fetch(`${pyUrl}/api/strategy/wallet-overview`).then(r => r.json()).catch(() => ({})) as Record<string, unknown>;
+          // On-chain USDC = ground truth (includes CLOB-locked order capital)
           const usdc = (overview.usdc_balance as number) || 0;
+          const clobBalance = (overview.clob_balance as number) || 0;
           const unredeemed = (overview.unredeemed_value as number) || 0;
           const pendingWinsValue = (overview.pending_wins_value as number) || 0;
           const pendingWinsCount = (overview.pending_wins_count as number) || 0;
           const unredeemedCount = (overview.unredeemed_count as number) || 0;
+          const positionsValue = (overview.positions_value as number) || 0;
+          const positionsCount = (overview.positions_count as number) || 0;
 
-          // Also get deployed capital from active strategy windows (not in Python API)
-          let deployedCapital = 0;
-          for (const [, inst] of instances) {
-            if (inst.config.mode === "real") {
-              deployedCapital += inst.state.capital_deployed || 0;
-            }
-          }
-
-          // Total = USDC + unredeemed + pending wins + deployed (don't double-count deployed — it's already in USDC via CLOB allowance)
-          // Actually deployed capital is NOT in USDC balance — it's locked in resting orders.
-          // But the CLOB balance already excludes locked order capital. So total = usdc + unredeemed + pending + deployed.
-          // No: deployed is the cost of TOKENS we hold, which aren't in USDC or positions.
-          // Active window tokens haven't resolved yet, so they're not in unredeemed_value.
-          // For now, just use: usdc + unredeemed + pending_wins (deployed is in USDC or in open positions already).
+          // Total = on-chain USDC + ALL position values at current market price.
+          // This is the true "what is everything worth right now" number.
+          // On-chain USDC includes capital locked by resting CLOB orders.
+          // Positions value includes active windows, pending wins, and worthless losers.
           jsonResponse(res, {
             usdc_balance: usdc,
-            total_balance: Math.round((usdc + unredeemed + pendingWinsValue) * 100) / 100,
+            total_balance: Math.round((usdc + positionsValue) * 100) / 100,
             unredeemed_value: unredeemed,
             unredeemed_count: unredeemedCount,
             pending_wins_value: pendingWinsValue,
             pending_wins_count: pendingWinsCount,
+            positions_value: positionsValue,
+            positions_count: positionsCount,
+            clob_balance: clobBalance,
             pol_balance: (overview.pol_balance as number) || 0,
             wallet_address: (overview.wallet_address as string) || "",
-            position_count: unredeemedCount + pendingWinsCount,
+            position_count: positionsCount,
             redeemable_count: unredeemedCount,
           });
         } catch (e) {

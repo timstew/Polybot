@@ -1911,10 +1911,11 @@ def strategy_wallet_overview():
     except Exception as e:
         logger.warning("On-chain USDC balance fetch failed: %s", e)
 
-    # Use CLOB balance for totals (conservative — doesn't include pending redeems)
-    # Fall back to on-chain if CLOB unavailable
-    result["usdc_balance"] = clob_balance if clob_balance > 0 else onchain_balance
+    # USDC balance: on-chain is the ground truth (includes CLOB-locked order capital).
+    # CLOB "free balance" is a subset — only what's available for NEW orders.
+    result["usdc_balance"] = onchain_balance if onchain_balance > 0 else clob_balance
     result["onchain_balance"] = onchain_balance
+    result["clob_balance"] = clob_balance
 
     # POL (native token) balance
     try:
@@ -1951,6 +1952,14 @@ def strategy_wallet_overview():
         result["unredeemed_value"] = round(sum(float(p.get("size", 0)) for p in redeemable), 2)
         result["pending_wins_count"] = len(pending_wins)
         result["pending_wins_value"] = round(sum(float(p.get("size", 0)) for p in pending_wins), 2)
+
+        # Total value of ALL positions (at current market price) — shows deployed capital
+        all_position_value = sum(
+            float(p.get("size", 0)) * float(p.get("curPrice", 0))
+            for p in all_positions
+        )
+        result["positions_value"] = round(all_position_value, 2)
+        result["positions_count"] = len(all_positions)
     except Exception as e:
         logger.warning("Positions fetch failed: %s", e)
         result["unredeemed_count"] = 0
