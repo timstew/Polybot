@@ -1729,7 +1729,7 @@ class BabyBoneRStrategy implements Strategy {
                 this.setRealOrderId(w, checkSide, lvl, null);
               } else if (st.status === "LIVE") {
                 allReconciled = false; // still resting — don't place new orders yet
-              } else if (st.status === "CANCELLED") {
+              } else if (st.status === "CANCELLED" || st.status === "CANCELED") {
                 const lockedCost = this.getRealOrderPrice(w, checkSide, lvl) * params.maker_bid_size;
                 adjustClobBalance(lockedCost);
                 this.setRealOrderId(w, checkSide, lvl, null);
@@ -1752,11 +1752,16 @@ class BabyBoneRStrategy implements Strategy {
       const capitalBudget = Math.max(0, this.effectiveCapital - totalDeployed);
       let clobFreeBalance: number;
       if (isReal) {
-        const actualClob = await refreshClobBalance();
-        if (actualClob < 0) {
-          // Balance API failed — do NOT place any orders this tick
-          ctx.log("BALANCE FETCH FAILED — skipping order placement this tick", { level: "warning" });
-          continue; // skip this window's orders entirely
+        // Use the shared balance cache (polled every 30s). Only force-refresh if stale.
+        // Calling refreshClobBalance every 100ms tick overwhelms the Python API.
+        let actualClob = getClobBalance();
+        if (actualClob <= 0) {
+          // Stale or unknown — try one refresh
+          actualClob = await refreshClobBalance();
+          if (actualClob < 0) {
+            ctx.log("BALANCE FETCH FAILED — skipping order placement this tick", { level: "warning" });
+            continue;
+          }
         }
         clobFreeBalance = Math.min(actualClob, capitalBudget);
       } else {
@@ -1834,7 +1839,7 @@ class BabyBoneRStrategy implements Strategy {
                 const actualCost = fillPrice * fillSz;
                 if (lockedCost !== actualCost) adjustClobBalance(lockedCost - actualCost); // refund or deduct difference
               }
-            } else if (status.status === "CANCELLED") {
+            } else if (status.status === "CANCELLED" || status.status === "CANCELED") {
               // Order confirmed cancelled — safe to clear and refund
               if (isReal) {
                 const lockedCost = this.getRealOrderPrice(w, side, level) * params.maker_bid_size;
@@ -1871,11 +1876,15 @@ class BabyBoneRStrategy implements Strategy {
           }
 
           // Place new GTC order if no order resting AND previous orders are reconciled
+          if (this.hasUnreconciledOrders && ctx.state.ticks % 50 === 0) {
+            ctx.log(`BLOCKED: hasUnreconciledOrders=true — not placing ${side} ${levelLabel}`, { level: "warning" });
+          }
           if (!this.getRealOrderId(w, side, level) && !this.hasUnreconciledOrders) {
             // Capital budget: don't commit more than effective capital across all orders this tick
             const orderCost = roundedBid * fillSize;
             const budgetRemaining = clobFreeBalance - tickCapitalCommitted;
             if (orderCost > budgetRemaining) {
+              if (ctx.state.ticks % 50 === 0) ctx.log(`BUDGET SKIP: ${side} ${levelLabel} cost=$${orderCost.toFixed(1)} > budget=$${budgetRemaining.toFixed(1)} (clob=$${clobFreeBalance.toFixed(1)} committed=$${tickCapitalCommitted.toFixed(1)})`, { level: "warning" });
               continue; // skip this level — not enough budget
             }
             try {
