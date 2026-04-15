@@ -1675,10 +1675,27 @@ def strategy_place_order(body: dict):
             if order_id:
                 try:
                     order_info = client.get_order(order_id)
-                    if order_info and order_info.get("status") == "MATCHED":
+                    # py_clob_client can return a string — parse it
+                    if isinstance(order_info, str):
+                        try:
+                            import json as _json
+                            order_info = _json.loads(order_info)
+                        except Exception:
+                            order_info = None
+                    if order_info and isinstance(order_info, dict) and order_info.get("status") == "MATCHED":
                         matched_size = float(order_info.get("size_matched", 0))
                         # Use associate_trades for actual execution price (not the limit price)
-                        trades_list = order_info.get("associate_trades", [])
+                        raw_trades = order_info.get("associate_trades", [])
+                        trades_list = []
+                        for t in (raw_trades or []):
+                            if isinstance(t, str):
+                                try:
+                                    import json as _json2
+                                    trades_list.append(_json2.loads(t))
+                                except Exception:
+                                    pass
+                            elif isinstance(t, dict):
+                                trades_list.append(t)
                         if trades_list:
                             # Volume-weighted average price across all partial fills
                             total_cost = sum(float(t.get("price", 0)) * float(t.get("size", 0)) for t in trades_list)
@@ -1781,9 +1798,29 @@ def strategy_order_status(order_id: str):
         order = client.get_order(order_id)
         if order is None:
             return {"order_id": order_id, "status": "UNKNOWN", "size_matched": 0, "original_size": 0, "price": 0}
+        # py_clob_client can return a string if the CLOB returns non-JSON — parse it
+        if isinstance(order, str):
+            try:
+                import json as _json
+                order = _json.loads(order)
+            except Exception:
+                return {"order_id": order_id, "status": "ERROR", "error": f"CLOB returned non-dict: {order[:100]}"}
+        if not isinstance(order, dict):
+            return {"order_id": order_id, "status": "ERROR", "error": f"Unexpected type: {type(order).__name__}"}
         # For filled orders, compute actual execution price from associate_trades
         exec_price = float(order.get("price", 0))
-        trades_list = order.get("associate_trades", [])
+        raw_trades = order.get("associate_trades", [])
+        # associate_trades can be a list of dicts or strings — normalize
+        trades_list = []
+        for t in (raw_trades or []):
+            if isinstance(t, str):
+                try:
+                    import json as _json
+                    trades_list.append(_json.loads(t))
+                except Exception:
+                    pass
+            elif isinstance(t, dict):
+                trades_list.append(t)
         if trades_list and order.get("status") == "MATCHED":
             total_cost = sum(float(t.get("price", 0)) * float(t.get("size", 0)) for t in trades_list)
             total_size = sum(float(t.get("size", 0)) for t in trades_list)
