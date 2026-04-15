@@ -1729,11 +1729,14 @@ class BabyBoneRStrategy implements Strategy {
                 this.setRealOrderId(w, checkSide, lvl, null);
               } else if (st.status === "LIVE") {
                 allReconciled = false; // still resting — don't place new orders yet
-              } else {
-                // CANCELLED, ERROR, UNKNOWN — clear the slot, refund
+              } else if (st.status === "CANCELLED") {
                 const lockedCost = this.getRealOrderPrice(w, checkSide, lvl) * params.maker_bid_size;
                 adjustClobBalance(lockedCost);
                 this.setRealOrderId(w, checkSide, lvl, null);
+              } else {
+                // ERROR or UNKNOWN — don't clear, don't place new orders, retry next tick
+                allReconciled = false;
+                ctx.log(`RECONCILE ERROR: ${checkSide} L${lvl} status=${st.status}. Will retry.`, { level: "warning" });
               }
             }
           }
@@ -1826,13 +1829,17 @@ class BabyBoneRStrategy implements Strategy {
                 const actualCost = fillPrice * fillSz;
                 if (lockedCost !== actualCost) adjustClobBalance(lockedCost - actualCost); // refund or deduct difference
               }
-            } else if (status.status === "ERROR" || status.status === "UNKNOWN" || status.status === "CANCELLED") {
-              // Order gone from CLOB — refund locked capital
+            } else if (status.status === "CANCELLED") {
+              // Order confirmed cancelled — safe to clear and refund
               if (isReal) {
                 const lockedCost = this.getRealOrderPrice(w, side, level) * params.maker_bid_size;
-                adjustClobBalance(lockedCost); // return locked capital
+                adjustClobBalance(lockedCost);
               }
               this.setRealOrderId(w, side, level, null);
+            } else if (status.status === "ERROR" || status.status === "UNKNOWN") {
+              // API error — DON'T clear the slot. The order might still be live on the CLOB.
+              // Clearing would orphan it. Retry next tick.
+              ctx.log(`ORDER STATUS ERROR: ${side} ${levelLabel} oid=${existingId.slice(0,16)} — ${status.status}. Retrying next tick.`, { level: "warning" });
             } else {
               // Still resting (LIVE) — check if price drifted enough to requote
               const existingPrice = this.getRealOrderPrice(w, side, level);
