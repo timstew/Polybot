@@ -12,6 +12,7 @@ import { initDb, logActivity } from "./db.js";
 import { userWs } from "./feeds/user-ws.js";
 import { processUserWsFill } from "./orders/fill-processor.js";
 import { cancelAllOrders } from "./orders/order-placer.js";
+import { startApiServer } from "./api-server.js";
 
 const PYTHON_API_URL = process.env.PYTHON_API_URL || "http://127.0.0.1:8000";
 
@@ -60,8 +61,12 @@ async function main() {
   // 8. Start reconciliation loop (30s)
   // 9. Start HTTP API server for dashboard
 
-  console.log("\n[STARTUP] Phase 1 complete — order infrastructure ready");
-  console.log("[STARTUP] Remaining: feeds, strategy engine, reconciler, dashboard");
+  // Start the dashboard + API server
+  const port = parseInt(process.env.PORT || "3001", 10);
+  startApiServer(port);
+
+  console.log("\n[STARTUP] Phase 1 complete — order infrastructure + dashboard ready");
+  console.log("[STARTUP] Remaining: feeds, strategy engine, reconciler");
 
   // Graceful shutdown
   const shutdown = async () => {
