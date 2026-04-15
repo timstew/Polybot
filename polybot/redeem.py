@@ -11,6 +11,7 @@ Requires env vars:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 
@@ -256,8 +257,9 @@ def merge_positions(
     if not pk or not address:
         return {"status": "failed", "error": "Missing POLYMARKET_PRIVATE_KEY or POLYMARKET_FUNDER_ADDRESS"}
 
-    # amount in token units → raw (×1e6 for USDC decimals)
-    int_amount = int(amount * 1e6)
+    # amount in token units → raw (×1e6 for conditional token decimals)
+    # Floor slightly to avoid "subtraction overflow" from fractional rounding
+    int_amount = int(math.floor(amount * 1e6 * 0.999))  # 0.1% safety margin
     if int_amount <= 0:
         return {"status": "failed", "error": f"Invalid amount: {amount}"}
 
