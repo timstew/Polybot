@@ -7,6 +7,9 @@
 > Source of truth for BR behavior: [../BONEREAPER-ANALYSIS.md](../BONEREAPER-ANALYSIS.md).
 > When we learn new things about BR, update that doc first, then cross-reference
 > the relevant roadmap item.
+>
+> How fills work today: [FILL-SYSTEM.md](./FILL-SYSTEM.md) — queue-sim, tape
+> gap-filler, taker fees, reprice logic.
 
 ## Current State (April 18, 2026)
 
