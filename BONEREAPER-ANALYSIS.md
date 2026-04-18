@@ -2,9 +2,9 @@
 
 > Consolidated analysis of Bonereaper (`0xeebde7a0e019a63e6b476eb425505b7b3e6eba30`), a profitable automated trader on Polymarket's crypto "Up or Down" binary markets.
 >
-> Data sources: 982 trades across 11 windows (initial analysis, early April), 192 trades cross-referenced with oracle data (April 9 correlation study), 10,000 trade live pull (April 11 via Data API), position snapshot (April 11), BabyBoneR replication testing (April 11).
+> Data sources: 982 trades across 11 windows (initial analysis, early April), 192 trades cross-referenced with oracle data (April 9 correlation study), 10,000 trade live pull (April 11 via Data API), position snapshot (April 11), BabyBoneR replication testing (April 11). **April 18, 2026: 805,783 on-chain fills via Goldsky subgraph (see Section 13) — the first full-history dataset.**
 >
-> Last updated: April 14, 2026 (evening). Added Section 12 (5m vs 15m window analysis), updated Section 10 (multi-level bid ladder), Section 11 (real-mode lessons learned). Previous major revision April 12 overturned fixed-offset model.
+> Last updated: April 18, 2026. **Added Section 13 (Goldsky refresh) — refines the "zero sells" claim (true for current strategy from March 28+, but the wallet DID sell aggressively as taker March 25–27), refreshes fill-price distribution with 2,500× more data, records $7.3M net long-USDC flow over 7 days.** Previous revision April 14 added Sections 10-12 from 55K /activity records; April 12 overturned fixed-offset model.
 
 ---
 
@@ -25,7 +25,14 @@ Pulled 10,000 most recent trades + 25 open positions directly from the Data API.
 | Sell count | **0 out of 9,800** | Exits ONLY via merge+redeem |
 | Tokens per window | 30,000-90,000 | Massive volume per window |
 
-### Zero Sells — Confirmed
+### Zero Sells — REFINED (April 18, 2026)
+
+> **Not so simple.** Goldsky subgraph full-history (see §13) reveals BR's
+> wallet had a March 25–27 phase with 270K taker sells (33% of activity then).
+> From March 28 onward, taker sells drop to ZERO and the wallet goes pure
+> maker-buy. The original "zero sells" observation was done April 11+ and
+> reflects the post-March-28 strategy correctly. Treat "zero sells" as a
+> property of the **current** strategy, not the wallet's full history.
 
 Across the full 3,000 accessible items (2.5 hours, API max), there are ZERO sell trades. All exits are via MERGE (token pairs → $1.00 USDC) and REDEEM (winning tokens → $1.00 at resolution).
 
@@ -162,8 +169,9 @@ Polymarket has two reward programs relevant to Bonereaper's strategy:
 
 | Claim | Status | Evidence |
 |-------|--------|----------|
-| Zero sells | **Confirmed** | 10,000 trade sample, zero sell orders |
-| Merge + redeem exit | **Confirmed** | Only exit mechanism observed |
+| Zero sells (current strategy) | **Confirmed** | Goldsky shows zero taker-sells from March 28 onward (§13) |
+| Zero sells (full wallet history) | **False** | Mar 25–27 had 270K taker-sells; strategy changed around Mar 28 (§13) |
+| Merge + redeem exit | **Confirmed (current)** | Primary exit since Mar 28; pre-Mar-28 the wallet also sold (§13) |
 | Both UP and DOWN sides | **Confirmed** | Buys both, 30-90% paired depending on P_true stability |
 | Fixed bid levels ($0.72/$0.28) | **OVERTURNED** | Live monitoring shows dynamic pricing ~$0.50 at open, follows P_true |
 | High frequency | **Confirmed** | 200-800 tokens per 5m window |
@@ -470,3 +478,99 @@ Bonereaper trades both 5m and 15m concurrently. The 15m windows provide:
 3. **Diversification** — not all windows resolve the same way
 
 At Bonereaper's scale (30K-90K tokens/window), the occasional 15m loss is absorbed easily. At small scale ($50-100), the same loss could wipe out a significant portion of capital.
+
+---
+
+## 13. Goldsky Subgraph Refresh (April 18, 2026) — Full-History Ground Truth
+
+Backfilled BR's complete on-chain `orderFilledEvent` history from the public
+Polymarket orderbook subgraph. **805,783 events across March 25 – April 1
+(~7 days)**; cron continues catching up to present. First dataset with
+every BR fill, not samples.
+
+Tooling: `reaper/src/analysis/goldsky-backfill.ts` (TS-only, sticky-cursor
+pagination). See `reaper/FILL-SYSTEM.md` for architecture.
+
+### Two Regimes Discovered
+
+BR's wallet splits into two behavioral regimes in this 7-day window:
+
+| Period | Events | Buys-as-maker | Buys-as-taker | Sells-as-taker | Sells-as-maker |
+|---|---|---|---|---|---|
+| 2026-03-25 | 124,905 | 41,355 | 6,882 | 76,668 | 0 |
+| 2026-03-26 | 173,033 | 64,623 | 9,987 | 98,422 | 1 |
+| 2026-03-27 | 174,087 | 71,765 | 10,303 | 92,019 | 0 |
+| 2026-03-28 | 69,609 | 69,609 | 0 | 0 | 0 |
+| 2026-03-29 | 51,035 | 51,035 | 0 | 0 | 0 |
+| 2026-03-30 | 103,783 | 103,783 | 0 | 0 | 0 |
+| 2026-03-31 | 89,326 | 86,491 | 0 | 0 | 2,835 |
+| 2026-04-01 | 20,005 | 19,945 | 0 | 0 | 60 |
+
+- **March 25–27:** Active dual-sided trader. ~33% of events are taker sells
+  (267,109 total). This is clearly NOT the "zero sells" strategy described in
+  earlier sections.
+- **March 28 onward:** Strategy flip. Pure maker-buy mode — zero taker sells,
+  zero taker activity at all except rare maker-side sells (likely residual
+  position management, not active strategy).
+
+The original analysis observations (April 9–14) were all during the
+post-March-28 "pure maker" regime. Those findings (zero sells, merge+redeem
+exit, maker-rebate optimization) reflect that regime and remain valid for it.
+Everything needs the caveat: **BR's strategy has changed at least once; it
+may change again.**
+
+### Refined Fill-Price Distribution (508K maker-buy fills, 2,500× larger sample)
+
+| Price range | Fills | % | Tokens | Notional (USDC) | Avg price |
+|---|---|---|---|---|---|
+| $0.01–0.20 (deep value) | 97,288 | 19.1% | 3,266,858 | $311,588 | 0.115 |
+| $0.21–0.40 (value) | 108,683 | 21.4% | 2,326,229 | $711,227 | 0.307 |
+| $0.41–0.60 (near fair) | 148,058 | **29.1%** | 3,308,346 | $1,679,811 | 0.507 |
+| $0.61–0.80 (above fair) | 97,538 | 19.2% | 2,387,283 | $1,669,605 | 0.696 |
+| $0.81–0.95 (high conviction) | 44,776 | 8.8% | 1,835,769 | $1,624,505 | 0.872 |
+| $0.96–0.99 (panic late) | 12,263 | 2.4% | 3,178,608 | $3,135,172 | 0.985 |
+
+**Key corrections vs the 200-fill sample (§10):**
+
+- **Near-fair is the largest bucket, not deep value.** 29.1% of fills at $0.41–
+  0.60 vs the prior claim of 15%. Most BR activity is around fair price, not
+  cheap panic-buying.
+- **Panic-late bucket exists and is enormous.** The original sample found 0 fills
+  at $0.96–0.99. Goldsky shows 12K fills there with **3.18M tokens / $3.14M
+  notional** — nearly 19% of all BR's token volume comes from this tiny-count
+  bucket. These are massive late-window "certainty loads" at prices guaranteeing
+  tiny profits but no loss (token resolving at $1.00 in seconds). This is the
+  real "end-of-window" behavior, not the 0.81–0.95 bucket.
+- **Average price is NOT $0.21.** Notional-weighted average is ~$0.56 — BR's
+  dollars go mostly to near-fair and high-conviction buys, not to pennies.
+
+### Net Position Flow
+
+Over 7 days, BR paid a net **$7.3M USDC** to acquire outcome tokens — massively
+net long. Gross maker-paid USDC: $11.74M; gross taker-paid USDC: $21.0M.
+Consistent with the "accumulate, merge, redeem" strategy pattern.
+
+### Fee Field Ground Truth
+
+The Goldsky `fee` field contains real on-chain fee values but **denomination is
+not yet decoded**. Sample values:
+- At price=$0.50, size=40 tokens, maker_amount=$20 USDC → fee=4.0 (units unclear;
+  the ~20% ratio to maker_amount is too high to be a flat 6.25% crypto-market fee)
+- Several distinct "fee_bps / maker_amount" clusters (2000, 1884, 1673, 1578…)
+  suggest per-order `feeRateBps` parameters, not a flat market rate
+
+Decoding this properly is a ROADMAP Phase 4.10 follow-up. The `fee` field is
+ground truth for what Polymarket actually charged — once decoded, it replaces
+our modeled `p*(1-p)*0.0625*size` formula for paper P&L.
+
+### Data Limitations
+
+- **Only 7 days covered so far (Mar 25 – Apr 1).** Cron is backfilling to
+  present; the Goldsky server rate-limits heavy queries so we catch up slowly.
+- **No window context yet.** Goldsky events carry `maker_asset_id` (the outcome
+  token) but not the market slug or window boundaries. Late-window / phase /
+  5m-vs-15m analyses (§10 phase-three model, §12 window-duration comparison)
+  still need the `token_id → market` lookup that's pending (ROADMAP Phase 4.11).
+- **Wallet rotation risk.** This wallet has already changed strategies once
+  (Mar 25-27 → Mar 28+). A second rotation to a fresh wallet would make these
+  findings historical overnight. Rotation detector is ROADMAP Phase 4.9.
