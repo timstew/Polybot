@@ -265,6 +265,107 @@ Total: 47 tests directly covering the fill system. Full reaper suite:
 
 ---
 
+## Goldsky Backfill (Deep Historical Fill Data)
+
+The Polymarket orderbook contract emits an event on every fill. Goldsky
+indexes these via a public subgraph. We pull them into `goldsky_trades` for
+wallets we care about (BR + our own funder address) and use that data for
+analysis, not live fill decisions.
+
+### Why
+
+- Data API `/activity` polling returns only the last 200 events per wallet,
+  aging out long-window trades. Goldsky gives the full history.
+- Every event includes the real on-chain `fee` field — ground truth for
+  measuring maker rebates vs our formula.
+- Richer than what we observe live: we only see windows we were subscribed
+  to; Goldsky covers every window BR traded, even ones we missed.
+
+### Architecture
+
+```
+Cron (engine.ts, 5min default)
+  │
+  └─▶ backfillAll()  ── src/analysis/goldsky-backfill.ts
+        │
+        │  for each wallet in goldsky_wallets config:
+        │    for each role in {maker, taker}:
+        │
+        └─▶ backfillWalletRole(wallet, role)
+              │
+              ├─ Load cursor from goldsky_cursor table
+              ├─ Loop: fetchOrderFilledEvents(cursor, {makerEq | takerEq})
+              │     ↕ GraphQL over HTTPS to public Goldsky endpoint
+              ├─ advanceCursor() — sticky-cursor state machine
+              ├─ INSERT OR IGNORE into goldsky_trades (id is unique)
+              └─ saveCursor() on every batch
+```
+
+### Sticky-cursor pattern
+
+Many fills land at the same unix-second timestamp (especially at window
+boundaries). Naive `timestamp_gt: X` pagination skips events within the
+boundary second. Sticky cursor handles it:
+
+- Normal: `timestamp_gt: X` — advance
+- Full batch with all events at the same ts → sticky at that ts, paginate
+  by `id_gt: Y`
+- Full batch with mixed ts → sticky at last ts (may still have pending
+  events at the boundary)
+- Partial batch while sticky → timestamp exhausted, advance past it
+
+Unit tests in `tests/goldsky-feed.test.ts` cover every transition.
+
+### Tables
+
+`goldsky_trades` — raw orderFilledEvent dump:
+```
+id TEXT PRIMARY KEY, timestamp INTEGER, maker TEXT, maker_asset_id TEXT,
+maker_amount_filled TEXT (raw uint256; divide by 1e6 for USDC),
+taker, taker_asset_id, taker_amount_filled, fee, order_hash,
+transaction_hash, tracked_wallet TEXT, role TEXT CHECK IN('maker','taker')
+```
+
+`goldsky_cursor` — resume state:
+```
+wallet, role, last_timestamp, last_id, sticky_timestamp
+PRIMARY KEY (wallet, role)
+```
+
+### Config
+
+| Key | Default | Purpose |
+|---|---|---|
+| `goldsky_enabled` | `true` | Kill-switch for the cron |
+| `goldsky_wallets` | BR address | CSV of wallets to track |
+| `goldsky_interval_ms` | `300000` (5m) | Backfill cadence |
+
+`POLYMARKET_FUNDER_ADDRESS` env var, if set, is auto-appended to
+`goldsky_wallets` on startup.
+
+### CLI
+
+```bash
+# Backfill a specific wallet, exit when caught up
+bun src/analysis/goldsky-backfill.ts --wallet=0xeebde7… --once
+
+# Backfill all configured wallets, then run forever at goldsky_interval_ms
+bun src/analysis/goldsky-backfill.ts
+
+# Limit batches per invocation (default 200 in CLI, 20 in engine cron)
+bun src/analysis/goldsky-backfill.ts --once --max-batches=10
+```
+
+### BR Wallet Rotation
+
+If BR moves to a new wallet, add it to `goldsky_wallets` and the backfill
+picks up the new history automatically. Old wallet data stays queryable —
+we don't delete.
+
+A helpful heuristic for detecting rotation: when fill activity on the
+tracked BR address drops for N consecutive windows, log a warning. Not yet
+implemented — captured as a follow-up in ROADMAP.md (Phase 4 area).
+
 ## Known Limitations / Follow-Ups
 
 1. **Live calibration pending.** `queue_fill_mult` starts at 1.0 based on
@@ -284,3 +385,13 @@ Total: 47 tests directly covering the fill system. Full reaper suite:
    (`paper_fill_modes=grounded`) to rely on the queue-simmed path.
 5. **`bun --watch` dev mode disruption.** Each file save cancels all
    orders on restart. During active windows, expect brief fill gaps.
+6. **Goldsky wallet-rotation detection.** Nothing auto-flags when a tracked
+   wallet (BR) goes silent. Add a check: if no events for N consecutive
+   windows, log a warning + optionally suggest candidate replacements from
+   the top-volume wallets in recent goldsky_trades.
+7. **Goldsky token→market resolution.** The raw orderFilledEvent only has
+   asset IDs. Deriving which market/window each fill belongs to requires a
+   `asset_id → (condition_id, outcome)` lookup (Gamma API or cached table).
+   Analysis queries currently join on `asset_id` and cross-reference the
+   `windows` table for active windows; historical windows need a richer
+   lookup (deferred; see ROADMAP.md).

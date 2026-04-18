@@ -105,9 +105,25 @@ async function main() {
     discovery_interval_ms: "15000",
     // Shadow fills
     shadow_wallet: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
+    // Goldsky subgraph backfill
+    goldsky_enabled: "true",
+    goldsky_wallets: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30", // BR by default; our wallet is auto-appended below if env is set
+    goldsky_interval_ms: "300000", // 5 minutes
   };
   for (const [key, value] of Object.entries(defaults)) {
     if (!gc(key)) sc(key, value);
+  }
+
+  // Auto-append our own funder address to the goldsky_wallets list if set
+  const funder = process.env.POLYMARKET_FUNDER_ADDRESS?.toLowerCase();
+  if (funder) {
+    const current = (gc("goldsky_wallets") || "").toLowerCase();
+    const list = current.split(",").map(w => w.trim()).filter(Boolean);
+    if (!list.includes(funder)) {
+      list.push(funder);
+      sc("goldsky_wallets", list.join(","));
+      console.log(`[STARTUP] Added funder ${funder.slice(0, 10)}… to Goldsky backfill list`);
+    }
   }
 
   // 7. Start the strategy engine

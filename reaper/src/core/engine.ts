@@ -40,6 +40,7 @@ let running = false;
 let tickTimer: ReturnType<typeof setTimeout> | null = null;
 let reconcileTimer: ReturnType<typeof setInterval> | null = null;
 let boundaryTimer: ReturnType<typeof setTimeout> | null = null;
+let goldskyTimer: ReturnType<typeof setInterval> | null = null;
 let lastDiscoveryAt = 0;
 let priceHistory: number[] = [];
 
@@ -52,6 +53,7 @@ export function start(): void {
   scheduleTick();
   scheduleNextBoundary();
   reconcileTimer = setInterval(reconcile, RECONCILE_INTERVAL_MS);
+  scheduleGoldskyBackfill();
 
   // Connect market WebSocket for real-time per-token trade events.
   // Every trade on our subscribed tokens triggers instant grounded fill checking.
@@ -73,10 +75,38 @@ export async function stop(): Promise<void> {
   if (tickTimer) { clearTimeout(tickTimer); tickTimer = null; }
   if (boundaryTimer) { clearTimeout(boundaryTimer); boundaryTimer = null; }
   if (reconcileTimer) { clearInterval(reconcileTimer); reconcileTimer = null; }
+  if (goldskyTimer) { clearInterval(goldskyTimer); goldskyTimer = null; }
   marketWs.disconnect();
   flushTapeBuckets(); // persist any remaining tape data
   console.log("[ENGINE] Stopped");
   logActivity("ENGINE_STOP", "Strategy engine stopped");
+}
+
+/** Schedule periodic Goldsky backfill. Runs once at startup, then every N ms. */
+function scheduleGoldskyBackfill(): void {
+  const enabled = (getConfig("goldsky_enabled", "true") || "true") !== "false";
+  if (!enabled) return;
+  const interval = Math.max(60_000, parseInt(getConfig("goldsky_interval_ms", "300000") || "300000"));
+
+  const run = async () => {
+    if (!running) return;
+    try {
+      const { backfillAll } = await import("../analysis/goldsky-backfill.js");
+      const results = await backfillAll(20); // at most 20 batches per (wallet, role) per run
+      const total = results.reduce((s, r) => s + r.inserted, 0);
+      if (total > 0) {
+        console.log(`[GOLDSKY] +${total} events across ${results.length} (wallet, role) pairs`);
+      }
+    } catch (err) {
+      console.error("[GOLDSKY] Backfill error:", err);
+      logActivity("GOLDSKY_ERROR", String(err).slice(0, 200), { level: "warning" });
+    }
+  };
+
+  // Fire once shortly after startup (don't block engine start), then interval
+  setTimeout(run, 5_000).unref?.();
+  goldskyTimer = setInterval(run, interval);
+  console.log(`[ENGINE] Goldsky backfill scheduled (${interval}ms interval)`);
 }
 
 // Track last-known trade price per token for reprice detection

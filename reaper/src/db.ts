@@ -177,6 +177,42 @@ export function initDb(dbPath?: string): Database {
     CREATE INDEX IF NOT EXISTS idx_tape_buckets_token_ts ON tape_buckets(token_id, bucket_ts);
     CREATE INDEX IF NOT EXISTS idx_tape_buckets_slug ON tape_buckets(window_slug, bucket_ts);
 
+    -- Goldsky subgraph orderFilledEvents (deep historical fill data)
+    -- Raw dump keyed by event id; tracked_wallet tags which config wallet this
+    -- event belongs to (as maker or taker). Amounts are raw uint256 strings;
+    -- divide by 1e6 for USDC.
+    CREATE TABLE IF NOT EXISTS goldsky_trades (
+      id TEXT PRIMARY KEY,                -- Goldsky event id (unique)
+      timestamp INTEGER NOT NULL,         -- unix seconds
+      maker TEXT NOT NULL,
+      maker_asset_id TEXT NOT NULL,
+      maker_amount_filled TEXT NOT NULL,  -- raw (divide by 1e6)
+      taker TEXT NOT NULL,
+      taker_asset_id TEXT NOT NULL,
+      taker_amount_filled TEXT NOT NULL,
+      fee TEXT,
+      order_hash TEXT,
+      transaction_hash TEXT,
+      tracked_wallet TEXT NOT NULL,       -- the config wallet matched (lowercase)
+      role TEXT NOT NULL CHECK(role IN ('maker','taker')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_goldsky_wallet_ts ON goldsky_trades(tracked_wallet, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_goldsky_timestamp ON goldsky_trades(timestamp);
+
+    -- Resume cursor per (wallet, role). Sticky-cursor pattern: when a batch
+    -- is full and all events share the same timestamp, we paginate by id at
+    -- that timestamp until the timestamp is exhausted.
+    CREATE TABLE IF NOT EXISTS goldsky_cursor (
+      wallet TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('maker','taker')),
+      last_timestamp INTEGER NOT NULL DEFAULT 0,
+      last_id TEXT,
+      sticky_timestamp INTEGER,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (wallet, role)
+    );
+
     -- Per-tick window snapshots (for charts + drill-down)
     CREATE TABLE IF NOT EXISTS window_ticks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

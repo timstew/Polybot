@@ -259,6 +259,21 @@ Things BR doesn't do that we can exploit.
 - [ ] Red-flag windows where we systematically miss liquidity BR captures —
       this signals queue-position or sizing bugs early
 
+### 4.8 Goldsky Subgraph Backfill — DONE (scaffold)
+- [x] `src/feeds/goldsky-feed.ts` — GraphQL client with sticky-cursor
+      pagination (ported from warproxxx/poly_data; TS, zero Python deps)
+- [x] `src/analysis/goldsky-backfill.ts` — per-(wallet, role) orchestrator +
+      CLI; engine runs it on a 5min cron
+- [x] Tables: `goldsky_trades` (raw dump) + `goldsky_cursor` (resume state)
+- [x] 16 tests covering cursor state machine + backfill dedup + multi-wallet
+- [x] Live smoke test: pulled 4000 BR events in 1.2s across 6 batches
+- [ ] Analysis scripts that consume `goldsky_trades`:
+  - [ ] Refresh §10-12 stats in BONEREAPER-ANALYSIS.md from larger sample
+  - [ ] Fee-rebate estimate from real `fee` field (vs our formula)
+  - [ ] BR wallet rotation detector (no events for N windows → warn)
+  - [ ] Candidate-replacement finder (top-volume crypto wallets outside
+        our tracked list)
+
 ---
 
 ## Phase 5: Operational Maturity (before real money)
