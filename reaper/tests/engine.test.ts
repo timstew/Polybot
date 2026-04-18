@@ -152,6 +152,44 @@ describe("getEffectiveCapital: config + P&L, capped", () => {
   });
 });
 
+describe("shouldRepriceOrder: reprice decision invariants", () => {
+  test("bid price-improved within threshold is NOT cancelled", async () => {
+    // Regression: window btc-updown-5m-1776501300 had a $0.645 DN bid and
+    // BR traded DN at $0.64. Old logic cancelled the bid (order.price >
+    // event.price) even though gap was sub-threshold, stranding us before
+    // we could be filled by the next trade.
+    const { shouldRepriceOrder } = await import("../src/core/engine.js");
+    expect(shouldRepriceOrder(0.645, 0.640)).toBe(false);
+    expect(shouldRepriceOrder(0.60, 0.58)).toBe(false);
+    expect(shouldRepriceOrder(0.55, 0.54)).toBe(false);
+  });
+
+  test("bid far above trade IS cancelled (gap exceeds threshold)", async () => {
+    const { shouldRepriceOrder } = await import("../src/core/engine.js");
+    expect(shouldRepriceOrder(0.70, 0.60)).toBe(true);
+    expect(shouldRepriceOrder(0.65, 0.50)).toBe(true);
+  });
+
+  test("bid far below trade IS cancelled (stale, market moved up)", async () => {
+    const { shouldRepriceOrder } = await import("../src/core/engine.js");
+    expect(shouldRepriceOrder(0.50, 0.65)).toBe(true);
+    expect(shouldRepriceOrder(0.20, 0.50)).toBe(true);
+  });
+
+  test("bid within threshold either side is NOT cancelled", async () => {
+    const { shouldRepriceOrder } = await import("../src/core/engine.js");
+    expect(shouldRepriceOrder(0.52, 0.50)).toBe(false); // 2¢ above
+    expect(shouldRepriceOrder(0.48, 0.50)).toBe(false); // 2¢ below
+    expect(shouldRepriceOrder(0.50, 0.50)).toBe(false); // exact
+  });
+
+  test("custom threshold respected", async () => {
+    const { shouldRepriceOrder } = await import("../src/core/engine.js");
+    expect(shouldRepriceOrder(0.55, 0.50, 0.10)).toBe(false); // 5¢ within 10¢ threshold
+    expect(shouldRepriceOrder(0.65, 0.50, 0.10)).toBe(true); // 15¢ exceeds
+  });
+});
+
 describe("window resolution P&L scenarios", () => {
   beforeEach(async () => {
     await resetDb();

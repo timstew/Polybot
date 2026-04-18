@@ -83,6 +83,22 @@ export async function stop(): Promise<void> {
 const lastTradeByToken = new Map<string, number>();
 const REPRICE_THRESHOLD = 0.02;
 
+/**
+ * Whether a resting bid should be cancelled as stale after observing a trade
+ * at `eventPrice`. Pure function — unit-tested.
+ *
+ * Cancel only when the absolute gap exceeds the threshold. A bid that's
+ * price-improved above the trade (ourBid > eventPrice, gap within threshold)
+ * is still competitive for the next trade: we missed this one via queue
+ * contention but the bid shouldn't be pulled. Pulling it strands us on the
+ * book whenever queue-sim rolls a miss against a clearly better bid.
+ */
+export function shouldRepriceOrder(orderPrice: number, eventPrice: number, threshold = REPRICE_THRESHOLD): boolean {
+  // Round to 0.001 (Polymarket minimum tick) so FP noise doesn't flip the decision.
+  const gap = Math.round(Math.abs(orderPrice - eventPrice) * 1000) / 1000;
+  return gap > threshold;
+}
+
 // ── Tape bucket accumulator (1-second aggregation for offline replay) ────
 // Accumulates raw WS events in memory, flushes to DB every second.
 interface BucketAccum {
@@ -340,8 +356,7 @@ async function onMarketTrade(event: MarketTradeEvent): Promise<void> {
       if (order.token_id !== event.asset_id) continue;
       if (!order.clob_order_id) continue;
       if (order.ladder_level >= 4) continue; // protect sweep orders from repricing
-      const gap = Math.abs(order.price - event.price);
-      if (gap > REPRICE_THRESHOLD || order.price > event.price) {
+      if (shouldRepriceOrder(order.price, event.price)) {
         await placer.cancelOrder(order.clob_order_id);
         cancelled++;
       }
