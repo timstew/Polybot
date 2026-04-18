@@ -78,8 +78,11 @@ export function computeBids(
   const dnPrices: number[] = [];
 
   if (pricingMode === "hybrid") {
-    // Hybrid: max(0.55, P_true) on both sides — designed for shadow fill matching
-    const HYBRID_FLOOR = 0.55;
+    // Hybrid: max($0.50, P_true) on both sides.
+    // Per April 12 findings: $0.50 floor matches BR's window-open behavior —
+    // both sides fill immediately when spread is tightest (P_true ≈ 0.50 at open).
+    // $0.55 floor was missing those first-10s fills that BR gets.
+    const HYBRID_FLOOR = 0.50;
     const upBid = Math.min(0.95, Math.max(HYBRID_FLOOR, upFair));
     const dnBid = Math.min(0.95, Math.max(HYBRID_FLOOR, dnFair));
     // Single level for hybrid (no ladder)

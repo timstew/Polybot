@@ -14,6 +14,16 @@ import { getDb, logActivity } from "../db.js";
 import * as ledger from "./order-ledger.js";
 import type { UserFillEvent } from "../feeds/user-ws.js";
 
+/** Where a fill came from. Helps diagnose which detection path is working. */
+export type FillSource =
+  | "user_ws"         // Real-time WebSocket — primary path for REAL mode
+  | "immediate"       // Order crossed spread at placement
+  | "rest_reconcile"  // 30s REST safety-net check (REAL mode only)
+  | "cancel_fill"     // Cancel-fill race
+  | "paper_shadow"    // PAPER: shadow-wallet (Bonereaper) fill detected
+  | "paper_grounded"  // PAPER: real CLOB trade tape showed our bid covered
+  | "paper_book";     // PAPER: our bid crossed real ask at check time
+
 /** Check if a fill has already been recorded (dedup by trade ID). */
 function isAlreadyRecorded(tradeId: string): boolean {
   const row = getDb().prepare("SELECT 1 FROM fills WHERE id = ?").get(tradeId);
@@ -30,7 +40,7 @@ function recordFillInDb(fill: {
   price: number;
   size: number;
   fee: number;
-  source: "user_ws" | "rest_reconcile" | "immediate" | "cancel_fill";
+  source: FillSource;
   isMaker: boolean;
 }): void {
   const db = getDb();
@@ -174,8 +184,8 @@ export function processImmediateFill(
 }
 
 /**
- * Process a fill discovered during REST reconciliation.
- * Called when getActivity() reveals a fill we missed.
+ * Process a fill discovered during REST reconciliation OR any paper fill path.
+ * The `source` parameter tags where the fill came from for diagnostic attribution.
  */
 export function processReconcileFill(
   tradeId: string,
@@ -185,6 +195,7 @@ export function processReconcileFill(
   side: "UP" | "DOWN",
   fillPrice: number,
   fillSize: number,
+  source: FillSource = "rest_reconcile",
 ): void {
   if (isAlreadyRecorded(tradeId)) return;
 
@@ -199,15 +210,15 @@ export function processReconcileFill(
     price: fillPrice,
     size: fillSize,
     fee: 0,
-    source: "rest_reconcile",
-    isMaker: true, // assume maker for resting fills
+    source,
+    isMaker: true, // resting fills = maker on Polymarket
   });
 
-  logActivity("FILL", `${side} ${fillSize.toFixed(1)}@$${fillPrice.toFixed(3)} [reconcile]`, {
+  logActivity("FILL", `${side} ${fillSize.toFixed(1)}@$${fillPrice.toFixed(3)} [${source}]`, {
     windowSlug,
     side,
     level: "trade",
   });
 
-  console.log(`[FILL] ${side} ${fillSize.toFixed(1)}@$${fillPrice.toFixed(3)} window=${windowSlug.slice(-13)} [reconcile]`);
+  console.log(`[FILL] ${side} ${fillSize.toFixed(1)}@$${fillPrice.toFixed(3)} window=${windowSlug.slice(-13)} [${source}]`);
 }

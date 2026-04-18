@@ -4,27 +4,29 @@
  * Key principle: NEVER store order state only in memory.
  * Every order is persisted before placement, every fill is recorded immediately.
  * Process restarts recover fully from this database.
+ *
+ * Uses bun:sqlite — Bun's built-in SQLite (faster than better-sqlite3).
  */
 
-import Database from "better-sqlite3";
+import { Database } from "bun:sqlite";
 import path from "node:path";
 import fs from "node:fs";
 
-let db: InstanceType<typeof Database>;
+let db: Database;
 
-export function getDb(): InstanceType<typeof Database> {
+export function getDb(): Database {
   if (!db) throw new Error("Database not initialized. Call initDb() first.");
   return db;
 }
 
-export function initDb(dbPath?: string): InstanceType<typeof Database> {
+export function initDb(dbPath?: string): Database {
   const resolvedPath = dbPath || path.join(process.cwd(), "reaper.db");
   const dir = path.dirname(resolvedPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   db = new Database(resolvedPath);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
 
   // Create all tables
   db.exec(`
@@ -88,7 +90,9 @@ export function initDb(dbPath?: string): InstanceType<typeof Database> {
     );
     CREATE INDEX IF NOT EXISTS idx_windows_status ON windows(status);
 
-    -- Fill events — every fill from WebSocket or reconciliation
+    -- Fill events — every fill from any detection path
+    -- Source values: user_ws, immediate, rest_reconcile, cancel_fill,
+    --                paper_shadow, paper_grounded, paper_book
     CREATE TABLE IF NOT EXISTS fills (
       id TEXT PRIMARY KEY,                -- trade ID from CLOB (dedup key)
       order_id TEXT,                      -- links to orders.id (our local ID)
@@ -99,7 +103,7 @@ export function initDb(dbPath?: string): InstanceType<typeof Database> {
       price REAL NOT NULL,
       size REAL NOT NULL,
       fee REAL DEFAULT 0,
-      source TEXT NOT NULL CHECK(source IN ('user_ws', 'rest_reconcile', 'immediate', 'cancel_fill')),
+      source TEXT NOT NULL,
       is_maker INTEGER DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -135,10 +139,128 @@ export function initDb(dbPath?: string): InstanceType<typeof Database> {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    -- Shadow trades — every trade from the tracked wallet (e.g., Bonereaper)
+    -- Recorded regardless of fill mode; used for analysis and offline replay.
+    CREATE TABLE IF NOT EXISTS shadow_trades (
+      id TEXT PRIMARY KEY,                    -- tx hash or synthetic id (dedup key)
+      wallet TEXT NOT NULL,                   -- shadow wallet address
+      window_slug TEXT,                       -- market slug (nullable — may be non-crypto)
+      condition_id TEXT,                      -- market condition id
+      token_id TEXT,                          -- asset id
+      side TEXT CHECK(side IN ('UP','DOWN','YES','NO','OTHER')),
+      buy_sell TEXT CHECK(buy_sell IN ('BUY','SELL')),
+      price REAL NOT NULL,
+      size REAL NOT NULL,
+      timestamp INTEGER NOT NULL,             -- unix ms
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_shadow_trades_slug ON shadow_trades(window_slug);
+    CREATE INDEX IF NOT EXISTS idx_shadow_trades_ts ON shadow_trades(timestamp);
+
+    -- Per-second trade tape buckets (for accurate offline replay)
+    -- Aggregated from real-time market WS events: one row per token per second.
+    -- ~5 MB/day, supports fill simulation: "did trades happen at ≤ our bid with enough volume?"
+    CREATE TABLE IF NOT EXISTS tape_buckets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_id TEXT NOT NULL,
+      window_slug TEXT,
+      bucket_ts INTEGER NOT NULL,         -- unix seconds (floor of event timestamp)
+      trade_count INTEGER NOT NULL,
+      total_volume REAL NOT NULL,
+      min_price REAL NOT NULL,
+      max_price REAL NOT NULL,
+      vwap REAL NOT NULL,                 -- volume-weighted average price
+      side_buy_volume REAL DEFAULT 0,     -- volume from BUY-side trades
+      side_sell_volume REAL DEFAULT 0     -- volume from SELL-side trades
+    );
+    CREATE INDEX IF NOT EXISTS idx_tape_buckets_token_ts ON tape_buckets(token_id, bucket_ts);
+    CREATE INDEX IF NOT EXISTS idx_tape_buckets_slug ON tape_buckets(window_slug, bucket_ts);
+
+    -- Per-tick window snapshots (for charts + drill-down)
+    CREATE TABLE IF NOT EXISTS window_ticks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      window_slug TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      p_true REAL,
+      spot_price REAL,
+      up_best_bid REAL,
+      up_best_ask REAL,
+      up_bid_size REAL,
+      up_ask_size REAL,
+      up_last_trade REAL,
+      dn_best_bid REAL,
+      dn_best_ask REAL,
+      dn_bid_size REAL,
+      dn_ask_size REAL,
+      dn_last_trade REAL,
+      up_inventory REAL,
+      down_inventory REAL,
+      up_avg_cost REAL,
+      down_avg_cost REAL,
+      phase TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_window_ticks_slug_ts ON window_ticks(window_slug, timestamp DESC);
   `);
+
+  // Migration: drop CHECK constraint on fills.source if present (pre-v0.2 schema)
+  migrateFillsSource(db);
+
+  // Migration: add last_trade columns to window_ticks if missing
+  addColumnIfMissing(db, "window_ticks", "up_last_trade", "REAL");
+  addColumnIfMissing(db, "window_ticks", "dn_last_trade", "REAL");
+
+  // Migration: add confirmed column to windows (false = predicted from oracle, true = confirmed by Gamma)
+  addColumnIfMissing(db, "windows", "confirmed", "INTEGER DEFAULT 0");
+  // Migration: capture spot price at window close (oracle-preferred, for instant resolution)
+  addColumnIfMissing(db, "windows", "spot_at_close", "REAL");
 
   console.log(`[DB] Initialized at ${resolvedPath}`);
   return db;
+}
+
+/** Add a column if it doesn't exist on the given table. */
+function addColumnIfMissing(db: Database, table: string, col: string, type: string): void {
+  const info = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (info.some(c => c.name === col)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+}
+
+/** One-time migration: rebuild fills table without the source CHECK constraint. */
+function migrateFillsSource(db: Database): void {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fills'"
+  ).get() as { sql: string } | null;
+  if (!row) return;
+  // Old schema had: source TEXT NOT NULL CHECK(source IN (...))
+  // If it's present, rebuild the table.
+  if (!row.sql.includes("CHECK(source IN")) return;
+
+  console.log("[DB] Migrating fills table to allow new source values…");
+  db.exec(`
+    BEGIN TRANSACTION;
+    CREATE TABLE fills_new (
+      id TEXT PRIMARY KEY,
+      order_id TEXT,
+      clob_order_id TEXT,
+      window_slug TEXT NOT NULL,
+      token_id TEXT NOT NULL,
+      side TEXT NOT NULL CHECK(side IN ('UP', 'DOWN')),
+      price REAL NOT NULL,
+      size REAL NOT NULL,
+      fee REAL DEFAULT 0,
+      source TEXT NOT NULL,
+      is_maker INTEGER DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO fills_new SELECT * FROM fills;
+    DROP TABLE fills;
+    ALTER TABLE fills_new RENAME TO fills;
+    CREATE INDEX IF NOT EXISTS idx_fills_window ON fills(window_slug);
+    CREATE INDEX IF NOT EXISTS idx_fills_order ON fills(clob_order_id);
+    COMMIT;
+  `);
+  console.log("[DB] Migration complete.");
 }
 
 // ── Activity log helpers ────────────────────────────────────────────
@@ -157,7 +279,7 @@ export function logActivity(
 // ── Config helpers ──────────────────────────────────────────────────
 
 export function getConfig(key: string, defaultValue?: string): string | undefined {
-  const row = getDb().prepare("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined;
+  const row = getDb().prepare("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | null;
   return row?.value ?? defaultValue;
 }
 

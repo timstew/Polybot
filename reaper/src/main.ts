@@ -6,6 +6,7 @@
  * - Durable order ledger in SQLite (survives restarts)
  * - 5s tick for pricing/discovery (NOT for order management)
  * - 30s reconciliation as safety net
+ * - Direct CLOB integration via @polymarket/clob-client (no Python middleman)
  */
 
 import { initDb, logActivity } from "./db.js";
@@ -13,16 +14,22 @@ import { userWs } from "./feeds/user-ws.js";
 import { processUserWsFill } from "./orders/fill-processor.js";
 import { cancelAllOrders } from "./orders/order-placer.js";
 import { startApiServer } from "./api-server.js";
-
-const PYTHON_API_URL = process.env.PYTHON_API_URL || "http://127.0.0.1:8000";
+import { initClobClient } from "./clob/index.js";
 
 async function main() {
   console.log("=".repeat(60));
   console.log("  REAPER — Bonereaper Clone for Polymarket");
   console.log("  Event-driven order management + durable ledger");
+  console.log("  Direct CLOB integration (v1/v2 auto-detect)");
   console.log("=".repeat(60));
 
-  // 1. Initialize database
+  // 1. Check clock drift against CLOB server (diagnostic — we rely on NTP for accuracy)
+  const { syncClock, startClockSync, getOffset } = await import("./core/clock.js");
+  await syncClock();
+  startClockSync(); // re-check every 5 min, logs warning if drift > 100ms
+  console.log(`[STARTUP] Clock check: ${Math.abs(getOffset()).toFixed(0)}ms ${getOffset() > 0 ? 'behind' : 'ahead of'} CLOB server`);
+
+  // 2. Initialize database
   const db = initDb();
   logActivity("STARTUP", "Reaper starting up");
 
@@ -30,11 +37,25 @@ async function main() {
   console.log("[STARTUP] Cancelling orphan CLOB orders...");
   await cancelAllOrders();
 
-  // 3. Get CLOB API credentials for User WebSocket
-  console.log("[STARTUP] Fetching CLOB API credentials...");
-  const creds = await fetchClobCredentials();
-  if (creds) {
-    // 4. Connect User WebSocket for real-time fill notifications
+  // 3. Initialize CLOB client (derives API credentials from private key)
+  const privateKey = process.env.POLYMARKET_PRIVATE_KEY;
+  let clobCreds: { apiKey: string; secret: string; passphrase: string } | null = null;
+
+  if (privateKey) {
+    try {
+      const clobVersion = (process.env.CLOB_VERSION || "auto") as "v1" | "v2" | "auto";
+      clobCreds = await initClobClient(privateKey, clobVersion);
+      console.log("[STARTUP] CLOB client initialized — direct API access enabled");
+    } catch (err) {
+      console.warn("[STARTUP] CLOB client init failed:", err);
+      console.warn("[STARTUP] Real mode will not work — paper mode only");
+    }
+  } else {
+    console.log("[STARTUP] No POLYMARKET_PRIVATE_KEY — paper mode only");
+  }
+
+  // 4. Connect User WebSocket for real-time fill notifications
+  if (clobCreds) {
     userWs.on("fill", (event) => {
       processUserWsFill(event);
     });
@@ -47,19 +68,12 @@ async function main() {
     userWs.on("reconnecting", () => {
       logActivity("USER_WS", "Reconnecting — will reconcile on reconnect", { level: "warning" });
     });
-    userWs.connect(creds);
+    userWs.connect(clobCreds);
     console.log("[STARTUP] User WebSocket connected — fill notifications active");
   } else {
-    console.warn("[STARTUP] Could not get CLOB credentials — User WebSocket disabled");
-    console.warn("[STARTUP] Fill detection will rely on REST reconciliation only (SLOWER)");
+    console.warn("[STARTUP] No CLOB credentials — User WebSocket disabled");
+    console.warn("[STARTUP] Fill detection will rely on paper fill modes only");
   }
-
-  // TODO: Phase 2-6 implementation
-  // 5. Start market WebSocket (book updates)
-  // 6. Start oracle + Binance feeds
-  // 7. Start strategy engine (5s tick loop)
-  // 8. Start reconciliation loop (30s)
-  // 9. Start HTTP API server for dashboard
 
   // 5. Start oracle feed (Chainlink via RTDS)
   try {
@@ -80,7 +94,7 @@ async function main() {
     capital_cap_usd: "5000",
     // Pricing
     pricing_mode: "hybrid",            // hybrid (best for shadow paper), bonereaper (for real), book
-    paper_fill_mode: "shadow",          // shadow (BR activity — proven), grounded (trade tape — WIP), book (ask crossing)
+    paper_fill_modes: "grounded",  // default: grounded (real trade tape). Options: shadow, grounded, book (comma-sep for multiple)
     deep_value_price: "0.15",
     certainty_threshold: "0.65",
     suppress_after_pct: "0.50",
@@ -96,15 +110,15 @@ async function main() {
     if (!gc(key)) sc(key, value);
   }
 
-  // 6. Start the strategy engine
-  const { start: startEngine, stop: stopEngine } = await import("./core/engine.js");
+  // 7. Start the strategy engine
+  const { start: startEngine } = await import("./core/engine.js");
   const mode = gc("mode") || "paper";
   console.log(`[STARTUP] Mode: ${mode.toUpperCase()}`);
   if (mode === "real" || mode === "paper") {
     startEngine();
   }
 
-  // 7. Start the dashboard + API server
+  // 8. Start the dashboard + API server
   const port = parseInt(process.env.PORT || "3001", 10);
   startApiServer(port);
 
@@ -124,24 +138,6 @@ async function main() {
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
-}
-
-/** Fetch CLOB API credentials from the Python API. */
-async function fetchClobCredentials(): Promise<{ apiKey: string; secret: string; passphrase: string } | null> {
-  try {
-    // The Python API can derive API credentials from the private key
-    const resp = await fetch(`${PYTHON_API_URL}/api/strategy/clob-creds`);
-    if (!resp.ok) {
-      console.warn("[STARTUP] /api/strategy/clob-creds not available — need to add this endpoint");
-      return null;
-    }
-    const data = await resp.json() as { apiKey: string; secret: string; passphrase: string };
-    if (data.apiKey && data.secret && data.passphrase) return data;
-    return null;
-  } catch (err) {
-    console.warn("[STARTUP] Could not fetch CLOB credentials:", err);
-    return null;
-  }
 }
 
 main().catch((err) => {

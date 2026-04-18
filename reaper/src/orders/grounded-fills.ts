@@ -25,22 +25,52 @@ interface TapeEntry {
   asset: string;
 }
 
-/** Fetch recent trades from the public Data API. */
-async function fetchTradeTape(slug: string): Promise<TapeEntry[]> {
+// Rolling trade accumulator — builds up coverage of our specific tokens over time.
+// The global tape at 200 returns ~0 matches for our crypto tokens (they're a tiny
+// fraction of total Polymarket volume). At 1000 (API max) we get ~6. By accumulating
+// across ticks and deduplicating, we build a comprehensive view.
+const accumulatedTrades = new Map<string, TapeEntry>(); // keyed by "asset-price-timestamp" for dedup
+let tapeCacheAt = 0;
+const TAPE_TTL_MS = 4_000;
+const TAPE_RETENTION_MS = 120_000; // keep 2 min of accumulated trades
+
+async function fetchTradeTape(): Promise<TapeEntry[]> {
+  const now = Date.now();
+  if (now - tapeCacheAt < TAPE_TTL_MS) return [...accumulatedTrades.values()];
+
   try {
-    const resp = await fetch(`${DATA_API}/trades?market=${encodeURIComponent(slug)}&limit=100`);
-    if (!resp.ok) return [];
+    const resp = await fetch(`${DATA_API}/trades?limit=1000&_t=${Date.now()}`);
+    if (!resp.ok) return [...accumulatedTrades.values()];
     const data = await resp.json() as Array<Record<string, unknown>>;
-    return data.map(t => ({
-      price: parseFloat(String(t.price || 0)),
-      size: parseFloat(String(t.size || 0)),
-      side: String(t.side || ""),
-      timestamp: (t.timestamp as number) || Date.now() / 1000,
-      asset: String(t.asset || ""),
-    })).filter(t => t.price > 0 && t.size > 0);
-  } catch {
-    return [];
-  }
+
+    for (const t of data) {
+      const price = parseFloat(String(t.price || 0));
+      const size = parseFloat(String(t.size || 0));
+      const ts = (t.timestamp as number) || now / 1000;
+      const asset = String(t.asset || "");
+      if (price <= 0 || size <= 0 || !asset) continue;
+
+      const key = `${asset}-${price}-${ts}`;
+      if (!accumulatedTrades.has(key)) {
+        accumulatedTrades.set(key, {
+          price, size,
+          side: String(t.side || ""),
+          timestamp: ts,
+          asset,
+        });
+      }
+    }
+
+    // Prune old entries (>2 min)
+    const cutoff = now / 1000 - TAPE_RETENTION_MS / 1000;
+    for (const [key, entry] of accumulatedTrades) {
+      if (entry.timestamp < cutoff) accumulatedTrades.delete(key);
+    }
+
+    tapeCacheAt = now;
+  } catch { /* keep accumulated */ }
+
+  return [...accumulatedTrades.values()];
 }
 
 /**
@@ -60,9 +90,12 @@ export async function checkGroundedFills(): Promise<void> {
     bySlug.set(order.window_slug, list);
   }
 
+  // One global tape fetch per tick (cached 4s) — filter per-window client-side by token ID
+  const globalTape = await fetchTradeTape();
+  if (globalTape.length === 0) return;
+
   for (const [slug, orders] of bySlug) {
-    const tape = await fetchTradeTape(slug);
-    if (tape.length === 0) continue;
+    const tape = globalTape; // filter by token happens below via tokenToSide map
 
     // Get the window for entry time and token IDs
     const window = getDb().prepare(
@@ -71,39 +104,51 @@ export async function checkGroundedFills(): Promise<void> {
     if (!window) continue;
     const enteredAt = window.entered_at ? new Date(window.entered_at + "Z").getTime() / 1000 : 0;
 
+    // Map token IDs to sides so we can match tape trades to orders
+    const tokenToSide: Record<string, "UP" | "DOWN"> = {};
+    if (window.up_token_id) tokenToSide[window.up_token_id] = "UP";
+    if (window.down_token_id) tokenToSide[window.down_token_id] = "DOWN";
+
     for (const order of orders) {
       if (order.size_matched >= order.size) continue; // already filled
 
-      // Find trades on this token at or below our bid price, after we entered
-      const matchingTrades = tape.filter(t =>
-        t.asset === order.token_id &&
-        t.price <= order.price &&
-        t.timestamp >= enteredAt
-      );
+      // Find trades on this side at or below our bid price, after we entered.
+      // Each matching trade fills us at THE TRADE PRICE (not our bid) for THE TRADE SIZE.
+      // This is realistic: if someone sold 10 tokens at $0.45 and our bid is $0.50,
+      // we'd fill 10 tokens at $0.45 (maker gets the better price).
+      const matchingTrades = tape.filter(t => {
+        const tradeSide = tokenToSide[t.asset];
+        return tradeSide === order.side &&
+          t.price <= order.price &&
+          t.timestamp >= enteredAt;
+      });
 
-      let volumeAtBid = 0;
-      let bestFillPrice = order.price;
+      if (matchingTrades.length === 0) continue;
+
+      // Re-fetch order state (in case shadow detector already filled it this tick)
+      const fresh = ledger.getOrderByClobId(order.clob_order_id!);
+      if (!fresh || fresh.size_matched >= fresh.size * 0.99) continue;
+
+      // Fill per-trade: each trade fills us up to trade.size, at trade.price
+      let remaining = fresh.size - fresh.size_matched;
       for (const trade of matchingTrades) {
-        volumeAtBid += trade.size;
-        bestFillPrice = trade.price;
-      }
-
-      // Need enough volume to fill our remaining size
-      const remaining = order.size - order.size_matched;
-      if (volumeAtBid >= remaining * 0.5) { // 50% fill threshold — don't require exact match
-        const fillSize = Math.min(remaining, volumeAtBid);
-        const tradeId = `grounded-${order.id}-${Date.now()}`;
+        if (remaining <= 0) break;
+        const fillSize = Math.min(remaining, trade.size);
+        // Unique tradeId per trade to prevent duplicates
+        const tradeId = `grounded-${order.clob_order_id}-${trade.asset}-${trade.price}-${trade.timestamp}`;
         fillProcessor.processReconcileFill(
           tradeId,
           order.clob_order_id!,
           order.window_slug,
           order.token_id,
           order.side as "UP" | "DOWN",
-          bestFillPrice,
+          trade.price,  // fill at the TRADE price, not our bid
           fillSize,
+          "paper_grounded",
         );
+        remaining -= fillSize;
 
-        logActivity("GROUNDED_FILL", `${order.side} ${fillSize.toFixed(1)}@$${bestFillPrice.toFixed(3)} (tape vol=${volumeAtBid.toFixed(0)})`, {
+        logActivity("GROUNDED_FILL", `${order.side} ${fillSize.toFixed(1)}@$${trade.price.toFixed(3)} (trade)`, {
           windowSlug: order.window_slug,
           side: order.side,
           level: "trade",

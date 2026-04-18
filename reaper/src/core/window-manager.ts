@@ -41,6 +41,8 @@ export interface WindowRow {
   merge_pnl: number;
   net_pnl: number;
   entered_at: string | null;
+  confirmed: number; // 0 = predicted from oracle, 1 = confirmed by Gamma
+  spot_at_close: number | null; // oracle-preferred spot price captured at window end
 }
 
 let lastBoundary5m = 0;
@@ -60,11 +62,24 @@ export async function discoverWindows(config: {
     if (interval * 1000 > config.maxWindowDurationMs) continue;
     if (interval * 1000 < config.minWindowDurationMs) continue;
 
-    const prefix = interval === 300 ? "btc-updown-5m" : "btc-updown-15m";
+    // BTC + ETH + SOL markets. SOL only if under capacity (lower priority).
+    const corePrefixes = interval === 300
+      ? ["btc-updown-5m", "eth-updown-5m"]
+      : ["btc-updown-15m", "eth-updown-15m"];
+    const activeCount = getDb().prepare("SELECT COUNT(*) as n FROM windows WHERE status = 'ACTIVE'").get() as { n: number };
+    const hasCapacity = activeCount.n < config.maxConcurrentWindows - 1; // leave 1 slot buffer
+    const solPrefixes = hasCapacity
+      ? (interval === 300 ? ["sol-updown-5m"] : ["sol-updown-15m"])
+      : [];
+    const prefixes = [...corePrefixes, ...solPrefixes];
+
+    for (const prefix of prefixes) {
     const rounded = Math.floor(nowSec / interval) * interval;
 
     for (let offset = 0; offset <= 1; offset++) {
       const openTs = rounded + offset * interval;
+      // Only enter windows that have already opened (openTs is the second the window starts)
+      if (openTs > nowSec + 1) continue; // +1s tolerance for boundary timer firing at T+0.25s
       const slug = `${prefix}-${openTs}`;
 
       try {
@@ -96,6 +111,7 @@ export async function discoverWindows(config: {
         }
       } catch { /* skip failed lookup */ }
     }
+    } // end for prefix
   }
 
   return markets;
@@ -133,15 +149,20 @@ export async function enterWindow(market: CryptoMarket): Promise<boolean> {
   const activeCount = db.prepare("SELECT COUNT(*) as c FROM windows WHERE status = 'ACTIVE'").get() as { c: number };
   // We'll check the limit in the engine, not here
 
-  // Get spot price for reference
-  const spotPrice = await fetchSpotPrice();
+  // Derive crypto symbol from slug (btc-updown-5m-... → BTCUSDT, eth-... → ETHUSDT, sol-... → SOLUSDT)
+  const cryptoSymbol = market.slug.startsWith("eth-") ? "ETHUSDT"
+    : market.slug.startsWith("sol-") ? "SOLUSDT"
+    : "BTCUSDT";
+
+  // Get spot price for this specific crypto
+  const spotPrice = await fetchSpotPrice(cryptoSymbol);
 
   db.prepare(`
     INSERT INTO windows (slug, condition_id, title, crypto_symbol, up_token_id, down_token_id,
                          open_time, end_time, price_at_open, entered_at, status)
-    VALUES (?, ?, ?, 'BTCUSDT', ?, ?, ?, ?, ?, datetime('now'), 'ACTIVE')
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 'ACTIVE')
   `).run(
-    market.slug, market.conditionId, market.title,
+    market.slug, market.conditionId, market.title, cryptoSymbol,
     market.upTokenId, market.downTokenId,
     openTime, endMs, spotPrice,
   );

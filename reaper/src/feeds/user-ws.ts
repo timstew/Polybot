@@ -10,15 +10,9 @@
  *   Auth: { type: "user", auth: { apiKey, secret, passphrase } }
  *   Events: trade events with status MATCHED → MINED → CONFIRMED/FAILED
  *
- * Each fill event contains:
- *   - order_id: the CLOB order ID
- *   - status: MATCHED (fill happened), CONFIRMED (on-chain), FAILED (reverted)
- *   - size_matched: how many tokens filled
- *   - price: execution price
- *   - associate_trades: list of individual trade details
+ * Uses Bun's built-in WebSocket (browser API).
  */
 
-import WebSocket from "ws";
 import { EventEmitter } from "node:events";
 import { logActivity } from "../db.js";
 
@@ -77,7 +71,7 @@ class UserWebSocket extends EventEmitter {
     try {
       this.ws = new WebSocket(USER_WS_URL);
 
-      this.ws.on("open", () => {
+      this.ws.onopen = () => {
         console.log("[USER-WS] Connected");
         this.lastMessageAt = Date.now();
         logActivity("USER_WS", "Connected to Polymarket user WebSocket", { level: "info" });
@@ -106,11 +100,11 @@ class UserWebSocket extends EventEmitter {
         this.zombieInterval = setInterval(() => this._checkZombie(), ZOMBIE_THRESHOLD_MS);
 
         this.emit("connected");
-      });
+      };
 
-      this.ws.on("message", (data: Buffer | string) => {
+      this.ws.onmessage = (event: MessageEvent) => {
         this.lastMessageAt = Date.now();
-        const raw = typeof data === "string" ? data : data.toString();
+        const raw = typeof event.data === "string" ? event.data : String(event.data);
 
         if (raw === "PONG" || raw === "") return;
 
@@ -120,18 +114,18 @@ class UserWebSocket extends EventEmitter {
         } catch {
           // Ignore parse errors
         }
-      });
+      };
 
-      this.ws.on("close", (code: number, reason: Buffer) => {
-        console.log(`[USER-WS] Disconnected: code=${code} reason="${reason.toString() || "none"}"`);
-        logActivity("USER_WS", `Disconnected: code=${code}`, { level: "warning" });
+      this.ws.onclose = (event: CloseEvent) => {
+        console.log(`[USER-WS] Disconnected: code=${event.code} reason="${event.reason || "none"}"`);
+        logActivity("USER_WS", `Disconnected: code=${event.code}`, { level: "warning" });
         this._scheduleReconnect();
-      });
+      };
 
-      this.ws.on("error", (err: Error) => {
-        console.error("[USER-WS] Error:", err.message);
+      this.ws.onerror = (event) => {
+        console.error("[USER-WS] Error:", event);
         this._scheduleReconnect();
-      });
+      };
     } catch (err) {
       console.error("[USER-WS] Failed to connect:", err);
       this._scheduleReconnect();
@@ -139,11 +133,6 @@ class UserWebSocket extends EventEmitter {
   }
 
   private _handleMessage(msg: Record<string, unknown>): void {
-    // The user WS delivers trade/order events
-    // Based on poly-maker's data_processing.py:
-    //   event_type: "trade" with status field
-    //   Each trade has: id, order_id, status, size, price, maker_address, etc.
-
     const eventType = (msg.event_type as string) || (msg.type as string) || "";
 
     if (eventType === "trade" || eventType === "order") {
@@ -169,8 +158,7 @@ class UserWebSocket extends EventEmitter {
 
     // Determine if we're the maker
     const makerAddress = (msg.maker_address as string) || "";
-    // We'll check against our wallet address in the fill processor
-    const isMaker = !!makerAddress; // placeholder — fill processor will verify
+    const isMaker = !!makerAddress;
 
     const event: UserFillEvent = {
       orderId,
@@ -186,33 +174,28 @@ class UserWebSocket extends EventEmitter {
 
     switch (status) {
       case "MATCHED":
-        // Fill happened — this is the primary signal
         console.log(`[USER-WS] FILL: order=${orderId.slice(0, 12)} ${sizeMatched}@$${price.toFixed(3)}`);
         this.emit("fill", event);
         break;
 
       case "MINED":
-        // On-chain confirmation in progress
         this.emit("mined", event);
         break;
 
       case "CONFIRMED":
-        // Fully confirmed on-chain
         this.emit("confirmed", event);
         break;
 
       case "FAILED":
-        // On-chain transaction reverted
         console.warn(`[USER-WS] FAILED: order=${orderId.slice(0, 12)}`);
         logActivity("FILL_FAILED", `Order ${orderId} fill reverted on-chain`, { level: "error" });
         this.emit("failed", event);
         break;
 
       default:
-        // Unknown status — log it
         if (sizeMatched > 0) {
           console.log(`[USER-WS] Unknown status "${status}" for order ${orderId.slice(0, 12)}`);
-          this.emit("fill", event); // treat as fill to be safe
+          this.emit("fill", event);
         }
     }
   }
