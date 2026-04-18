@@ -4,7 +4,7 @@
 >
 > Data sources: 982 trades across 11 windows (initial analysis, early April), 192 trades cross-referenced with oracle data (April 9 correlation study), 10,000 trade live pull (April 11 via Data API), position snapshot (April 11), BabyBoneR replication testing (April 11). **April 18, 2026: 805,783 on-chain fills via Goldsky subgraph (see Section 13) — the first full-history dataset.**
 >
-> Last updated: April 18, 2026. **Added Section 13 (Goldsky refresh) — refines the "zero sells" claim (true for current strategy from March 28+, but the wallet DID sell aggressively as taker March 25–27), refreshes fill-price distribution with 2,500× more data, records $7.3M net long-USDC flow over 7 days.** Previous revision April 14 added Sections 10-12 from 55K /activity records; April 12 overturned fixed-offset model.
+> Last updated: April 18, 2026 (revised evening). **Added Section 14 (full-history correction) — completely overturns the "zero sells" claim. BR sells heavily as taker ~25 of 28 tracked days (only Mar 31–Apr 3 was a true no-sells window, 4 days). The /activity API that produced the original claim appears to filter or mis-categorize taker sells; Goldsky on-chain data is authoritative.** Section 13 is partially superseded by §14.
 
 ---
 
@@ -25,14 +25,14 @@ Pulled 10,000 most recent trades + 25 open positions directly from the Data API.
 | Sell count | **0 out of 9,800** | Exits ONLY via merge+redeem |
 | Tokens per window | 30,000-90,000 | Massive volume per window |
 
-### Zero Sells — REFINED (April 18, 2026)
+### Zero Sells — OVERTURNED (April 18, 2026, revised)
 
-> **Not so simple.** Goldsky subgraph full-history (see §13) reveals BR's
-> wallet had a March 25–27 phase with 270K taker sells (33% of activity then).
-> From March 28 onward, taker sells drop to ZERO and the wallet goes pure
-> maker-buy. The original "zero sells" observation was done April 11+ and
-> reflects the post-March-28 strategy correctly. Treat "zero sells" as a
-> property of the **current** strategy, not the wallet's full history.
+> **Claim is wrong.** Full Goldsky data (2.56M events, 28 days) shows BR
+> sells heavily as taker ~25 of 28 tracked days (50K–108K sells/day).
+> Only Mar 31 – Apr 3 was a true no-sells window — 4 days out of 28.
+> The /activity API that produced the original "0 sells in 9800" claim
+> appears to filter or mis-categorize taker sells; Goldsky is authoritative.
+> See §14 for the full daily breakdown.
 
 Across the full 3,000 accessible items (2.5 hours, API max), there are ZERO sell trades. All exits are via MERGE (token pairs → $1.00 USDC) and REDEEM (winning tokens → $1.00 at resolution).
 
@@ -574,3 +574,109 @@ our modeled `p*(1-p)*0.0625*size` formula for paper P&L.
 - **Wallet rotation risk.** This wallet has already changed strategies once
   (Mar 25-27 → Mar 28+). A second rotation to a fresh wallet would make these
   findings historical overnight. Rotation detector is ROADMAP Phase 4.9.
+
+---
+
+## 14. Full-History Correction (April 18, 2026, evening)
+
+After backfilling 2.56M Goldsky events across March 25 – April 18 (24 days),
+the "zero sells" claim — repeated throughout §1, §5, §10, §11, §12, §13 —
+is wrong. BR sells heavily as taker almost continuously.
+
+### Daily Action Breakdown
+
+| Date | Maker BUY | Taker BUY | **Taker SELL** | Maker SELL |
+|---|---|---|---|---|
+| 2026-03-25 | 41,355 | 6,882 | **76,668** | 0 |
+| 2026-03-26 | 64,623 | 9,987 | **98,422** | 1 |
+| 2026-03-27 | 71,765 | 10,682 | **95,853** | 0 |
+| 2026-03-28 | 69,609 | 12,274 | **108,019** | 0 |
+| 2026-03-29 | 51,035 | 6,578 | **58,699** | 0 |
+| 2026-03-30 | 103,783 | 9,467 | **78,810** | 0 |
+| **2026-03-31** | **86,491** | **0** | **0** | **2,835** |
+| **2026-04-01** | **77,424** | **0** | **0** | **60** |
+| **2026-04-02** | **74,338** | **0** | **0** | **0** |
+| **2026-04-03** | **44,193** | **0** | **0** | **0** |
+| 2026-04-04 | 27,439 | 2,196 | 19,441 | 0 |
+| 2026-04-05 | 48,807 | 5,764 | **49,480** | 0 |
+| 2026-04-06 | 72,633 | 7,972 | **61,223** | 0 |
+| 2026-04-07 | 54,628 | 6,111 | **52,040** | 0 |
+| 2026-04-08 | 58,936 | 3,188 | **26,718** | 0 |
+| 2026-04-09 | 45,626 | 9,563 | **82,103** | 0 |
+| 2026-04-10 | 48,739 | 789 | 4,698 | 0 |
+| 2026-04-11 | 33,511 | 7,351 | **53,651** | 0 |
+| 2026-04-12 | 61,999 | 6,111 | **59,722** | 0 |
+| 2026-04-13 | 67,342 | 5,092 | **34,890** | 0 |
+| 2026-04-14 | 77,784 | 12,013 | **98,648** | 0 |
+| 2026-04-15 | 60,310 | 6,419 | **47,840** | 0 |
+| 2026-04-16 | 60,659 | 9,084 | **61,428** | 0 |
+| 2026-04-17 | 45,839 | 8,857 | **63,862** | 0 |
+| 2026-04-18 | 6,087 | 6,792 | **49,314** | 0 |
+
+**The only true "no-sells" window is Mar 31 – Apr 3 (4 days).** Everything
+else has taker sells. The /activity API's "0 sells in 9800 trades" original
+claim appears to reflect API filtering/categorization, not the underlying
+on-chain truth.
+
+### BR's Actual Playbook (April-15+ BTC 5m windows, per-elapsed-phase)
+
+Joining `goldsky_trades` with `markets_cache` to attribute each fill to its
+window and elapsed %:
+
+| Phase | maker BUY | taker BUY | taker SELL |
+|---|---|---|---|
+| EARLY (0–30%) | 26,780 @ $0.51 | 4,457 @ $0.52 | **42,102 @ $0.49** |
+| MID (30–70%) | 29,369 @ $0.48 | 8,275 @ $0.52 | **40,971 @ $0.52** |
+| LATE (70–95%) | 18,114 @ $0.50 | 6,468 @ $0.61 | **23,158 @ $0.51** |
+| CLOSE (95–100%+) | **5,322 @ $0.87** | 1,402 @ $0.89 | 3,703 @ $0.33 |
+
+**Pattern reading:**
+
+1. **Market-making behavior, not directional accumulation.** Maker BUYs
+   at ~$0.50 + taker SELLs at ~$0.50 across EARLY/MID/LATE. 109K sells
+   vs 19K taker buys overall. BR is posting maker bids, collecting fills,
+   then crossing back out via taker sells — likely to capture maker rebates
+   while staying near-neutral.
+
+2. **Certainty loading ONLY in last 5%.** Maker BUYs at $0.87 with massive
+   per-fill size (5,322 fills / 656K tokens = 123 tokens/fill). This is
+   the "stack the winning side right before resolution" behavior. Previous
+   §10 claim that late-window starts at 30% is wrong — it's the last 5%.
+
+3. **Mid-phase taker SELL at $0.51 is neutral-exiting.** This is where
+   BR trims positions to free capital. We don't do this — we use mid-window
+   merging instead. Both are valid recycling strategies.
+
+### Implications for Reaper
+
+**Behaviors we're missing:**
+- **Taker selling for neutral position management.** Our strategy never
+  sells. BR's entire mid-phase is balanced maker-buy + taker-sell at
+  near-fair prices. This costs us capital velocity and possibly some
+  market-making edge (rebates).
+- **Delayed certainty load.** Our `late_size_mult` fires at elapsed > 70%;
+  BR fires at > 95%. We're loading winning side too early, risking
+  reversals (P_true flips late-window in 5/7 windows per §1).
+
+**Behaviors we have that BR doesn't:**
+- **Mid-window merging** (§2.8 observation: BR only merges at resolution).
+  Our `jit-merge-on-capital-squeeze` is a different strategy for capital
+  recycling — both valid, ours saves a sell-side leg per round-trip.
+
+### Prior Claims, Corrected
+
+| Claim | Earlier Status | Correct Status |
+|---|---|---|
+| "Zero sells" | Confirmed → Refined (§13) | **OVERTURNED** — BR sells 25 of 28 days |
+| "Merge + redeem exit only" | Confirmed → Partial (§13) | **Wrong** — BR's primary capital recycling is via taker sells, merges are a backstop |
+| "Strategy flipped Mar 28" | Claimed | **Wrong** — Brief 4-day pause Mar 31–Apr 3, otherwise consistent |
+| "93% taker post Apr 15" | Claimed | **Partial** — 93% of taker events are sells; taker role is ~40% of total, not 93% |
+| "Late-window certainty loads start at 30%" (§10) | Claimed | **Wrong** — Starts at 95%+ |
+
+### Data-Collection Meta-Lesson
+
+The /activity API has been giving us filtered/biased data since the start.
+All pre-Goldsky sections of this doc should be re-verified against on-chain
+subgraph data. The Goldsky backfill pipeline (§13) is now the canonical
+source; §1–§12 should be treated as historical speculation unless confirmed
+from on-chain events.
