@@ -27,3 +27,7 @@ worker/launchd-*.log
 worker/.dev.pid
 worker/python-api.log
 worker/next-dev.log
+
+# Reaper lives in its own repo (github.com/timstew/reaper)
+# but keeps a working copy here for cross-project reference
+reaper/
