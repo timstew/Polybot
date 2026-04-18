@@ -24,6 +24,19 @@ export type FillSource =
   | "paper_grounded"  // PAPER: real CLOB trade tape showed our bid covered
   | "paper_book";     // PAPER: our bid crossed real ask at check time
 
+/** Polymarket crypto-market taker fee rate: 6.25% of p*(1-p). */
+export const TAKER_FEE_RATE = 0.0625;
+
+/**
+ * Polymarket taker fee for binary (0/1) markets:
+ *   fee = price * (1 - price) * rate * size
+ * Zero at the 0/1 edges (no fee on risk-free buys), peaks at $0.50.
+ */
+export function takerFee(price: number, size: number, rate = TAKER_FEE_RATE): number {
+  const p = Math.max(0, Math.min(1, price));
+  return p * (1 - p) * rate * size;
+}
+
 /** Check if a fill has already been recorded (dedup by trade ID). */
 function isAlreadyRecorded(tradeId: string): boolean {
   const row = getDb().prepare("SELECT 1 FROM fills WHERE id = ?").get(tradeId);
@@ -169,7 +182,7 @@ export function processImmediateFill(
     side,
     price: fillPrice,
     size: fillSize,
-    fee: 0,
+    fee: takerFee(fillPrice, fillSize),
     source: "immediate",
     isMaker: false, // immediate fills are taker (crossed the spread)
   });
@@ -186,6 +199,8 @@ export function processImmediateFill(
 /**
  * Process a fill discovered during REST reconciliation OR any paper fill path.
  * The `source` parameter tags where the fill came from for diagnostic attribution.
+ * `isMaker` defaults true — override to false for taker fills (book crosses,
+ * opportunistic taker buys) so the 6.25% fee is applied.
  */
 export function processReconcileFill(
   tradeId: string,
@@ -196,6 +211,7 @@ export function processReconcileFill(
   fillPrice: number,
   fillSize: number,
   source: FillSource = "rest_reconcile",
+  isMaker = true,
 ): void {
   if (isAlreadyRecorded(tradeId)) return;
 
@@ -209,9 +225,9 @@ export function processReconcileFill(
     side,
     price: fillPrice,
     size: fillSize,
-    fee: 0,
+    fee: isMaker ? 0 : takerFee(fillPrice, fillSize),
     source,
-    isMaker: true, // resting fills = maker on Polymarket
+    isMaker,
   });
 
   logActivity("FILL", `${side} ${fillSize.toFixed(1)}@$${fillPrice.toFixed(3)} [${source}]`, {

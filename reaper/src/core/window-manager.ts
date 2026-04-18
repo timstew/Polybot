@@ -194,7 +194,7 @@ export function markResolving(slug: string): void {
   ).run(slug);
 }
 
-/** Resolve a window with an outcome. Compute P&L. */
+/** Resolve a window with an outcome. Compute P&L net of taker fees. */
 export function resolveWindow(slug: string, outcome: "UP" | "DOWN" | "UNKNOWN"): void {
   const w = getWindow(slug);
   if (!w || w.status === "RESOLVED") return;
@@ -209,7 +209,12 @@ export function resolveWindow(slug: string, outcome: "UP" | "DOWN" | "UNKNOWN"):
     resolutionPnl = winInv * (1.0 - winCost) - loseInv * loseCost;
   }
 
-  const netPnl = (w.merge_pnl || 0) + resolutionPnl;
+  const feeRow = getDb().prepare(
+    "SELECT COALESCE(SUM(fee), 0) AS total FROM fills WHERE window_slug = ?"
+  ).get(slug) as { total: number };
+  const totalFees = feeRow.total;
+
+  const netPnl = (w.merge_pnl || 0) + resolutionPnl - totalFees;
 
   getDb().prepare(`
     UPDATE windows
@@ -218,11 +223,11 @@ export function resolveWindow(slug: string, outcome: "UP" | "DOWN" | "UNKNOWN"):
     WHERE slug = ?
   `).run(outcome, resolutionPnl, netPnl, slug);
 
-  logActivity("RESOLVE", `${outcome} net=$${netPnl.toFixed(2)} (mrg=$${(w.merge_pnl || 0).toFixed(2)} res=$${resolutionPnl.toFixed(2)})`, {
+  logActivity("RESOLVE", `${outcome} net=$${netPnl.toFixed(2)} (mrg=$${(w.merge_pnl || 0).toFixed(2)} res=$${resolutionPnl.toFixed(2)} fee=$${totalFees.toFixed(2)})`, {
     windowSlug: slug, level: "trade",
   });
 
-  console.log(`[RESOLVE] ${slug.slice(-13)} ${outcome} net=$${netPnl.toFixed(2)}`);
+  console.log(`[RESOLVE] ${slug.slice(-13)} ${outcome} net=$${netPnl.toFixed(2)} (fees=$${totalFees.toFixed(2)})`);
 }
 
 /** Parse window duration from title (e.g., "10:45PM-10:50PM" → 300000ms). */

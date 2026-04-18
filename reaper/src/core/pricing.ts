@@ -13,6 +13,7 @@
  */
 
 import type { WindowRow } from "./window-manager.js";
+import { computeSkewGuard, applyGuardToLadder } from "../strategies/inventory-guard.js";
 
 export interface PricingConfig {
   deepValuePrice: number;       // default 0.15
@@ -103,14 +104,12 @@ export function computeBids(
     if (state.side === "DOWN") upPrices.fill(0);
   }
 
-  // Apply inventory suppression
-  const totalTokens = window.up_inventory + window.down_inventory;
-  if (totalTokens >= 50) { // skew guard min
-    const upRatio = window.up_inventory / totalTokens;
-    const dnRatio = window.down_inventory / totalTokens;
-    if (upRatio > 0.9) upPrices.fill(0);
-    if (dnRatio > 0.9) dnPrices.fill(0);
-  }
+  // Sliding-ratchet inventory guard (tiered suppression based on skew %)
+  const upSizes = new Array(nLevels).fill(config.baseBidSize);
+  const dnSizes = new Array(nLevels).fill(config.baseBidSize);
+  const guard = computeSkewGuard(window.up_inventory, window.down_inventory, 50);
+  applyGuardToLadder(upPrices, upSizes, guard.up);
+  applyGuardToLadder(dnPrices, dnSizes, guard.dn);
 
   // Build bid levels (highest price first for fill priority)
   const bids: BidLevel[] = [];
@@ -120,21 +119,24 @@ export function computeBids(
     const idx = lvl - 1;
     const upPrice = upPrices[idx];
     const dnPrice = dnPrices[idx];
-    let size = config.baseBidSize;
+    let upSize = upSizes[idx];
+    let dnSize = dnSizes[idx];
 
     // Late window size boost on winning side
     if (state.activated && isLateWindow) {
-      const isWinningSide = (upIsWinning && upPrice > 0) || (!upIsWinning && dnPrice > 0);
-      if (isWinningSide) size = Math.floor(size * config.lateSizeMult);
+      const isUpWinningSide = upIsWinning && upPrice > 0;
+      const isDnWinningSide = !upIsWinning && dnPrice > 0;
+      if (isUpWinningSide) upSize = Math.floor(upSize * config.lateSizeMult);
+      if (isDnWinningSide) dnSize = Math.floor(dnSize * config.lateSizeMult);
     }
 
     // Add light side first for balance
     if (lightSideFirst === "UP") {
-      if (upPrice > 0) bids.push({ side: "UP", price: Math.floor(upPrice * 100) / 100, size, level: lvl });
-      if (dnPrice > 0) bids.push({ side: "DOWN", price: Math.floor(dnPrice * 100) / 100, size, level: lvl });
+      if (upPrice > 0) bids.push({ side: "UP", price: Math.floor(upPrice * 100) / 100, size: upSize, level: lvl });
+      if (dnPrice > 0) bids.push({ side: "DOWN", price: Math.floor(dnPrice * 100) / 100, size: dnSize, level: lvl });
     } else {
-      if (dnPrice > 0) bids.push({ side: "DOWN", price: Math.floor(dnPrice * 100) / 100, size, level: lvl });
-      if (upPrice > 0) bids.push({ side: "UP", price: Math.floor(upPrice * 100) / 100, size, level: lvl });
+      if (dnPrice > 0) bids.push({ side: "DOWN", price: Math.floor(dnPrice * 100) / 100, size: dnSize, level: lvl });
+      if (upPrice > 0) bids.push({ side: "UP", price: Math.floor(upPrice * 100) / 100, size: upSize, level: lvl });
     }
   }
 

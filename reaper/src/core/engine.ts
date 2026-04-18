@@ -12,6 +12,7 @@
 import { getDb, logActivity, getConfig, setConfig } from "../db.js";
 import { marketWs, type MarketTradeEvent } from "../feeds/market-ws.js";
 import { processReconcileFill as processWsFill } from "../orders/fill-processor.js";
+import { queueFillProbability, rollForFill } from "../orders/queue-sim.js";
 // Time: relies on system NTP for clock accuracy. CLOB order signing uses
 // server time via useServerTime:true in the adapter. See core/clock.ts for
 // offset diagnostics if drift ever becomes an issue.
@@ -219,6 +220,9 @@ async function onMarketTrade(event: MarketTradeEvent): Promise<void> {
       side: string; price: number; size: number; size_matched: number; ladder_level: number;
     }>;
 
+    const queueSimEnabled = (getConfig("queue_fill_sim", "true") || "true") !== "false";
+    const queueMult = parseFloat(getConfig("queue_fill_mult", "1.0") || "1.0");
+
     for (const order of openOrders) {
       if (remainingVolume <= 0) break;
 
@@ -227,7 +231,17 @@ async function onMarketTrade(event: MarketTradeEvent): Promise<void> {
 
       const orderRemaining = fresh.size - fresh.size_matched;
       const fillSize = Math.min(orderRemaining, remainingVolume);
+      // Consume volume regardless of our outcome — if we lose the queue roll,
+      // competition at this level got the fill, and the seller walks on.
       remainingVolume -= fillSize;
+
+      // Queue-position simulation: paper bids must contend with real CLOB queue.
+      // A brand-new paper bid at the same price as an existing resting bid goes
+      // to the back of the queue; price improvement jumps ahead.
+      if (queueSimEnabled) {
+        const prob = queueFillProbability(order.price, event.price);
+        if (!rollForFill(prob, queueMult)) continue;
+      }
 
       // Unique trade ID per order (same trade can fill multiple orders)
       const tradeId = `ws-grounded-${order.clob_order_id}-${event.timestamp}-${event.price}`;
@@ -297,6 +311,7 @@ async function onMarketTrade(event: MarketTradeEvent): Promise<void> {
             tradeId, `taker-${w.slug}-${side}-${Date.now()}`, w.slug,
             event.asset_id, side, event.price,
             Math.min(signal.size, event.size), "paper_grounded",
+            false, // taker: aggressive buy at trade price — 6.25% fee applies
           );
 
           logActivity("TAKER_BUY", `${side} ${Math.min(signal.size, event.size).toFixed(0)}@$${event.price.toFixed(3)} [${signal.reason}]`, {
@@ -427,7 +442,7 @@ async function onBoundaryFire(boundaryTs: number): Promise<void> {
 }
 
 /** Get effective capital from config + P&L. */
-function getEffectiveCapital(): number {
+export function getEffectiveCapital(): number {
   const maxCapital = parseFloat(getConfig("max_capital_usd", "500") || "500");
   const totalPnl = getTotalPnl();
   const cap = parseFloat(getConfig("capital_cap_usd", "5000") || "5000");
@@ -437,7 +452,7 @@ function getEffectiveCapital(): number {
 }
 
 /** Get total P&L from completed windows. */
-function getTotalPnl(): number {
+export function getTotalPnl(): number {
   const row = getDb().prepare(
     "SELECT COALESCE(SUM(net_pnl), 0) as total FROM windows WHERE status = 'RESOLVED'"
   ).get() as { total: number };
@@ -445,7 +460,7 @@ function getTotalPnl(): number {
 }
 
 /** Dynamic scaling based on capital. */
-function getScaledConfig(effectiveCapital: number): PricingConfig & {
+export function getScaledConfig(effectiveCapital: number): PricingConfig & {
   maxConcurrentWindows: number;
   maxTotalCostPerWindow: number;
   maxWindowDurationMs: number;
@@ -556,12 +571,20 @@ async function tick(): Promise<void> {
     const modes = new Set(modesRaw.split(",").map(m => m.trim()));
 
     if (modes.has("shadow")) await processShadowFills();
-    // Tape poller always runs — WS is unreliable (zombie cycles, 6s drops).
-    // WS handler fills at maker price when connected; tape poller fills at trade price.
-    // Both have unique tradeIds so no double-counting.
+    // Market WS is the primary fill source (real-time per-trade events, fills at
+    // maker price). Tape poller runs only as a gap-filler when WS is unhealthy
+    // (zombie / reconnecting / disconnected). Both use their own tradeId schemes
+    // so a single underlying trade can produce fills via both paths if overlapped
+    // — this gate prevents the overlap in the common case.
     if (modes.has("grounded")) {
-      const { checkGroundedFills } = await import("../orders/grounded-fills.js");
-      await checkGroundedFills();
+      const forceTape = (getConfig("tape_always", "false") || "false") === "true";
+      if (forceTape || !marketWs.isConnected()) {
+        const { checkGroundedFills } = await import("../orders/grounded-fills.js");
+        await checkGroundedFills();
+        if (!forceTape) {
+          logActivity("TAPE_GAPFILL", `WS unhealthy (age=${marketWs.dataAge}s) — running tape poller as gap-filler`, { level: "signal" });
+        }
+      }
     }
   }
 
@@ -1056,6 +1079,7 @@ async function checkPaperRestingFills(): Promise<void> {
           bestAsk,
           remaining,
           "paper_book",
+          false, // taker: crossed the real ask — 6.25% fee applies
         );
       }
     } catch { /* skip */ }

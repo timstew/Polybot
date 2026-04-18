@@ -5,6 +5,7 @@
  */
 
 import type { BidContext, BidLevel, BidStrategy } from "./types.js";
+import { computeSkewGuard, applyGuardToLadder } from "./inventory-guard.js";
 
 interface LadderState { activated: boolean; side: "UP" | "DOWN" }
 const windowStates = new Map<string, LadderState>();
@@ -61,14 +62,14 @@ export const bonereaperLadder: BidStrategy = {
       if (state.side === "DOWN") upPrices.fill(0);
     }
 
-    // Heavy-side inventory suppression
-    const totalTokens = ctx.up_inventory + ctx.dn_inventory;
-    if (totalTokens >= 50) {
-      const upRatio = ctx.up_inventory / totalTokens;
-      const dnRatio = ctx.dn_inventory / totalTokens;
-      if (upRatio > 0.9) upPrices.fill(0);
-      if (dnRatio > 0.9) dnPrices.fill(0);
-    }
+    // Sliding-ratchet inventory guard (tiered suppression)
+    // Builds up size arrays so halve-top can shrink just the top level.
+    const baseSize = Math.max(5, ctx.base_bid_size);
+    const upSizes = new Array(nLevels).fill(baseSize);
+    const dnSizes = new Array(nLevels).fill(baseSize);
+    const guard = computeSkewGuard(ctx.up_inventory, ctx.dn_inventory, 50);
+    applyGuardToLadder(upPrices, upSizes, guard.up);
+    applyGuardToLadder(dnPrices, dnSizes, guard.dn);
 
     const bids: BidLevel[] = [];
     const lightSideFirst = ctx.up_inventory <= ctx.dn_inventory ? "UP" : "DOWN";
@@ -77,15 +78,18 @@ export const bonereaperLadder: BidStrategy = {
       const idx = lvl - 1;
       const upPrice = upPrices[idx];
       const dnPrice = dnPrices[idx];
-      let size = Math.max(5, ctx.base_bid_size);
+      let upSize = upSizes[idx];
+      let dnSize = dnSizes[idx];
 
       if (state.activated && isLateWindow) {
-        const isWinningSide = (upIsWinning && upPrice > 0) || (!upIsWinning && dnPrice > 0);
-        if (isWinningSide) size = Math.floor(size * LATE_SIZE_MULT);
+        const isUpWinning = upIsWinning && upPrice > 0;
+        const isDnWinning = !upIsWinning && dnPrice > 0;
+        if (isUpWinning) upSize = Math.floor(upSize * LATE_SIZE_MULT);
+        if (isDnWinning) dnSize = Math.floor(dnSize * LATE_SIZE_MULT);
       }
 
-      const addUp = () => { if (upPrice > 0) bids.push({ side: "UP", price: Math.floor(upPrice * 100) / 100, size, level: lvl }); };
-      const addDn = () => { if (dnPrice > 0) bids.push({ side: "DOWN", price: Math.floor(dnPrice * 100) / 100, size, level: lvl }); };
+      const addUp = () => { if (upPrice > 0) bids.push({ side: "UP", price: Math.floor(upPrice * 100) / 100, size: upSize, level: lvl }); };
+      const addDn = () => { if (dnPrice > 0) bids.push({ side: "DOWN", price: Math.floor(dnPrice * 100) / 100, size: dnSize, level: lvl }); };
       if (lightSideFirst === "UP") { addUp(); addDn(); } else { addDn(); addUp(); }
     }
 
